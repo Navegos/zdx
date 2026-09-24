@@ -1240,6 +1240,86 @@ async fn repeated_identical_tool_call_is_stopped_and_retried() {
     );
 }
 
+/// Regression (thread 636c69e9): an edit-then-verify cycle whose verify step
+/// returns identical output every time is progress, not a loop. The turn must
+/// run to its answer without a loop notice.
+#[tokio::test]
+async fn identical_checks_between_edits_are_not_a_tool_loop() {
+    if !can_bind_localhost() {
+        eprintln!("Skipping: cannot bind localhost TCP port in this environment.");
+        return;
+    }
+    let zdx_home = temp_zdx_home();
+    let temp_dir = TempDir::new().unwrap();
+    let thread_id = "tool-loop-edit-verify";
+    fs::write(temp_dir.path().join("test.txt"), "Stable content.").unwrap();
+
+    let mock_server = MockServer::start().await;
+    let call_count = Arc::new(AtomicUsize::new(0));
+    let call_count_clone = Arc::clone(&call_count);
+
+    // Alternate a read of an unchanged file (the "passing check") with a
+    // write of new content (the "edit"), four checks in total.
+    let responses: Vec<String> = (0..4)
+        .flat_map(|round| {
+            [
+                tool_use_sse(
+                    &format!("toolu_check_{round}"),
+                    "read",
+                    r#"{"file_path": "test.txt"}"#,
+                ),
+                tool_use_sse(
+                    &format!("toolu_edit_{round}"),
+                    "write",
+                    &format!(r#"{{"file_path": "edit.txt", "content": "edit {round}"}}"#),
+                ),
+            ]
+        })
+        .chain([text_sse("Edits verified.")])
+        .collect();
+    let expected_calls = responses.len();
+
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .and(header("x-api-key", "test-api-key"))
+        .respond_with(move |_req: &Request| {
+            let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
+            fixtures::sse_response(&responses[count.min(responses.len() - 1)])
+        })
+        .mount(&mock_server)
+        .await;
+
+    run_exec_turn_with_model(
+        &zdx_home,
+        &temp_dir,
+        &mock_server.uri(),
+        thread_id,
+        "anthropic:claude-sonnet-5@high",
+        "edit and verify",
+    );
+
+    assert_eq!(
+        call_count.load(Ordering::SeqCst),
+        expected_calls,
+        "every edit/verify round should run"
+    );
+    let jsonl = fs::read_to_string(
+        zdx_home
+            .path()
+            .join("threads")
+            .join(format!("{thread_id}.jsonl")),
+    )
+    .expect("thread JSONL should exist");
+    assert!(
+        !jsonl.contains(r#""kind":"output_loop""#),
+        "edits between identical checks must not trip the loop guard; got:\n{jsonl}"
+    );
+    assert!(
+        jsonl.contains("Edits verified."),
+        "the turn should reach its answer; got:\n{jsonl}"
+    );
+}
+
 /// With no lower thinking level to retry to, a loop closes the turn normally
 /// with a notice instead of failing it.
 #[tokio::test]

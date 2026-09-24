@@ -908,21 +908,27 @@ fn floor_char_boundary(s: &str, index: usize) -> usize {
     index
 }
 
-/// Counts identical tool calls within one turn, so a model that keeps
-/// re-issuing the same call and getting the same result back can be stopped
-/// instead of grinding until the turn budget runs out.
+/// Counts identical tool calls within a no-progress window, so a model that
+/// keeps re-issuing the same call and getting the same result back can be
+/// stopped instead of grinding until the turn budget runs out.
 ///
-/// The signature covers the tool name, its input, and the result, so a
-/// legitimate retry loop (run the tests, fix, run again) never matches: its
-/// results change.
+/// The signature covers the tool name, its input, and the result. A tool
+/// round that produces any signature not seen before in the turn (an edit, a
+/// new command, a changed result) is progress and closes the window, so an
+/// edit-then-verify cycle never trips even when the verify step (a passing
+/// typecheck) returns identical output each time. `seen` outlives the window,
+/// so a cycle that only replays old signatures (same call, or A/B alternating)
+/// still accumulates counts and trips.
 #[derive(Default)]
 struct ToolLoopTracker {
     counts: std::collections::HashMap<u64, usize>,
+    seen: std::collections::HashSet<u64>,
 }
 
 impl ToolLoopTracker {
     /// Records the tool calls and results appended by the most recent tool
-    /// turn, returning true once any identical call has repeated enough times.
+    /// turn, returning true once any identical call has repeated enough times
+    /// without progress in between.
     fn record(&mut self, messages: &[ChatMessage]) -> bool {
         let Some(calls) = messages.iter().rev().find_map(tool_call_inputs) else {
             return false;
@@ -931,21 +937,37 @@ impl ToolLoopTracker {
             return false;
         };
 
+        let signatures: Vec<u64> = calls
+            .iter()
+            .filter_map(|(id, (name, input))| {
+                results
+                    .get(id)
+                    .map(|result| tool_call_signature(name, input, result))
+            })
+            .collect();
+
+        let mut progressed = false;
+        for signature in &signatures {
+            progressed |= self.seen.insert(*signature);
+        }
+        if progressed {
+            self.counts.clear();
+        }
+
         let mut tripped = false;
-        for (id, (name, input)) in &calls {
-            let Some(result) = results.get(id) else {
-                continue;
-            };
-            let count = self
-                .counts
-                .entry(tool_call_signature(name, input, result))
-                .or_insert(0);
+        for signature in signatures {
+            let count = self.counts.entry(signature).or_insert(0);
             *count += 1;
             if *count >= MAX_IDENTICAL_TOOL_CALLS {
                 tripped = true;
             }
         }
         tripped
+    }
+
+    /// Starts a fresh no-progress window, keeping the seen set.
+    fn reset_counts(&mut self) {
+        self.counts.clear();
     }
 }
 
@@ -1462,6 +1484,7 @@ async fn run_turn_inner(
                         rebuild_for_lower_thinking(&setup, config, options, thread_id, &messages)
                 {
                     thinking_retry_used = true;
+                    tool_loop_tracker.reset_counts();
                     tracing::warn!(
                         model_turn,
                         thinking = rebuilt.thinking_level.display_name(),
@@ -3339,18 +3362,38 @@ mod tests {
     }
 
     fn tool_turn(name: &str, input: &str, result: &str) -> Vec<ChatMessage> {
+        tool_round(&[(name, input, result)])
+    }
+
+    /// One tool round with several calls, each `(name, input, result)`.
+    fn tool_round(calls: &[(&str, &str, &str)]) -> Vec<ChatMessage> {
+        let id = |index: usize| format!("toolu_{index}");
         vec![
-            ChatMessage::assistant_blocks(vec![ChatContentBlock::ToolUse {
-                id: "toolu_1".to_string(),
-                name: name.to_string(),
-                input: serde_json::json!({ "arg": input }),
-                id_origin: zdx_types::IdOrigin::Real,
-                replay: None,
-            }]),
-            ChatMessage::tool_results(vec![ToolResult::from_output(
-                "toolu_1".to_string(),
-                &ToolOutput::success(serde_json::json!({ "out": result })),
-            )]),
+            ChatMessage::assistant_blocks(
+                calls
+                    .iter()
+                    .enumerate()
+                    .map(|(index, (name, input, _))| ChatContentBlock::ToolUse {
+                        id: id(index),
+                        name: (*name).to_string(),
+                        input: serde_json::json!({ "arg": input }),
+                        id_origin: zdx_types::IdOrigin::Real,
+                        replay: None,
+                    })
+                    .collect(),
+            ),
+            ChatMessage::tool_results(
+                calls
+                    .iter()
+                    .enumerate()
+                    .map(|(index, (_, _, result))| {
+                        ToolResult::from_output(
+                            id(index),
+                            &ToolOutput::success(serde_json::json!({ "out": result })),
+                        )
+                    })
+                    .collect(),
+            ),
         ]
     }
 
@@ -3381,6 +3424,53 @@ mod tests {
         assert!(!tracker.record(&tool_turn("read", "a.txt", "same")));
         assert!(!tracker.record(&tool_turn("read", "b.txt", "same")));
         assert!(!tracker.record(&tool_turn("grep", "a.txt", "same")));
+    }
+
+    /// Regression: thread 636c69e9. A passing typecheck prints the same output
+    /// every time, but each run follows new edits, so it must never trip.
+    #[test]
+    fn tool_loop_tracker_ignores_identical_checks_between_edits() {
+        let mut tracker = ToolLoopTracker::default();
+
+        assert!(!tracker.record(&tool_turn("bash", "typecheck", "tsc ok")));
+        for round in 0..6 {
+            let patch = format!("patch {round}");
+            assert!(!tracker.record(&tool_turn("apply_patch", &patch, "ok")));
+            assert!(!tracker.record(&tool_round(&[
+                ("bash", "build", "built"),
+                ("bash", "typecheck", "tsc ok"),
+            ])));
+        }
+    }
+
+    /// Two calls that alternate with unchanged results are a loop too. The
+    /// window opens once both have been seen, so it trips on the sixth round.
+    #[test]
+    fn tool_loop_tracker_trips_on_alternating_cycle() {
+        let mut tracker = ToolLoopTracker::default();
+
+        assert!(!tracker.record(&tool_turn("read", "a.txt", "a")));
+        assert!(!tracker.record(&tool_turn("read", "b.txt", "b")));
+        assert!(!tracker.record(&tool_turn("read", "a.txt", "a")));
+        assert!(!tracker.record(&tool_turn("read", "b.txt", "b")));
+        assert!(!tracker.record(&tool_turn("read", "a.txt", "a")));
+        assert!(tracker.record(&tool_turn("read", "b.txt", "b")));
+    }
+
+    /// The lower-thinking retry gets a fresh window but still catches a loop
+    /// that continues after it.
+    #[test]
+    fn tool_loop_tracker_reset_gives_fresh_counts() {
+        let mut tracker = ToolLoopTracker::default();
+
+        assert!(!tracker.record(&tool_turn("read", "a.txt", "same")));
+        assert!(!tracker.record(&tool_turn("read", "a.txt", "same")));
+        assert!(tracker.record(&tool_turn("read", "a.txt", "same")));
+
+        tracker.reset_counts();
+        assert!(!tracker.record(&tool_turn("read", "a.txt", "same")));
+        assert!(!tracker.record(&tool_turn("read", "a.txt", "same")));
+        assert!(tracker.record(&tool_turn("read", "a.txt", "same")));
     }
 
     #[test]
