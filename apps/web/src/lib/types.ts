@@ -305,6 +305,51 @@ export interface ThreadTrajectoryReport {
   has_unavailable: boolean;
 }
 
+/* -------------------------------- workspaces -------------------------------- */
+
+/** Mirrors `zdx_engine::workspace_config` as served by `GET /api/workspaces`. */
+export interface WorkspacesResponse {
+  workspaces: WorkspaceReport[];
+}
+
+export interface WorkspaceReport {
+  root: string;
+  name: string;
+  /** Telegram profile names bound to this directory. */
+  profiles: string[];
+  /** The bot's own root. */
+  current: boolean;
+  overlay_path: string;
+  has_overlay: boolean;
+  settings: WorkspaceSetting[];
+  error: string | null;
+}
+
+/**
+ * `workspace` = set in this workspace's own overlay; `ancestor` = inherited
+ * from a parent directory's overlay.
+ */
+export type ConfigLayer = "default" | "global" | "workspace" | "ancestor";
+
+export interface ConfigSource {
+  layer: ConfigLayer;
+  path: string | null;
+  label: string;
+}
+
+export interface WorkspaceSetting {
+  key: string;
+  group: string;
+  label: string;
+  kind: "chat" | "transcription" | "speech" | "toggle" | "modes";
+  /** `null` when unset: the runtime default applies. */
+  value: string | null;
+  source: ConfigSource;
+  /** What resetting this workspace's own overlay would fall back to. */
+  inherited_value: string | null;
+  inherited_source: ConfigSource;
+}
+
 /* ---------------------------------- monitor --------------------------------- */
 
 export interface MonitorResponse {

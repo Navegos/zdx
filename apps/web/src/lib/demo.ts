@@ -18,6 +18,8 @@ import type {
   ThreadResponse,
   ThreadTrajectoryReport,
   WorkersResponse,
+  WorkspaceSetting,
+  WorkspacesResponse,
 } from "./types";
 
 export function demoEnabled(): boolean {
@@ -885,4 +887,72 @@ export const demoMonitor: MonitorResponse = {
   ],
   subscriptions_status: "ready",
   subscriptions_age: "12s",
+};
+
+const src = (layer: "default" | "global" | "workspace" | "ancestor", label: string) => ({
+  layer,
+  path: layer === "default" ? null : `/home/user/${label}/.zdx/config.toml`,
+  label,
+});
+
+function demoSetting(
+  key: string,
+  group: string,
+  label: string,
+  value: string | null,
+  source: ReturnType<typeof src>,
+  inherited: [string | null, ReturnType<typeof src>] = [value, source],
+): WorkspaceSetting {
+  return {
+    key,
+    group,
+    label,
+    kind: "chat",
+    value,
+    source,
+    inherited_value: inherited[0],
+    inherited_source: inherited[1],
+  };
+}
+
+export const demoWorkspaces: WorkspacesResponse = {
+  workspaces: [
+    {
+      root: "/home/user/projects/example-app",
+      name: "example-app",
+      profiles: ["example-app"],
+      current: true,
+      overlay_path: "/home/user/projects/example-app/.zdx/config.toml",
+      has_overlay: true,
+      error: null,
+      settings: [
+        demoSetting("model", "core", "model", "anthropic:claude-opus@high", src("workspace", "example-app"), [
+          "anthropic:claude-sonnet@medium",
+          src("ancestor", "projects"),
+        ]),
+        demoSetting("title_model", "helper models", "title_model", "gemini:flash-lite", src("global", "global")),
+        demoSetting("tldr_model", "helper models", "tldr_model", "gemini:flash-lite", src("default", "default")),
+        demoSetting(
+          "subagents.overrides.orchestrator.model",
+          "subagents",
+          "orchestrator",
+          "openai:gpt-5@high",
+          src("global", "global"),
+        ),
+        demoSetting("subagents.overrides.explorer.model", "subagents", "explorer", null, src("default", "default")),
+      ],
+    },
+    {
+      root: "/home/user/projects/other",
+      name: "other",
+      profiles: ["other", "other-orchestrator"],
+      current: false,
+      overlay_path: "/home/user/projects/other/.zdx/config.toml",
+      has_overlay: false,
+      error: null,
+      settings: [
+        demoSetting("model", "core", "model", "anthropic:claude-sonnet@medium", src("ancestor", "projects")),
+      ],
+    },
+  ],
 };

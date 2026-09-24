@@ -24,6 +24,7 @@
     "services",
     "usage",
     "config",
+    "workspaces",
     "automations",
   ];
 

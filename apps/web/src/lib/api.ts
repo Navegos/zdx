@@ -10,6 +10,7 @@ import type {
   ThreadResponse,
   ThreadTrajectoryReport,
   WorkersResponse,
+  WorkspacesResponse,
 } from "./types";
 
 /**
@@ -149,6 +150,14 @@ export const api = {
       if (demo.demoEnabled()) return demo.demoMonitor;
     }
     return get<MonitorResponse>("/api/monitor");
+  },
+
+  workspaces: async () => {
+    if (import.meta.env.DEV) {
+      const demo = await import("./demo");
+      if (demo.demoEnabled()) return demo.demoWorkspaces;
+    }
+    return get<WorkspacesResponse>("/api/workspaces");
   },
 
   git: async (threadId: string) => {

@@ -27,6 +27,7 @@ Scope: core runtime engine — config, agent orchestration, tools, prompt/contex
 - `src/pidfile.rs`: PID file management
 - `src/service.rs`: launchd-backed control for the long-lived `bot`/`daemon` services — plist rendering, `install`/`uninstall`/`start`/`stop`/`restart`, and combined launchd+PID-file `state()`. Agents run `~/.local/bin/zdx` (never `current_exe()`) so restart picks up the installed binary, launched via `zsh -c 'exec …'` so `~/.zshenv` (provider API keys, PATH) is sourced. Plists set `ZDX_SERVICE_SUPERVISOR=launchd` and capture output to `~/.zdx/run/logs/{name}.{out,err}`. macOS-only.
 - `src/tracing_init.rs`: tracing setup
+- `src/workspace_config.rs`: shared workspace model-settings view — workspace list (Telegram profile `cwd`s used as-is + the caller's root resolved to its project root), per-setting effective value + origin layer (`default`/`global`/`workspace`/`ancestor`) + inherited fallback, and targeted `set_setting`/`reset_setting` on one layer. Backs Monitor Config, `zdx config workspaces`, and `/api/workspaces`. Writers reuse `Config::*_to` (whose `layer_document` seeds the template only for the global file, so overlays stay minimal) and `Config::unset_layer_key`.
 
 ### Core runtime (`src/core/`)
 

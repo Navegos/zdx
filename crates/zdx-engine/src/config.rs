@@ -1520,38 +1520,39 @@ impl Config {
     /// Returns an error if the write fails.
     pub fn save_model_for_cwd(cwd: &Path, model: &str) -> Result<()> {
         match paths::workspace_config_path_for(cwd) {
-            Some(path) => Self::save_overlay_field(&path, "model", model),
+            Some(path) => Self::save_model_field_to(&path, "model", model),
             None => Self::save_model(model),
         }
     }
 
-    /// Writes a single top-level key to a workspace `.zdx/config.toml` overlay.
+    /// Reads one config layer for editing.
     ///
-    /// Overlays merge on top of the global config, so they must stay minimal:
-    /// a missing file starts empty instead of being seeded from the default
-    /// template, which would freeze every default as a workspace override.
-    fn save_overlay_field(path: &Path, field: &str, field_value: &str) -> Result<()> {
-        use toml_edit::{DocumentMut, value};
-
+    /// The global file is refreshed against the commented template. Any other
+    /// path is a workspace overlay: overlays merge on top of the global config,
+    /// so they must stay minimal. A missing overlay starts empty instead of
+    /// being seeded from the template, which would freeze every default as a
+    /// workspace override.
+    fn layer_document(path: &Path) -> Result<toml_edit::DocumentMut> {
+        let global = path == paths::config_path();
         let contents = if path.exists() {
-            fs::read_to_string(path)
-                .with_context(|| format!("Failed to read config from {}", path.display()))?
+            let user_config = fs::read_to_string(path)
+                .with_context(|| format!("Failed to read config from {}", path.display()))?;
+            if global {
+                merge_with_template(&user_config)?
+            } else {
+                user_config
+            }
+        } else if global {
+            default_config_template().to_string()
         } else {
             String::new()
         };
-
-        let mut doc: DocumentMut = contents
+        contents
             .parse()
-            .with_context(|| format!("Failed to parse config from {}", path.display()))?;
-        doc[field] = value(field_value);
-
-        Self::write_config(path, &doc.to_string())
+            .with_context(|| format!("Failed to parse config from {}", path.display()))
     }
 
     /// Saves only the model field to a specific config file path.
-    ///
-    /// Creates the file with default template if it doesn't exist.
-    /// If file exists, merges user values into the latest template.
     ///
     /// # Errors
     /// Returns an error if the operation fails.
@@ -1571,38 +1572,20 @@ impl Config {
         "speech.model",
     ];
 
-    /// Saves a single top-level model field (one of [`Self::EDITABLE_MODEL_FIELDS`]).
-    ///
-    /// # Errors
-    /// Returns an error if the field is not editable or the write fails.
-    pub fn save_model_field(field: &str, model: &str) -> Result<()> {
-        Self::save_model_field_to(&paths::config_path(), field, model)
-    }
-
-    /// Saves a single top-level model field to a specific config path,
-    /// preserving existing fields and comments via `toml_edit`.
+    /// Saves a single top-level model field to a config layer, preserving
+    /// existing fields and comments via `toml_edit`.
     ///
     /// # Errors
     /// Returns an error if the field is not editable or the write fails.
     pub fn save_model_field_to(path: &Path, field: &str, model: &str) -> Result<()> {
-        use toml_edit::{DocumentMut, Item, value};
+        use toml_edit::{Item, value};
 
         anyhow::ensure!(
             Self::EDITABLE_MODEL_FIELDS.contains(&field),
             "not an editable model field: {field}"
         );
 
-        let contents = if path.exists() {
-            let user_config = fs::read_to_string(path)
-                .with_context(|| format!("Failed to read config from {}", path.display()))?;
-            merge_with_template(&user_config)?
-        } else {
-            default_config_template().to_string()
-        };
-
-        let mut doc: DocumentMut = contents
-            .parse()
-            .with_context(|| format!("Failed to parse config from {}", path.display()))?;
+        let mut doc = Self::layer_document(path)?;
 
         // Support one level of nesting (e.g. `transcription.model`).
         match field.split_once('.') {
@@ -1625,33 +1608,16 @@ impl Config {
         Self::write_config(path, &doc.to_string())
     }
 
-    /// Saves the full mode list, replacing any existing `[[model_modes]]`
-    /// entries while preserving the rest of the document via `toml_edit`.
-    ///
-    /// # Errors
-    /// Returns an error if the write fails.
-    pub fn save_model_modes(modes: &[ModelMode]) -> Result<()> {
-        Self::save_model_modes_to(&paths::config_path(), modes)
-    }
-
-    /// Saves the mode list to a specific config path.
+    /// Saves the mode list to a config layer, replacing any existing
+    /// `[[model_modes]]` entries while preserving the rest of the document.
+    /// An empty list removes the key.
     ///
     /// # Errors
     /// Returns an error if the write fails.
     pub fn save_model_modes_to(path: &Path, modes: &[ModelMode]) -> Result<()> {
-        use toml_edit::{Array, ArrayOfTables, DocumentMut, Item, Table, value};
+        use toml_edit::{Array, ArrayOfTables, Item, Table, value};
 
-        let contents = if path.exists() {
-            let user_config = fs::read_to_string(path)
-                .with_context(|| format!("Failed to read config from {}", path.display()))?;
-            merge_with_template(&user_config)?
-        } else {
-            default_config_template().to_string()
-        };
-
-        let mut doc: DocumentMut = contents
-            .parse()
-            .with_context(|| format!("Failed to parse config from {}", path.display()))?;
+        let mut doc = Self::layer_document(path)?;
 
         if modes.is_empty() {
             doc.remove("model_modes");
@@ -1682,32 +1648,14 @@ impl Config {
         Self::write_config(path, &doc.to_string())
     }
 
-    /// Saves the `subagents.enabled` flag, preserving the rest of the document.
-    ///
-    /// # Errors
-    /// Returns an error if the write fails.
-    pub fn save_subagents_enabled(enabled: bool) -> Result<()> {
-        Self::save_subagents_enabled_to(&paths::config_path(), enabled)
-    }
-
-    /// Saves the `subagents.enabled` flag to a specific config path.
+    /// Saves the `subagents.enabled` flag to a config layer.
     ///
     /// # Errors
     /// Returns an error if the write fails.
     pub fn save_subagents_enabled_to(path: &Path, enabled: bool) -> Result<()> {
-        use toml_edit::{DocumentMut, Item, Table, value};
+        use toml_edit::{Item, Table, value};
 
-        let contents = if path.exists() {
-            let user_config = fs::read_to_string(path)
-                .with_context(|| format!("Failed to read config from {}", path.display()))?;
-            merge_with_template(&user_config)?
-        } else {
-            default_config_template().to_string()
-        };
-        let mut doc: DocumentMut = contents
-            .parse()
-            .with_context(|| format!("Failed to parse config from {}", path.display()))?;
-
+        let mut doc = Self::layer_document(path)?;
         if doc.get("subagents").and_then(Item::as_table).is_none() {
             doc["subagents"] = Item::Table(Table::new());
         }
@@ -1716,29 +1664,7 @@ impl Config {
         Self::write_config(path, &doc.to_string())
     }
 
-    /// Saves a per-subagent model override (`[subagents.overrides.<name>]`),
-    /// preserving the rest of the document via `toml_edit`.
-    ///
-    /// # Errors
-    /// Returns an error if the write fails.
-    pub fn save_subagent_override(name: &str, model: &str, thinking: ThinkingLevel) -> Result<()> {
-        Self::save_subagent_override_spec_to(
-            &paths::config_path(),
-            name,
-            &crate::models::format_model_thinking(model, thinking),
-        )
-    }
-
-    /// Saves a per-subagent override from a spec that is already canonical,
-    /// such as a `mode:<name>` reference that carries no thinking of its own.
-    ///
-    /// # Errors
-    /// Returns an error if the write fails.
-    pub fn save_subagent_override_spec(name: &str, spec: &str) -> Result<()> {
-        Self::save_subagent_override_spec_to(&paths::config_path(), name, spec)
-    }
-
-    /// Saves a per-subagent model override to a specific config path.
+    /// Saves a per-subagent model override to a config layer.
     ///
     /// # Errors
     /// Returns an error if the write fails.
@@ -1755,24 +1681,15 @@ impl Config {
         )
     }
 
-    /// Saves a per-subagent override spec verbatim to a specific config path.
+    /// Saves a per-subagent override spec verbatim to a config layer, such as
+    /// a `mode:<name>` reference that carries no thinking of its own.
     ///
     /// # Errors
     /// Returns an error if the write fails.
     pub fn save_subagent_override_spec_to(path: &Path, name: &str, spec: &str) -> Result<()> {
-        use toml_edit::{DocumentMut, Item, Table, value};
+        use toml_edit::{Item, Table, value};
 
-        let contents = if path.exists() {
-            let user_config = fs::read_to_string(path)
-                .with_context(|| format!("Failed to read config from {}", path.display()))?;
-            merge_with_template(&user_config)?
-        } else {
-            default_config_template().to_string()
-        };
-        let mut doc: DocumentMut = contents
-            .parse()
-            .with_context(|| format!("Failed to parse config from {}", path.display()))?;
-
+        let mut doc = Self::layer_document(path)?;
         if doc.get("subagents").and_then(Item::as_table).is_none() {
             doc["subagents"] = Item::Table(Table::new());
         }
@@ -1795,42 +1712,53 @@ impl Config {
         Self::write_config(path, &doc.to_string())
     }
 
-    /// Removes a per-subagent model override, reverting to the definition's
-    /// default. No-op if the override doesn't exist.
-    ///
-    /// # Errors
-    /// Returns an error if the write fails.
-    pub fn clear_subagent_override(name: &str) -> Result<()> {
-        Self::clear_subagent_override_to(&paths::config_path(), name)
-    }
-
-    /// Removes a per-subagent model override from a specific config path.
+    /// Removes a per-subagent model override from a config layer. No-op if
+    /// the override doesn't exist.
     ///
     /// # Errors
     /// Returns an error if the write fails.
     pub fn clear_subagent_override_to(path: &Path, name: &str) -> Result<()> {
-        use toml_edit::{DocumentMut, Item};
+        Self::unset_layer_key(path, &format!("subagents.overrides.{name}")).map(|_| ())
+    }
 
-        let contents = if path.exists() {
-            let user_config = fs::read_to_string(path)
-                .with_context(|| format!("Failed to read config from {}", path.display()))?;
-            merge_with_template(&user_config)?
-        } else {
-            default_config_template().to_string()
-        };
-        let mut doc: DocumentMut = contents
-            .parse()
-            .with_context(|| format!("Failed to parse config from {}", path.display()))?;
-
-        if let Some(overrides) = doc
-            .get_mut("subagents")
-            .and_then(Item::as_table_mut)
-            .and_then(|t| t.get_mut("overrides"))
-            .and_then(Item::as_table_mut)
-        {
-            overrides.remove(name);
+    /// Removes a dotted key (`model`, `subagents.overrides.<name>.model`, …)
+    /// from one config layer, so the value falls back to the layers below it.
+    /// Tables left empty along the path are pruned. Returns whether the key
+    /// was present; a missing file or key is not an error and writes nothing.
+    ///
+    /// # Errors
+    /// Returns an error if the layer cannot be read, parsed, or written.
+    pub fn unset_layer_key(path: &Path, key: &str) -> Result<bool> {
+        fn remove(table: &mut dyn toml_edit::TableLike, parts: &[&str]) -> bool {
+            match parts {
+                [] => false,
+                [leaf] => table.remove(leaf).is_some(),
+                [head, rest @ ..] => {
+                    let Some(child) = table
+                        .get_mut(head)
+                        .and_then(|item| item.as_table_like_mut())
+                    else {
+                        return false;
+                    };
+                    let removed = remove(child, rest);
+                    if removed && child.is_empty() {
+                        table.remove(head);
+                    }
+                    removed
+                }
+            }
         }
-        Self::write_config(path, &doc.to_string())
+
+        if !path.exists() {
+            return Ok(false);
+        }
+        let mut doc = Self::layer_document(path)?;
+        let parts: Vec<&str> = key.split('.').collect();
+        if !remove(doc.as_table_mut(), &parts) {
+            return Ok(false);
+        }
+        Self::write_config(path, &doc.to_string())?;
+        Ok(true)
     }
 
     /// Returns the effective system prompt, preferring the file if both are set.
@@ -2934,13 +2862,13 @@ mod tests {
     /// Workspace overlay writes stay minimal (no default template dump) and
     /// override the global layer for that workspace only.
     #[test]
-    fn test_save_overlay_field_is_minimal_and_layers_over_global() {
+    fn test_overlay_model_write_is_minimal_and_layers_over_global() {
         let dir = tempdir().unwrap();
         let global = dir.path().join("global.toml");
         let overlay = dir.path().join("project/.zdx/config.toml");
         fs::write(&global, "model = \"global-model\"\nmax_tokens = 4096\n").unwrap();
 
-        Config::save_overlay_field(&overlay, "model", "parity:some-model").unwrap();
+        Config::save_model_field_to(&overlay, "model", "parity:some-model").unwrap();
 
         let contents = fs::read_to_string(&overlay).unwrap();
         assert_eq!(contents.trim(), "model = \"parity:some-model\"");
@@ -3644,8 +3572,8 @@ language = "pt"
     /// `save_model`: creates new config file with template if it doesn't exist.
     #[test]
     fn test_save_model_creates_file_with_template() {
-        let dir = tempdir().unwrap();
-        let config_path = dir.path().join("config.toml");
+        let _home = crate::test_support::temp_zdx_home();
+        let config_path = paths::config_path();
 
         Config::save_model_to(&config_path, "claude-sonnet-4-5-20250929").unwrap();
 
@@ -3764,8 +3692,8 @@ bash_foreground_bound_secs = 60
     /// `save_model`: uses template structure but preserves user values.
     #[test]
     fn test_save_model_merges_with_template() {
-        let dir = tempdir().unwrap();
-        let config_path = dir.path().join("config.toml");
+        let _home = crate::test_support::temp_zdx_home();
+        let config_path = paths::config_path();
 
         // Create config with user values (old format, no template comments)
         fs::write(
@@ -4242,8 +4170,8 @@ text_verbosity = "low"
 
     #[test]
     fn save_model_field_keeps_thinking_in_the_model_spec() {
-        let dir = tempdir().unwrap();
-        let config_path = dir.path().join("config.toml");
+        let _home = crate::test_support::temp_zdx_home();
+        let config_path = paths::config_path();
 
         fs::write(
             &config_path,

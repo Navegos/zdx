@@ -17,7 +17,7 @@ has been removed.
 - `src/lib/api.ts`: typed fetch client; sends `Authorization: tma <initData>`
 - `src/lib/types.ts`: response types mirroring `server.rs` — keep in sync when the Rust structs change
 - `src/lib/router.svelte.ts`: query-string router. Canonical: `?view=threads`, `?view=thread&id=…&tab=…`
-  and `?view=monitor&section=…`. The bot's legacy `?view=threads&id=…`, `?view=git` and bare
+  and `?view=monitor&section=…` (sections include `workspaces`). The bot's legacy `?view=threads&id=…`, `?view=git` and bare
   `startapp=<thread_id>` links are normalized — do not break those. `?view=threads` **with** an `id`
   stays a single-thread link for that reason; only the bare form opens the list.
 - `src/lib/transcript.ts`: projects the flat activity stream into a three-level collapsible tree
@@ -64,6 +64,7 @@ has been removed.
   row with `live: false` was recovered from persisted lineage after a restart and knows only that
   the worker existed. Those render dashed, as `status unavailable`, never as settled.
 - `src/views/MonitorView.svelte`: section-aware monitor (`overview` renders everything). Subscription quotas arrive **after** the rest of the dashboard — the server refreshes them off the request path — so render from `subscriptions_status`, not from list length: `pending` shows the section as loading, `stale` shows the values with their age, and the overview quota tile reads `—` rather than `0%` until real windows exist.
+- `src/views/WorkspacesPane.svelte`: `?view=monitor&section=workspaces` — workspace chips, then each model setting with its origin (`set here` highlighted, `from <ancestor>`, `global`, `default`) and, for own-overlay overrides, what a reset falls back to. Read-only; `MonitorView` fetches `/api/workspaces` for this section instead of `/api/monitor`, does not poll it, and `overview` does not include it.
 - `src/views/ThreadListView.svelte`: recent-thread browser (`?view=threads`). Each row opens the
   thread in-app; threads bound to a Telegram topic also get a jump button that calls
   `openTelegramLink` with the `t.me/c/<internal_id>/<topic_id>` link built server-side. TUI/CLI

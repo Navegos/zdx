@@ -1,8 +1,9 @@
 <script lang="ts">
   import { api, ApiError } from "$lib/api";
-  import type { MonitorResponse } from "$lib/types";
+  import type { MonitorResponse, WorkspacesResponse } from "$lib/types";
   import { router, MONITOR_SECTION_LABELS, type MonitorSection } from "$lib/router.svelte";
   import { haptic } from "$lib/telegram";
+  import WorkspacesPane from "./WorkspacesPane.svelte";
 
   interface Props {
     section: MonitorSection;
@@ -12,6 +13,7 @@
   let { section, onmenu }: Props = $props();
 
   let data = $state<MonitorResponse | null>(null);
+  let workspaces = $state<WorkspacesResponse | null>(null);
   let error = $state("");
   let loading = $state(true);
 
@@ -19,7 +21,10 @@
     if (showSpinner) loading = true;
     error = "";
     try {
-      data = await api.monitor();
+      // Workspaces come from their own endpoint; the dashboard snapshot is not
+      // needed there.
+      if (section === "workspaces") workspaces = await api.workspaces();
+      else data = await api.monitor();
     } catch (e) {
       error = e instanceof ApiError ? e.message : String(e);
     } finally {
@@ -32,13 +37,15 @@
   });
 
   // The server caches this for 30s, so polling faster only burns battery.
+  // Workspace settings change only on edits, so they refresh manually.
   $effect(() => {
     const timer = setInterval(() => {
-      if (document.visibilityState === "visible") load(false);
+      if (document.visibilityState === "visible" && section !== "workspaces") load(false);
     }, 30_000);
     return () => clearInterval(timer);
   });
 
+  // Overview renders every dashboard section; workspaces is its own view.
   let show = $derived((s: MonitorSection) => section === "overview" || section === s);
 
   function tokens(n: number): string {
@@ -107,6 +114,12 @@
     <p class="py-8 text-center text-xs text-muted-foreground">Loading…</p>
   {:else if error}
     <p class="rounded-md border border-destructive px-3 py-2 text-xs text-destructive">{error}</p>
+  {:else if section === "workspaces"}
+    {#if workspaces}
+      <div class="mx-auto flex max-w-3xl flex-col gap-3 pb-6">
+        <WorkspacesPane workspaces={workspaces.workspaces} />
+      </div>
+    {/if}
   {:else if data}
     <div class="mx-auto flex max-w-3xl flex-col gap-3 pb-6">
       {#if section === "overview"}

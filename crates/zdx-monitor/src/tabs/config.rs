@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::path::Path;
 
 use crossterm::event::KeyCode;
@@ -8,8 +9,12 @@ use zdx_engine::config;
 use zdx_engine::models::{
     available_models, bare_model_id, custom_provider_models, model_id_matches_patterns,
 };
+use zdx_engine::workspace_config::{
+    self, EditTarget, HELPER_MODEL_KEYS, Layer, MODEL_MODES_KEY, SUBAGENTS_ENABLED_KEY, Setting,
+    SettingValue, Source, Workspace,
+};
 
-use crate::app::MonitorApp;
+use crate::app::{MonitorApp, TargetPickerState};
 use crate::ui::{SELECTED_BG, centered_rect, truncate_chars};
 
 /// A single displayable line in the Config tab.
@@ -23,45 +28,58 @@ pub enum ConfigLine {
     Row(String, String),
 }
 
+/// Overlay tag shown next to a row whose value comes from a workspace layer.
+/// Global and default values stay untagged.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RowSource {
+    pub label: String,
+    /// Set in the viewed workspace's own overlay (not inherited).
+    pub here: bool,
+}
+
 pub(crate) struct ConfigView {
     pub model: String,
     pub lines: Vec<ConfigLine>,
-    pub sources: Vec<Option<String>>,
+    pub sources: Vec<Option<RowSource>>,
+    pub settings: Vec<Setting>,
 }
 
-pub(crate) fn load_config_view(root: &Path) -> anyhow::Result<ConfigView> {
-    let (config, sources) =
-        config::Config::load_layered_with_sources(&config::paths::config_layer_paths_for(root))?;
-    let lines = build_config_lines(&config, root);
-    let sources = config_source_labels(&config, &lines, &sources, &config::paths::config_path());
+pub(crate) fn load_config_view(workspace: &Workspace) -> anyhow::Result<ConfigView> {
+    let (config, sources) = config::Config::load_layered_with_sources(
+        &config::paths::config_layer_paths_for(&workspace.root),
+    )?;
+    let lines = build_config_lines(&config, &workspace.root);
+    let sources = config_source_labels(
+        &lines,
+        &sources,
+        &config::paths::config_path(),
+        &workspace.overlay_path,
+    );
     Ok(ConfigView {
         model: config.model,
         lines,
         sources,
+        settings: workspace_config::load_settings(workspace)?,
     })
 }
 
-fn source_name(source: Option<&Path>, global: &Path) -> String {
-    match source {
-        None => "default".to_string(),
-        Some(path) if path == global => "global".to_string(),
-        Some(path) => path
-            .parent()
-            .and_then(Path::parent)
-            .and_then(Path::file_name)
-            .map_or_else(
-                || "workspace".to_string(),
-                |name| name.to_string_lossy().into_owned(),
-            ),
+fn row_source(source: Option<&Path>, global: &Path, overlay: &Path) -> Option<RowSource> {
+    let source = Source::classify(source, global, overlay);
+    match source.layer {
+        Layer::Default | Layer::Global => None,
+        Layer::Workspace | Layer::Ancestor => Some(RowSource {
+            label: source.label,
+            here: source.layer == Layer::Workspace,
+        }),
     }
 }
 
 fn config_source_labels(
-    _config: &config::Config,
     lines: &[ConfigLine],
     sources: &config::ConfigSources,
     global: &Path,
-) -> Vec<Option<String>> {
+    overlay: &Path,
+) -> Vec<Option<RowSource>> {
     let mut section = "";
     lines
         .iter()
@@ -72,32 +90,16 @@ fn config_source_labels(
                 }
                 return None;
             };
-            if section == "core" && key == "model" {
-                return sources
-                    .source("model")
-                    .filter(|path| *path != global)
-                    .map(|source| source_name(Some(source), global));
-            }
-            if section == "subagents" && key != "enabled" {
-                if value == SUBAGENT_DEFAULT_LABEL {
-                    return None;
-                }
-                let prefix = format!("subagents.overrides.{key}");
-                return sources
-                    .source(&format!("{prefix}.model"))
-                    .filter(|path| *path != global)
-                    .map(|source| source_name(Some(source), global));
-            }
             let path = match section {
+                "subagents" if key == "enabled" => SUBAGENTS_ENABLED_KEY.to_string(),
+                "subagents" if value == SUBAGENT_DEFAULT_LABEL => return None,
+                "subagents" => format!("subagents.overrides.{key}.model"),
                 "core" | "helper models" => key.clone(),
                 "model modes" if key == ADD_MODE_LABEL => return None,
-                "model modes" => "model_modes".to_string(),
+                "model modes" => MODEL_MODES_KEY.to_string(),
                 _ => format!("{section}.{key}"),
             };
-            sources
-                .source(&path)
-                .filter(|path| *path != global)
-                .map(|source| source_name(Some(source), global))
+            row_source(sources.source(&path), global, overlay)
         })
         .collect()
 }
@@ -204,16 +206,6 @@ fn build_section_lines(section_obj: &serde_json::Map<String, Value>) -> Vec<Conf
 /// Serialize `config` to JSON and flatten it into displayable lines.
 /// Top-level scalars are grouped under a synthetic "core" section.
 /// Top-level objects each become their own named section.
-/// Config model fields handled by helper subagents, grouped together on the
-/// Config tab (in display order) instead of being scattered through `core`.
-pub(crate) const HELPER_MODEL_KEYS: [&str; 5] = [
-    "title_model",
-    "tldr_model",
-    "handoff_model",
-    "prompt_builder_model",
-    "read_thread_model",
-];
-
 pub fn build_config_lines(config: &config::Config, root: &Path) -> Vec<ConfigLine> {
     let value = match serde_json::to_value(config) {
         Ok(v) => v,
@@ -543,6 +535,99 @@ pub(crate) fn move_config_selection(app: &mut MonitorApp, forward: bool) {
     ensure_config_selection_visible(app);
 }
 
+/// Setting key (see `zdx_engine::workspace_config`) edited by a Config row path
+/// from [`editable_model_fields`].
+pub(crate) fn setting_key(field_path: &str) -> String {
+    if field_path.starts_with("model_modes.") {
+        return MODEL_MODES_KEY.to_string();
+    }
+    if field_path == SUBAGENTS_ENABLED_PATH {
+        return SUBAGENTS_ENABLED_KEY.to_string();
+    }
+    if let Some(name) = field_path.strip_prefix("subagents.") {
+        return format!("subagents.overrides.{name}.model");
+    }
+    field_path.to_string()
+}
+
+/// The shared setting behind the selected Config row, if it is editable.
+pub(crate) fn selected_setting(app: &MonitorApp) -> Option<&Setting> {
+    let fields = editable_model_fields(&app.config_lines);
+    let key = setting_key(&fields.get(app.config_selected)?.path);
+    app.config_settings
+        .iter()
+        .find(|setting| setting.key == key)
+}
+
+/// Effective config of the viewed workspace (all layers merged).
+fn effective_config(app: &MonitorApp) -> anyhow::Result<config::Config> {
+    config::Config::load_layered(&config::paths::config_layer_paths_for(
+        &app.config_workspace().root,
+    ))
+}
+
+/// Human name of the current write target (`global` or the workspace name).
+fn target_name(app: &MonitorApp) -> String {
+    match app.config_target {
+        EditTarget::Global => "global".to_string(),
+        EditTarget::Workspace => app.config_workspace().name.clone(),
+    }
+}
+
+/// Status line after a write: where it went and, when a higher layer still
+/// wins in the viewed workspace, which one.
+fn write_outcome(app: &MonitorApp, key: &str, action: &str) -> String {
+    let mut message = format!("{action} {key} in {}", target_name(app));
+    if let Some(setting) = app.config_settings.iter().find(|s| s.key == key) {
+        let shadowed = match app.config_target {
+            EditTarget::Global => {
+                matches!(setting.source.layer, Layer::Workspace | Layer::Ancestor)
+            }
+            EditTarget::Workspace => false,
+        };
+        if shadowed {
+            let _ = write!(
+                message,
+                " · [{}] still overrides it here",
+                setting.source.label
+            );
+        } else {
+            let value = setting.value.as_deref().unwrap_or(SUBAGENT_DEFAULT_LABEL);
+            let _ = write!(message, " · now {value}");
+        }
+    }
+    message
+}
+
+/// Writes one setting to the current target and reloads the tab.
+fn write_setting(app: &mut MonitorApp, key: &str, value: SettingValue<'_>) {
+    let path = app.config_target.path(app.config_workspace());
+    match workspace_config::set_setting(&path, key, value) {
+        Ok(()) => {
+            app.model_picker = None;
+            reload_config_lines(app);
+            let message = write_outcome(app, key, "Set");
+            app.set_status(message);
+        }
+        Err(e) => app.set_status(format!("Failed to set {key}: {e:#}")),
+    }
+}
+
+/// Removes one setting from the current target so it falls back to the
+/// layers below.
+fn reset_setting(app: &mut MonitorApp, key: &str) {
+    let path = app.config_target.path(app.config_workspace());
+    match workspace_config::reset_setting(&path, key) {
+        Ok(true) => {
+            reload_config_lines(app);
+            let message = write_outcome(app, key, "Reset");
+            app.set_status(message);
+        }
+        Ok(false) => app.set_status(format!("{key} is not set in {}", target_name(app))),
+        Err(e) => app.set_status(format!("Failed to reset {key}: {e:#}")),
+    }
+}
+
 /// Opens the model picker for the currently selected Config model row, or
 /// toggles the subagents-enabled flag when that row is selected.
 pub(crate) fn open_model_picker(app: &mut MonitorApp) {
@@ -565,7 +650,7 @@ pub(crate) fn open_model_picker(app: &mut MonitorApp) {
         ConfigLine::Row(_, v) => v.clone(),
         _ => String::new(),
     };
-    let Ok(cfg) = config::Config::load() else {
+    let Ok(cfg) = effective_config(app) else {
         app.set_status("Failed to load config");
         return;
     };
@@ -584,38 +669,137 @@ pub(crate) fn open_model_picker(app: &mut MonitorApp) {
     ));
 }
 
-/// Flips `subagents.enabled` in the config and reloads the Config tab.
+/// Flips `subagents.enabled` in the current target and reloads the tab.
 fn toggle_subagents_enabled(app: &mut MonitorApp) {
-    let Ok(cfg) = config::Config::load() else {
+    let Ok(cfg) = effective_config(app) else {
         app.set_status("Failed to load config");
         return;
     };
-    let next = !cfg.subagents.enabled;
-    match config::Config::save_subagents_enabled(next) {
-        Ok(()) => {
-            reload_config_lines(app);
-            app.set_status(format!(
-                "Subagents {}",
-                if next { "enabled" } else { "disabled" }
-            ));
-        }
-        Err(e) => app.set_status(format!("Failed to toggle subagents: {e}")),
-    }
+    write_setting(
+        app,
+        SUBAGENTS_ENABLED_KEY,
+        SettingValue::Enabled(!cfg.subagents.enabled),
+    );
 }
 
-/// Reloads config lines from disk after an edit, clamping selection.
-fn reload_config_lines(app: &mut MonitorApp) {
-    let Ok(view) = load_config_view(&app.root) else {
+/// Reloads config lines from disk after an edit or workspace switch,
+/// clamping selection.
+pub(crate) fn reload_config_lines(app: &mut MonitorApp) {
+    let Ok(view) = load_config_view(app.config_workspace()) else {
         app.set_status("Failed to reload config");
         return;
     };
-    app.default_model = view.model;
+    if app.config_workspace().current {
+        app.default_model = view.model;
+    }
     app.config_lines = view.lines;
     app.config_sources = view.sources;
+    app.config_settings = view.settings;
     app.config_line_count = rendered_line_count(&app.config_lines);
     let count = editable_model_fields(&app.config_lines).len();
     if app.config_selected >= count {
         app.config_selected = count.saturating_sub(1);
+    }
+}
+
+/// Toggles the Config write target between global and the viewed workspace.
+fn toggle_config_target(app: &mut MonitorApp) {
+    app.config_target = app.config_target.toggled();
+    let path = app.config_target.path(app.config_workspace());
+    app.set_status(format!(
+        "Edits now write to {} ({})",
+        target_name(app),
+        path.display()
+    ));
+}
+
+fn workspace_picker_item(workspace: &Workspace) -> String {
+    let mut item = format!("{}  {}", workspace.name, workspace.root.display());
+    if workspace.current {
+        item.push_str("  · monitor root");
+    }
+    if !workspace.profiles.is_empty() {
+        let _ = write!(item, "  · {}", workspace.profiles.join(", "));
+    }
+    item
+}
+
+/// Re-discovers workspaces and opens the picker.
+fn open_workspace_picker(app: &mut MonitorApp) {
+    match workspace_config::discover(Some(&app.root)) {
+        Ok(list) if !list.is_empty() => {
+            let viewed = app.config_workspace().root.clone();
+            app.config_workspace_index = list.iter().position(|w| w.root == viewed).unwrap_or(0);
+            app.config_workspaces = list;
+        }
+        Ok(_) => {}
+        Err(e) => app.set_status(format!("Failed to list workspaces: {e:#}")),
+    }
+    let items = app
+        .config_workspaces
+        .iter()
+        .map(|workspace| (workspace_picker_item(workspace), workspace.profiles.len()))
+        .collect();
+    let mut picker = TargetPickerState::from_items(items);
+    picker.selected = app
+        .config_workspace_index
+        .min(picker.matches.len().saturating_sub(1));
+    app.config_workspace_picker = Some(picker);
+}
+
+/// Handles a Config-tab key, including every key while the workspace picker
+/// is open. Returns `true` if the key was consumed.
+pub(crate) fn handle_config_key(app: &mut MonitorApp, key: KeyCode) -> bool {
+    if app.config_workspace_picker.is_some() {
+        handle_workspace_picker_key(app, key);
+        return true;
+    }
+    match key {
+        KeyCode::Char('d') | KeyCode::Delete => delete_or_reset_selected(app),
+        KeyCode::Char('D') => reset_selected_modes(app),
+        KeyCode::Char('p') => open_workspace_picker(app),
+        KeyCode::Char('w') => toggle_config_target(app),
+        _ => return false,
+    }
+    true
+}
+
+/// Handles a key while the workspace picker is open. Consumes every key.
+fn handle_workspace_picker_key(app: &mut MonitorApp, key: KeyCode) {
+    let Some(picker) = app.config_workspace_picker.as_mut() else {
+        return;
+    };
+    match key {
+        KeyCode::Esc => app.config_workspace_picker = None,
+        KeyCode::Down => {
+            let last = picker.matches.len().saturating_sub(1);
+            picker.selected = (picker.selected + 1).min(last);
+        }
+        KeyCode::Up => picker.selected = picker.selected.saturating_sub(1),
+        KeyCode::Backspace => {
+            picker.filter.pop();
+            picker.recompute();
+        }
+        KeyCode::Char(c) => {
+            picker.filter.push(c);
+            picker.recompute();
+        }
+        KeyCode::Enter => {
+            let chosen = picker.matches.get(picker.selected).copied();
+            app.config_workspace_picker = None;
+            if let Some(index) = chosen {
+                app.config_workspace_index = index;
+                app.config_scroll = 0;
+                app.config_selected = 0;
+                reload_config_lines(app);
+                app.set_status(format!(
+                    "Viewing {} · edits write to {}",
+                    app.config_workspace().name,
+                    target_name(app)
+                ));
+            }
+        }
+        _ => {}
     }
 }
 
@@ -766,12 +950,16 @@ impl ModelPickerState {
     }
 }
 
-/// Applies a mode edit for a `model_modes.<i>`/`model_modes.add` field and
-/// persists the whole list. Appends a new mode for `add`, else updates index.
-/// Only the primary spec is edited here; `description`/`alternatives` stay
-/// TOML-only and are preserved on edit.
-fn save_mode(field: &str, model: &str, level: config::ThinkingLevel) -> anyhow::Result<()> {
-    let mut cfg = config::Config::load()?;
+/// Applies a mode edit for a `model_modes.<i>`/`model_modes.add` field to the
+/// viewed workspace's effective mode list and writes the whole list to the
+/// current target (arrays replace wholesale across layers). Only the primary
+/// spec is edited here; `description`/`alternatives` stay TOML-only and are
+/// preserved on edit.
+fn save_mode(app: &mut MonitorApp, field: &str, model: &str, level: config::ThinkingLevel) {
+    let mut cfg = match effective_config(app) {
+        Ok(cfg) => cfg,
+        Err(e) => return app.set_status(format!("Failed to load config: {e:#}")),
+    };
     let suffix = field.strip_prefix("model_modes.").unwrap_or_default();
     if suffix == "add" {
         let name = format!("mode{}", cfg.model_modes.len() + 1);
@@ -782,58 +970,59 @@ fn save_mode(field: &str, model: &str, level: config::ThinkingLevel) -> anyhow::
             alternatives: Vec::new(),
             thinking: level,
         });
-    } else if let Ok(idx) = suffix.parse::<usize>() {
-        let mode = cfg
-            .model_modes
-            .get_mut(idx)
-            .ok_or_else(|| anyhow::anyhow!("mode index out of range: {idx}"))?;
+    } else if let Some(mode) = suffix
+        .parse::<usize>()
+        .ok()
+        .and_then(|idx| cfg.model_modes.get_mut(idx))
+    {
         mode.primary = model.to_string();
         mode.thinking = level;
     } else {
-        anyhow::bail!("invalid mode field: {field}");
+        return app.set_status(format!("Invalid mode field: {field}"));
     }
-    config::Config::save_model_modes(&cfg.model_modes)
+    write_setting(app, MODEL_MODES_KEY, SettingValue::Modes(&cfg.model_modes));
 }
 
-/// Handles `d`/`Del` on the Config tab: removes the selected mode, or
-/// resets the selected subagent to its default (clears the config override).
-pub(crate) fn delete_or_reset_selected(app: &mut MonitorApp) {
+/// Handles `d`/`Del` on the Config tab: removes the selected mode (writing
+/// the remaining list to the target), or resets any other selected setting
+/// in the target layer so it falls back to the layers below.
+fn delete_or_reset_selected(app: &mut MonitorApp) {
     let fields = editable_model_fields(&app.config_lines);
     let Some(path) = fields.get(app.config_selected).map(|f| f.path.clone()) else {
         return;
     };
 
-    if let Some(suffix) = path.strip_prefix("model_modes.") {
-        let Ok(idx) = suffix.parse::<usize>() else {
-            return; // add-row or invalid: nothing to delete
-        };
-        let Ok(mut cfg) = config::Config::load() else {
-            app.set_status("Failed to load config");
-            return;
-        };
-        if idx >= cfg.model_modes.len() {
-            return;
-        }
-        let removed = cfg.model_modes.remove(idx);
-        match config::Config::save_model_modes(&cfg.model_modes) {
-            Ok(()) => {
-                reload_config_lines(app);
-                app.set_status(format!("Removed mode {}", removed.name));
-            }
-            Err(e) => app.set_status(format!("Failed to remove mode: {e}")),
-        }
-    } else if let Some(name) = path.strip_prefix("subagents.") {
-        match config::Config::clear_subagent_override(name) {
-            Ok(()) => {
-                reload_config_lines(app);
-                app.set_status(format!("Reset {name} to default"));
-            }
-            Err(e) => app.set_status(format!("Failed to reset {name}: {e}")),
-        }
+    let Some(suffix) = path.strip_prefix("model_modes.") else {
+        reset_setting(app, &setting_key(&path));
+        return;
+    };
+    let Ok(idx) = suffix.parse::<usize>() else {
+        return; // add-row: nothing to delete
+    };
+    let mut cfg = match effective_config(app) {
+        Ok(cfg) => cfg,
+        Err(e) => return app.set_status(format!("Failed to load config: {e:#}")),
+    };
+    if idx >= cfg.model_modes.len() {
+        return;
+    }
+    cfg.model_modes.remove(idx);
+    write_setting(app, MODEL_MODES_KEY, SettingValue::Modes(&cfg.model_modes));
+}
+
+/// Handles `D` on a mode row: resets the whole mode list in the target layer.
+fn reset_selected_modes(app: &mut MonitorApp) {
+    let fields = editable_model_fields(&app.config_lines);
+    if fields
+        .get(app.config_selected)
+        .is_some_and(|f| f.path.starts_with("model_modes."))
+    {
+        reset_setting(app, MODEL_MODES_KEY);
     }
 }
 
-/// Persists the picker's chosen model (+ thinking for chat models).
+/// Persists the picker's chosen model (+ thinking for chat models) to the
+/// current target.
 fn commit_model_picker(app: &mut MonitorApp) {
     let Some(picker) = app.model_picker.as_ref() else {
         return;
@@ -842,53 +1031,20 @@ fn commit_model_picker(app: &mut MonitorApp) {
     let model = picker.chosen_model.clone();
     let level = picker.selected_thinking();
 
-    let (result, shown) = match picker.kind {
+    let spec = match picker.kind {
         // Model mode: update the entry at `model_modes.<i>` or append via
         // `model_modes.add`; thinking rides in the saved primary spec.
-        ModelFieldKind::Chat if field.starts_with("model_modes.") => (
-            save_mode(&field, &model, level),
-            zdx_engine::models::format_model_thinking(&model, level),
-        ),
-        // Subagent override pointed at a mode: store the ref verbatim, since
-        // the mode's primary spec carries the level.
-        ModelFieldKind::Chat if field.starts_with("subagents.") && is_mode_ref(&model) => {
-            let name = field.strip_prefix("subagents.").unwrap_or_default();
-            (
-                config::Config::save_subagent_override_spec(name, &model),
-                model.clone(),
-            )
+        ModelFieldKind::Chat if field.starts_with("model_modes.") => {
+            return save_mode(app, &field, &model, level);
         }
-        // Subagent override: thinking carried inline in the saved model.
-        ModelFieldKind::Chat if field.starts_with("subagents.") => {
-            let name = field.strip_prefix("subagents.").unwrap_or_default();
-            (
-                config::Config::save_subagent_override(name, &model, level),
-                zdx_engine::models::format_model_thinking(&model, level),
-            )
-        }
-        // Main and role chat models: thinking carried inline as `model@thinking`.
-        ModelFieldKind::Chat => {
-            let combined = zdx_engine::models::format_model_thinking(&model, level);
-            (
-                config::Config::save_model_field(&field, &combined),
-                combined,
-            )
-        }
+        // A mode ref is stored verbatim: the mode's primary carries the level.
+        ModelFieldKind::Chat if is_mode_ref(&model) => model,
+        // Chat models carry thinking inline as `model@thinking`.
+        ModelFieldKind::Chat => zdx_engine::models::format_model_thinking(&model, level),
         // Audio (STT/TTS): model only, no thinking.
-        ModelFieldKind::Transcription | ModelFieldKind::Speech => (
-            config::Config::save_model_field(&field, &model),
-            model.clone(),
-        ),
+        ModelFieldKind::Transcription | ModelFieldKind::Speech => model,
     };
-
-    match result {
-        Ok(()) => {
-            app.model_picker = None;
-            reload_config_lines(app);
-            app.set_status(format!("Set {field} = {shown}"));
-        }
-        Err(e) => app.set_status(format!("Failed to set {field}: {e}")),
-    }
+    write_setting(app, &setting_key(&field), SettingValue::Spec(&spec));
 }
 
 /// Handles a key while the model picker overlay is open.
@@ -986,11 +1142,8 @@ pub(crate) fn render_config(f: &mut Frame, app: &MonitorApp, area: Rect) {
                     Style::default().fg(Color::DarkGray)
                 };
                 let key_span = Span::styled(format!("{marker}{key:<key_col$} "), key_style);
-                let source = app.config_sources.get(idx).and_then(Option::as_deref);
-                let source_span = Span::styled(
-                    source.map_or_else(String::new, |source| format!(" [{source}]")),
-                    Style::default().fg(Color::DarkGray),
-                );
+                let source = app.config_sources.get(idx).and_then(Option::as_ref);
+                let source_span = source_span(source);
                 let value = if source.is_some() {
                     truncate_chars(
                         value,
@@ -1028,14 +1181,57 @@ pub(crate) fn render_config(f: &mut Frame, app: &MonitorApp, area: Rect) {
         String::new()
     };
 
-    let root_label = app.root.file_name().unwrap_or_default().to_string_lossy();
-    let title = format!(" Config · {root_label} ({total_fields} fields){scroll_info} ");
+    let workspace = app.config_workspace();
+    let title = format!(
+        " Config · {} · edits → {} ({total_fields} fields){scroll_info} ",
+        workspace.name,
+        target_name(app),
+    );
 
     let p = Paragraph::new(Text::from(lines))
-        .block(Block::default().borders(Borders::ALL).title(title))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(title)
+                .title_bottom(provenance_hint(app)),
+        )
         .scroll((app.config_scroll as u16, 0));
 
     f.render_widget(p, area);
+}
+
+/// Row tag: overrides set in the viewed workspace stand out; inherited
+/// ancestor values stay dim.
+fn source_span(source: Option<&RowSource>) -> Span<'static> {
+    Span::styled(
+        source.map_or_else(String::new, |source| format!(" [{}]", source.label)),
+        if source.is_some_and(|source| source.here) {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        },
+    )
+}
+
+/// Bottom-border line for the selected row: where its value comes from and
+/// what `d` would fall back to in the current target.
+fn provenance_hint(app: &MonitorApp) -> Line<'static> {
+    let Some(setting) = selected_setting(app) else {
+        return Line::default();
+    };
+    let dim = Style::default().fg(Color::DarkGray);
+    let value = |value: Option<&str>| value.unwrap_or(SUBAGENT_DEFAULT_LABEL).to_string();
+    let text = if setting.overridden_here() {
+        format!(
+            " set in {} · reset → {} [{}] ",
+            setting.source.label,
+            value(setting.inherited_value.as_deref()),
+            setting.inherited_source.label,
+        )
+    } else {
+        format!(" from {} ", setting.source.label)
+    };
+    Line::from(Span::styled(text, dim))
 }
 
 /// Build a centered Rect using `percent_x` × `percent_y` of `area`.
@@ -1153,6 +1349,23 @@ fn render_picker_thinking(f: &mut Frame, picker: &ModelPickerState, popup: Rect)
 mod tests {
     use super::*;
 
+    fn label(source: &Option<RowSource>) -> Option<&str> {
+        source.as_ref().map(|source| source.label.as_str())
+    }
+
+    #[test]
+    fn rows_map_to_shared_setting_keys() {
+        assert_eq!(setting_key("model"), "model");
+        assert_eq!(setting_key("transcription.model"), "transcription.model");
+        assert_eq!(setting_key("model_modes.2"), MODEL_MODES_KEY);
+        assert_eq!(setting_key("model_modes.add"), MODEL_MODES_KEY);
+        assert_eq!(setting_key(SUBAGENTS_ENABLED_PATH), SUBAGENTS_ENABLED_KEY);
+        assert_eq!(
+            setting_key("subagents.orchestrator"),
+            "subagents.overrides.orchestrator.model"
+        );
+    }
+
     fn row_index(lines: &[ConfigLine], wanted_section: &str, wanted_key: &str) -> usize {
         let mut section = "";
         lines
@@ -1178,13 +1391,27 @@ mod tests {
         std::fs::write(&overlay, "model = \"selected@high\"\n").unwrap();
         assert_ne!(std::env::current_dir().unwrap(), root);
 
-        let view = load_config_view(&root).unwrap();
+        let workspace =
+            workspace_config::workspaces_from(&Default::default(), Some(&root)).remove(0);
+        let view = load_config_view(&workspace).unwrap();
         let row = row_index(&view.lines, "core", "model");
         assert_eq!(view.model, "selected@high");
-        assert_eq!(view.sources[row].as_deref(), Some("selected-root"));
+        assert_eq!(
+            view.sources[row],
+            Some(RowSource {
+                label: "selected-root".into(),
+                here: true
+            })
+        );
+        let model = view.settings.iter().find(|s| s.key == "model").unwrap();
+        assert!(model.overridden_here());
+        assert_eq!(model.inherited_value.as_deref(), Some("global@low"));
         assert!(matches!(&view.lines[row], ConfigLine::Row(_, value) if value == "selected@high"));
         std::fs::write(&overlay, "model = \"changed@medium\"\n").unwrap();
-        assert_eq!(load_config_view(&root).unwrap().model, "changed@medium");
+        assert_eq!(
+            load_config_view(&workspace).unwrap().model,
+            "changed@medium"
+        );
     }
 
     #[test]
@@ -1209,14 +1436,14 @@ mod tests {
             ])
             .unwrap();
             let lines = build_config_lines(&cfg, child.parent().unwrap().parent().unwrap());
-            let labels = config_source_labels(&cfg, &lines, &sources, &global);
+            let labels = config_source_labels(&lines, &sources, &global, &child);
             assert_eq!(
-                labels[row_index(&lines, "core", "model")].as_deref(),
+                label(&labels[row_index(&lines, "core", "model")]),
                 Some(expected)
             );
             assert_eq!(labels[row_index(&lines, "core", "max_tokens")], None);
             assert_eq!(
-                labels[row_index(&lines, "model modes", "work")].as_deref(),
+                label(&labels[row_index(&lines, "model modes", "work")]),
                 Some("parity")
             );
             assert_eq!(
@@ -1224,7 +1451,7 @@ mod tests {
                 None
             );
             let secret_row = row_index(&lines, "providers", "openai.api_key");
-            assert_eq!(labels[secret_row].as_deref(), Some("parity"));
+            assert_eq!(label(&labels[secret_row]), Some("parity"));
             assert!(matches!(&lines[secret_row], ConfigLine::Row(_, value) if value == "***"));
             let field = editable_model_fields(&lines)
                 .into_iter()
@@ -1255,13 +1482,18 @@ mod tests {
         let (cfg, sources) =
             config::Config::load_layered_with_sources(&[global.clone(), parent]).unwrap();
         let lines = build_config_lines(&cfg, home.path());
-        let labels = config_source_labels(&cfg, &lines, &sources, &global);
+        let labels = config_source_labels(
+            &lines,
+            &sources,
+            &global,
+            &home.path().join(".zdx/config.toml"),
+        );
         assert_eq!(
-            labels[row_index(&lines, "core", "model")].as_deref(),
+            label(&labels[row_index(&lines, "core", "model")]),
             Some("parity")
         );
         assert_eq!(
-            labels[row_index(&lines, "subagents", "explorer")].as_deref(),
+            label(&labels[row_index(&lines, "subagents", "explorer")]),
             Some("parity")
         );
     }

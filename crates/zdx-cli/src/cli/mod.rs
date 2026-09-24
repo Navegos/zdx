@@ -757,6 +757,13 @@ enum ConfigCommands {
         #[arg(long = "string")]
         force_string: bool,
     },
+    /// List workspaces (Telegram bindings + current directory) with their
+    /// model settings and the layer that supplies each value
+    Workspaces {
+        /// Emit JSON instead of text
+        #[arg(long)]
+        json: bool,
+    },
     /// Unset/remove a configuration key
     Unset {
         /// Configuration key to remove
@@ -1568,6 +1575,7 @@ fn dispatch_config(command: &ConfigCommands) -> Result<()> {
             local,
             force_string,
         } => commands::config::set(key, value, *local, *force_string),
+        ConfigCommands::Workspaces { json } => commands::config::workspaces(*json),
         ConfigCommands::Unset { key, local } => commands::config::unset(key, *local),
     }
 }

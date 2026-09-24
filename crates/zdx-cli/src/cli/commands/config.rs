@@ -1,5 +1,6 @@
 //! Config command handlers.
 
+use std::fmt::Write as _;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -23,6 +24,44 @@ pub fn init() -> Result<()> {
 pub fn generate() -> Result<()> {
     let toml = config::Config::generate()?;
     print!("{toml}");
+    Ok(())
+}
+
+pub fn workspaces(json: bool) -> Result<()> {
+    let cwd = std::env::current_dir().context("determine current directory")?;
+    let reports = zdx_engine::workspace_config::report(Some(&cwd))?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&reports)?);
+        return Ok(());
+    }
+    for report in &reports {
+        let workspace = &report.workspace;
+        let mut header = format!("{}  {}", workspace.name, workspace.root.display());
+        if workspace.current {
+            header.push_str("  (current)");
+        }
+        if !workspace.profiles.is_empty() {
+            let _ = write!(header, "  [{}]", workspace.profiles.join(", "));
+        }
+        println!("{header}");
+        if let Some(error) = &report.error {
+            println!("  error: {error}");
+        }
+        for setting in &report.settings {
+            let value = setting.value.as_deref().unwrap_or("(default)");
+            let mut line = format!("  {:<40} {value}  [{}]", setting.key, setting.source.label);
+            if setting.overridden_here() {
+                let inherited = setting.inherited_value.as_deref().unwrap_or("(default)");
+                let _ = write!(
+                    line,
+                    "  reset → {inherited} [{}]",
+                    setting.inherited_source.label
+                );
+            }
+            println!("{line}");
+        }
+        println!();
+    }
     Ok(())
 }
 

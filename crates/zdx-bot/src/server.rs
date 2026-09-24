@@ -36,6 +36,7 @@ use zdx_engine::models::ModelOption;
 use zdx_engine::providers::ReplayToken;
 use zdx_engine::providers::subscription_quota::{self, QuotaError, SubscriptionQuota};
 use zdx_engine::service::{self, Service};
+use zdx_engine::workspace_config::{self, WorkspaceReport};
 use zdx_engine::{agent_activity, automations, background_activity};
 
 const INIT_DATA_MAX_AGE_SECS: u64 = 60 * 60;
@@ -605,6 +606,7 @@ pub(crate) fn create_router(state: Arc<ServerState>) -> Router {
         .route("/threads/{id}", get(get_thread))
         .route("/threads/{id}/workers", get(get_thread_workers))
         .route("/monitor", get(get_monitor))
+        .route("/workspaces", get(get_workspaces))
         .route("/git", get(get_git))
         .route("/git/scope", get(get_git_scope))
         .route("/git/diff", get(get_git_diff))
@@ -2336,6 +2338,33 @@ fn short_hash(hash: &str) -> String {
     hash.chars().take(8).collect()
 }
 
+#[derive(Serialize)]
+struct WorkspacesResponse {
+    workspaces: Vec<WorkspaceReport>,
+}
+
+/// Read-only model settings of every workspace (Telegram bindings + the bot
+/// root), each value tagged with the layer that supplied it and what a reset
+/// of the workspace layer would fall back to. A thin adapter over
+/// `zdx_engine::workspace_config`; it reads a few small TOML files, so it is
+/// not cached.
+async fn get_workspaces(
+    State(state): State<Arc<ServerState>>,
+) -> Result<Json<WorkspacesResponse>, ApiError> {
+    let root = state.root.clone();
+    tokio::task::spawn_blocking(move || workspace_config::report(Some(&root)))
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, "Mini App workspaces task failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "Workspaces unavailable")
+        })?
+        .map(|workspaces| Json(WorkspacesResponse { workspaces }))
+        .map_err(|error| {
+            tracing::warn!(error = %format!("{error:#}"), "Failed to list Mini App workspaces");
+            (StatusCode::INTERNAL_SERVER_ERROR, "Workspaces unavailable")
+        })
+}
+
 async fn get_monitor(
     State(state): State<Arc<ServerState>>,
 ) -> Result<Json<MonitorResponse>, ApiError> {
@@ -2866,6 +2895,7 @@ mod tests {
             "/api/threads/active/artifacts",
             "/api/threads/active/artifacts/file?path=x",
             "/api/monitor",
+            "/api/workspaces",
             "/api/git?thread_id=active",
             "/api/git/scope?thread_id=active&scope=all",
             "/api/git/diff?thread_id=active&kind=unstaged&path=README.md",

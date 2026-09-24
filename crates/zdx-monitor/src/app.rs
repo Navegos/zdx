@@ -14,6 +14,7 @@ use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::prelude::*;
 use zdx_engine::core::thread_index::{ThreadBrowseOptions, ThreadKindFilter};
 use zdx_engine::core::usage_stats::UsageStats;
+use zdx_engine::workspace_config::{self, EditTarget, Setting, Workspace};
 
 use crate::log_line::{LevelFilter, line_target};
 use crate::tabs::agents::{
@@ -26,9 +27,9 @@ use crate::tabs::background::{
     load_background, open_background_detail, refresh_background_detail,
 };
 use crate::tabs::config::{
-    ConfigLine, ModelPickerState, config_max_scroll, config_page_size, delete_or_reset_selected,
-    handle_model_picker_key, load_config_view, move_config_selection, open_model_picker,
-    rendered_line_count,
+    ConfigLine, ModelPickerState, RowSource, config_max_scroll, config_page_size,
+    handle_config_key, handle_model_picker_key, load_config_view, move_config_selection,
+    open_model_picker, rendered_line_count,
 };
 use crate::tabs::logs::{
     LOG_TAIL_LINES, LoadedLogFile, ensure_log_selected_visible, handle_log_overlay_key,
@@ -53,7 +54,19 @@ use crate::ui;
 #[allow(clippy::struct_excessive_bools)]
 pub struct MonitorApp {
     pub config_lines: Vec<ConfigLine>,
-    pub config_sources: Vec<Option<String>>,
+    pub config_sources: Vec<Option<RowSource>>,
+    /// Shared model settings of the viewed workspace (value, origin, and
+    /// what a reset falls back to), keyed by setting key.
+    pub config_settings: Vec<Setting>,
+    /// Workspaces the Config tab can view: Telegram bindings + the monitor
+    /// root. Never empty; the monitor root is always present.
+    pub config_workspaces: Vec<Workspace>,
+    /// Index into `config_workspaces` of the viewed workspace.
+    pub config_workspace_index: usize,
+    /// Where Config edits and resets are written (`w` toggles).
+    pub config_target: EditTarget,
+    /// Open workspace picker (`p` on the Config tab), if any.
+    pub config_workspace_picker: Option<TargetPickerState>,
     pub config_line_count: usize,
     pub config_scroll: usize,
     /// Index into the editable model rows of the Config tab (see
@@ -238,6 +251,11 @@ impl Section {
 }
 
 impl MonitorApp {
+    /// The workspace the Config tab is viewing.
+    pub(crate) fn config_workspace(&self) -> &Workspace {
+        &self.config_workspaces[self.config_workspace_index]
+    }
+
     fn item_count(&self) -> usize {
         match self.active_section {
             Section::Services => self.services.len(),
@@ -359,7 +377,8 @@ fn switch_section(app: &mut MonitorApp, section: Section) {
 
 fn build_app(root: &Path) -> Result<MonitorApp> {
     let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    let view = load_config_view(&root).context("load config")?;
+    let config_workspaces = workspace_config::discover(Some(&root)).context("list workspaces")?;
+    let view = load_config_view(&config_workspaces[0]).context("load config")?;
     let default_model = view.model;
     let config_lines = view.lines;
     let config_line_count = rendered_line_count(&config_lines);
@@ -368,6 +387,11 @@ fn build_app(root: &Path) -> Result<MonitorApp> {
     let mut app = MonitorApp {
         config_lines,
         config_sources: view.sources,
+        config_settings: view.settings,
+        config_workspaces,
+        config_workspace_index: 0,
+        config_target: EditTarget::Global,
+        config_workspace_picker: None,
         config_line_count,
         config_scroll: 0,
         config_selected: 0,
@@ -462,6 +486,7 @@ const OVERLAY_CLOSE_SCROLL_GUARD: Duration = Duration::from_millis(250);
 /// Whether any modal surface is stacked over the active section.
 fn overlay_open(app: &MonitorApp) -> bool {
     app.model_picker.is_some()
+        || app.config_workspace_picker.is_some()
         || app.timing_overlay.is_some()
         || app.background_detail.is_some()
         || app.agent_overlay.is_some()
@@ -476,6 +501,7 @@ fn text_input_active(app: &MonitorApp) -> bool {
     app.log_query_editing
         || app.thread_query_editing
         || app.model_picker.is_some()
+        || app.config_workspace_picker.is_some()
         || app.log_target_picker.is_some()
         || app.thread_project_picker.is_some()
 }
@@ -566,6 +592,9 @@ fn dispatch_key_event(app: &mut MonitorApp, key: KeyEvent) {
     if app.active_section == Section::Usage && handle_usage_key(app, key.code) {
         return;
     }
+    if app.active_section == Section::Config && handle_config_key(app, key.code) {
+        return;
+    }
     match key.code {
         KeyCode::Char('q') => app.should_quit = true,
         KeyCode::Tab => {
@@ -604,9 +633,6 @@ fn dispatch_key_event(app: &mut MonitorApp, key: KeyEvent) {
         KeyCode::PageUp if app.active_section == Section::Config => {
             let page = config_page_size(app);
             app.config_scroll = app.config_scroll.saturating_sub(page);
-        }
-        KeyCode::Char('d') | KeyCode::Delete if app.active_section == Section::Config => {
-            delete_or_reset_selected(app);
         }
         KeyCode::Char('y') => copy_selected_thread_id(app),
         KeyCode::Char('x') if app.active_section == Section::Background => {
@@ -717,6 +743,17 @@ fn handle_mouse_event(app: &mut MonitorApp, mouse: MouseEvent) {
 /// so scrolling never leaks to the list underneath).
 fn handle_overlay_mouse(app: &mut MonitorApp, mouse: MouseEvent) -> bool {
     let kind = mouse.kind;
+    if let Some(picker) = app.config_workspace_picker.as_mut() {
+        match kind {
+            MouseEventKind::ScrollUp => picker.selected = picker.selected.saturating_sub(1),
+            MouseEventKind::ScrollDown => {
+                let last = picker.matches.len().saturating_sub(1);
+                picker.selected = (picker.selected + 1).min(last);
+            }
+            _ => {}
+        }
+        return true;
+    }
     if let Some(picker) = app.model_picker.as_mut() {
         match kind {
             MouseEventKind::ScrollUp => picker.selected = picker.selected.saturating_sub(1),

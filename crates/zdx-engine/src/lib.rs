@@ -24,4 +24,5 @@ pub mod telegram;
 pub mod test_support;
 pub mod tools;
 pub mod tracing_init;
+pub mod workspace_config;
 pub mod zdx_context;

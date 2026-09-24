@@ -14,7 +14,9 @@ zdx is a terminal-based AI coding assistant built in Rust, featuring a non-inter
 - **zdx-bot:** Telegram bot surface.
 - **zdx-monitor:** Service dashboard TUI.
 
-Config provenance is an opt-in companion to the engine's layered loader: `Config::load_layered_with_sources` uses the same merge/parser as ordinary loading, retaining explicit leaf origins and array-owner origins in `ConfigSources` without serializing them into `Config`. Monitor loads its supplied root through this API and stores row labels separately from values; rendering adds compact workspace names without changing picker inputs or save targets. Ordinary config loads do not collect provenance.
+Config provenance is an opt-in companion to the engine's layered loader: `Config::load_layered_with_sources` uses the same merge/parser as ordinary loading, retaining explicit leaf origins and array-owner origins in `ConfigSources` without serializing them into `Config`. Monitor loads the viewed workspace through this API and stores row labels separately from values; rendering adds compact workspace names without changing picker inputs. Ordinary config loads do not collect provenance.
+
+`workspace_config` is the shared workspace layer on top of it: it lists workspaces (Telegram profile `cwd`s + the caller's root), resolves each model setting to its value, origin layer (default/global/own overlay/ancestor overlay) and inherited fallback, and performs targeted writes and resets against one named layer (global or the workspace's own overlay). Monitor Config (read/write), `zdx config workspaces` and the Mini App `GET /api/workspaces` (read-only) are thin adapters over it. Config writers go through `Config::layer_document`, which refreshes only the global file against the commented template and keeps workspace overlays minimal.
 
 ## MCP Internal Engine
 

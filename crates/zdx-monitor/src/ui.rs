@@ -52,6 +52,12 @@ pub fn render(f: &mut Frame, app: &MonitorApp) {
         render_picker(f, picker, f.area(), "project");
     }
 
+    if app.active_section == Section::Config
+        && let Some(picker) = &app.config_workspace_picker
+    {
+        render_picker(f, picker, f.area(), "workspace · (n) Telegram bindings");
+    }
+
     if let Some(state) = &app.agent_overlay {
         render_agent_overlay(f, state, f.area());
     }
@@ -108,7 +114,7 @@ fn footer_hint(section: Section) -> &'static str {
         Section::Background => "↑↓ navigate • Enter details • x kill • Tab/⇧Tab switch • q quit",
         Section::Automations => "↑↓ navigate • Tab/⇧Tab switch • q quit",
         Section::Config => {
-            "↑↓ select model • Enter edit • d delete mode / reset subagent • PgUp/PgDn scroll • Tab/⇧Tab switch • q quit"
+            "↑↓ select • Enter edit • d reset here / delete mode • D reset modes • p workspace • w target • PgUp/PgDn scroll • q quit"
         }
         Section::Threads => {
             "↑↓ navigate • Enter preview • o raw • i timings • t kind • p project • / search • Esc clear • y copy ID"
