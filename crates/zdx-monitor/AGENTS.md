@@ -25,7 +25,7 @@ Rows come from `zdx_engine::core::thread_index::browse_threads()` (`threads.sqli
 
 ## Services tab
 
-The **Services** tab is a control panel over launchd, not a supervisor. `load_services()` maps `zdx_engine::service::Service::ALL` through `service::state()`. `Enter` delegates to `start`/`stop`, `r` requests a guarded restart, and `R` explicitly forces restart through active agent work. Monitor never spawns service processes itself, so restart always picks up `~/.local/bin/zdx` rather than the binary the monitor was launched from. Lifetime (login start, crash restart, `/restart` exit) belongs to launchd; install the agents with `zdx service install`.
+The **Services** tab is a control panel over launchd, not a supervisor. `load_services()` maps `zdx_engine::service::Service::ALL` through `service::state()`. `Enter` delegates to `start`/`stop`, `r` requests a guarded restart, and `R` explicitly forces restart through active agent work. Restart runs on a background thread (`RestartJob` in `MonitorApp::restart_job`, collected by `poll_restart_result` in `refresh_app`) because `service::restart` waits for the replacement PID and launchd's `ThrottleInterval` can defer that spawn by up to ~10s; running it inline froze the UI. While a job is in flight the row shows `restarting`, the status stays pinned, and further `r`/`R`/`Enter` are refused. Monitor never spawns service processes itself, so restart always picks up `~/.local/bin/zdx` rather than the binary the monitor was launched from. Lifetime (login start, crash restart, `/restart` exit) belongs to launchd; install the agents with `zdx service install`.
 
 ## Checks
 - Default final verification after code changes: `just ci` from repo root

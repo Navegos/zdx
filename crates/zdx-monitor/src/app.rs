@@ -37,8 +37,8 @@ use crate::tabs::logs::{
     recompute_log_visible,
 };
 use crate::tabs::services::{
-    ServiceInfo, load_services, restart_force_for_key, restart_selected_service,
-    toggle_selected_service,
+    RestartJob, ServiceInfo, load_services, poll_restart_result, restart_force_for_key,
+    restart_selected_service, toggle_selected_service,
 };
 use crate::tabs::threads::{
     ThreadInfo, ThreadsSnapshot, TimingOverlayState, copy_selected_thread_id,
@@ -104,6 +104,8 @@ pub struct MonitorApp {
     pub(crate) pending_open_path: Option<PathBuf>,
     pub automations: Vec<AutomationInfo>,
     pub services: Vec<ServiceInfo>,
+    /// In-flight background service restart, if any. Only one runs at a time.
+    pub restart_job: Option<RestartJob>,
     pub active_agents: Vec<ActiveAgentInfo>,
     /// Running background processes (from `background_activity`), for the
     /// Background tab. Sorted so same-thread processes are adjacent.
@@ -412,6 +414,7 @@ fn build_app(root: &Path) -> Result<MonitorApp> {
         pending_open_path: None,
         automations: load_automations(&root),
         services,
+        restart_job: None,
         active_agents: load_active_agents(),
         background: load_background(),
         agent_overlay: None,
@@ -815,9 +818,11 @@ fn handle_overlay_mouse(app: &mut MonitorApp, mouse: MouseEvent) -> bool {
 const STATUS_TTL: Duration = Duration::from_secs(4);
 
 fn refresh_app(app: &mut MonitorApp) {
-    if app
-        .status_set_at
-        .is_some_and(|set_at| set_at.elapsed() >= STATUS_TTL)
+    poll_restart_result(app);
+    if app.restart_job.is_none()
+        && app
+            .status_set_at
+            .is_some_and(|set_at| set_at.elapsed() >= STATUS_TTL)
     {
         app.status_message.clear();
         app.status_set_at = None;
