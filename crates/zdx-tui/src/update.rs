@@ -331,7 +331,6 @@ fn refresh_turn_context(tui: &mut crate::state::TuiState) {
             &tui.config,
             &tui.agent_opts.root,
             &instruction_layers,
-            true,
         )
     {
         tui.system_prompt = effective.prompt;

@@ -101,17 +101,17 @@ mod tests {
     fn template_teaches_zdx_house_style() {
         let prompt = build_prompt_builder_prompt("anything", "");
         // The template must teach the iterative ZDX-style blocks (Rules,
-        // loop arrow, termination contract, deliverables) and the subagent
-        // vocabulary. If any of these get accidentally stripped the prompt
-        // builder will collapse back to a generic prompt and lose its house
-        // style — which is exactly what this test guards against.
+        // loop line, termination contract, deliverables) and take subagent
+        // names from <zdx_context>. If any of these get accidentally stripped
+        // the prompt builder will collapse back to a generic prompt and lose
+        // its house style — which is exactly what this test guards against.
         assert!(prompt.contains("Rules:"));
         assert!(prompt.contains("Repeat until:"));
-        assert!(prompt.contains("Loop arrow"));
         assert!(prompt.contains("→"));
         assert!(prompt.contains("At the end, give me:"));
         assert!(prompt.contains("Oracle"));
-        assert!(prompt.contains("Explorer"));
+        assert!(prompt.contains("Name subagents and skills only when <zdx_context> lists them"));
+        assert!(!prompt.contains("**Task**"));
     }
 
     #[test]
@@ -123,7 +123,6 @@ mod tests {
         // directing the receiving agent to track work, which defeats the
         // ZDX house style for iterative workflows.
         assert!(prompt.contains("Todo_Write"));
-        assert!(prompt.contains("in_progress"));
     }
 
     #[test]

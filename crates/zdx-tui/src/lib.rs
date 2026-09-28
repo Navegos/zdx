@@ -86,7 +86,6 @@ pub async fn run_interactive_chat_with_history(
             config,
             &root,
             &instruction_layers,
-            true,
         )?;
 
     // Print pre-TUI info to stderr (will be replaced by alternate screen)

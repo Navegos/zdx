@@ -118,7 +118,6 @@ async fn run(
         &config,
         &agent_opts.root,
         &instruction_layers,
-        true,
     )?;
     let system_prompt = effective.prompt.unwrap_or_default();
     let agents_paths = effective.loaded_agents_paths.clone();

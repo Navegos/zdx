@@ -14,7 +14,8 @@ use crate::prompts::THREAD_TITLE_PROMPT_TEMPLATE;
 /// Model used when the configured title model fails.
 const FALLBACK_TITLE_MODEL: &str = "openai-codex:gpt-5.6-luna";
 
-/// Generate a title from a message using the LLM subagent.
+/// Generate a title from a message using the LLM subagent. For a `/handoff`
+/// or `/btw` seed, the title comes from the user's message in it.
 ///
 /// Falls back to [`FALLBACK_TITLE_MODEL`] if the configured model fails.
 ///
@@ -55,6 +56,7 @@ async fn generate_with_model(
     root: &Path,
     parent_thread_id: Option<&str>,
 ) -> Result<String> {
+    let message = crate::core::handoff_generation::seed_title_text(message);
     let prompt = THREAD_TITLE_PROMPT_TEMPLATE.replace("{{MESSAGE}}", message);
 
     let spec = crate::models::ModelSpec::parse(title_model);

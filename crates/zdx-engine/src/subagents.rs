@@ -294,7 +294,6 @@ fn render_prompt_inner(
         root,
         model,
         &definition.prompt_body,
-        false,
         inclusion,
         &StandalonePromptSkillContext {
             available_skills: subagent_skills.allowed,
@@ -1373,7 +1372,6 @@ mod tests {
             root.path(),
             model,
             &[],
-            false,
             PromptContextInclusion::default(),
         )
         .unwrap()

@@ -46,76 +46,119 @@ fn collect_lineage(source_thread_id: &str) -> Vec<LineageEntry> {
     chain
 }
 
+const HANDOFF_KIND: &str = "Handoff";
+const SIDE_QUESTION_KIND: &str = "Side question";
+const USER_MESSAGE_LABEL: &str = "User message:\n";
+
+/// Label line that starts the helper's generated background in a handoff seed.
+fn generated_background_label(source_thread_id: &str) -> String {
+    format!(
+        "Generated background from thread {source_thread_id} (written by a helper model; it can be incomplete or wrong):\n"
+    )
+}
+
 /// Formats one lineage entry as `id "title"`.
 fn format_lineage_entry(entry: &LineageEntry) -> String {
     let (id, title) = entry;
     format!("{id} \"{title}\"")
 }
 
-/// Builds the parenthetical note pointing at the source thread and its lineage.
-///
-/// With no ancestors it keeps the original short wording; with ancestors it
-/// renders the full chain so the new assistant can `read_thread` any of them.
-///
-/// `full_context` selects the wording: `true` points at the thread for the whole
-/// context (nothing else follows it), `false` points at it for whatever is
-/// missing from the content that follows.
-fn build_lineage_note(lineage: &[LineageEntry], full_context: bool) -> String {
+/// Header line that starts a seeded thread: what kind of transition it is,
+/// the source thread, and its ancestors, so the new assistant can
+/// `read_thread` any of them.
+fn build_source_header(kind: &str, lineage: &[LineageEntry]) -> String {
     let Some(source) = lineage.first() else {
-        return String::new();
+        return format!("[{kind}]");
     };
     if lineage.len() <= 1 {
-        let id = &source.0;
-        if full_context {
-            format!("(Continuing from thread {id} — call read_thread for full context.)")
-        } else {
-            format!(
-                "(Continuing from thread {id} — call read_thread for anything below that's missing.)"
-            )
-        }
-    } else {
-        let chain = lineage
-            .iter()
-            .map(format_lineage_entry)
-            .collect::<Vec<_>>()
-            .join(" ← ");
-        let source_str = format_lineage_entry(source);
-        format!(
-            "(Continuing from {source_str}. Lineage: {chain}. Call read_thread on any thread ID above for missing context.)"
-        )
+        return format!(
+            "[{kind} from thread {}. Use read_thread on it for details.]",
+            source.0
+        );
     }
+    let chain = lineage
+        .iter()
+        .map(format_lineage_entry)
+        .collect::<Vec<_>>()
+        .join(" ← ");
+    format!(
+        "[{kind} from thread {}. Lineage: {chain}. Use read_thread on any of these threads for details.]",
+        format_lineage_entry(source)
+    )
 }
 
-/// Joins the user's verbatim message with a lineage note, message first.
-fn join_message_and_note(message: &str, note: String) -> String {
+/// The user's own words, labelled so they stay apart from generated text.
+/// `None` when the user sent nothing.
+fn user_message_block(message: &str) -> Option<String> {
     let trimmed = message.trim();
-    if trimmed.is_empty() {
-        note
-    } else {
-        format!("{trimmed}\n\n{note}")
+    (!trimmed.is_empty()).then(|| format!("{USER_MESSAGE_LABEL}{trimmed}"))
+}
+
+/// Seed for `/handoff`: header, the user's message verbatim, then the
+/// helper's generated background, each part labelled with its origin.
+fn build_handoff_seed(
+    source_thread_id: &str,
+    lineage: &[LineageEntry],
+    next_message: &str,
+    generated: &str,
+) -> String {
+    let background = format!(
+        "{}{}",
+        generated_background_label(source_thread_id),
+        generated.trim()
+    );
+    [
+        Some(build_source_header(HANDOFF_KIND, lineage)),
+        user_message_block(next_message),
+        Some(background),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join("\n\n")
+}
+
+/// Builds the seed message for a side thread (`/btw`): a header pointing at
+/// `source_thread_id` and its ancestors, then the user's message verbatim.
+/// No generated text is added.
+pub fn build_side_thread_seed(source_thread_id: &str, message: &str) -> String {
+    let header = build_source_header(SIDE_QUESTION_KIND, &collect_lineage(source_thread_id));
+    match user_message_block(message) {
+        Some(block) => format!("{header}\n\n{block}"),
+        None => header,
     }
 }
 
-/// Prefix shown at the beginning of generated handoff output.
+/// The text a title should be generated from, for a message that may be a
+/// `/handoff` or `/btw` seed built above.
 ///
-/// The user's literal next-chat message leads (so the new assistant sees the
-/// user's own words first, exactly as typed), followed by a short parenthetical
-/// pointing at the source thread and its full ancestor lineage. The
-/// LLM-generated context block is appended after this prefix.
-fn build_handoff_prefix(lineage: &[LineageEntry], next_message: &str) -> String {
-    let note = build_lineage_note(lineage, next_message.trim().is_empty());
-    join_message_and_note(next_message, note)
-}
-
-/// Builds the seed message for a side thread (`/btw`).
-///
-/// The user's message leads verbatim, followed by a note pointing at
-/// `source_thread_id` and its ancestor lineage. Unlike `/handoff`, no generated
-/// context block follows, so the assistant is told to call `read_thread` for the
-/// full context rather than for gaps.
-pub fn build_side_thread_seed(source_thread_id: &str, message: &str) -> String {
-    let note = build_lineage_note(&collect_lineage(source_thread_id), true);
-    join_message_and_note(message, note)
+/// For a seed, returns the user's message, or the generated background when
+/// the user sent no message. Any other text, including a seed whose header or
+/// labels were edited, is returned unchanged.
+#[must_use]
+pub fn seed_title_text(message: &str) -> &str {
+    let Some((header, rest)) = message.split_once("\n\n") else {
+        return message;
+    };
+    let Some(source_id) = [HANDOFF_KIND, SIDE_QUESTION_KIND].iter().find_map(|kind| {
+        header
+            .strip_prefix(&format!("[{kind} from thread "))
+            .and_then(|tail| tail.split([' ', '.']).next())
+            .filter(|id| !id.is_empty())
+    }) else {
+        return message;
+    };
+    let background_label = generated_background_label(source_id);
+    if let Some(user) = rest.strip_prefix(USER_MESSAGE_LABEL) {
+        // The user's words are verbatim and may contain anything, so only the
+        // exact label this seed was built with ends them.
+        let end = user
+            .find(&format!("\n\n{background_label}"))
+            .unwrap_or(user.len());
+        return &user[..end];
+    }
+    rest.strip_prefix(background_label.as_str())
+        .unwrap_or(message)
 }
 
 /// Builds the prompt for handoff generation.
@@ -128,9 +171,9 @@ fn build_handoff_prompt(thread_content: &str, next_message: &str, zdx_context: &
 
 /// Generates a handoff prompt for `thread_id`, ready to seed a new thread.
 ///
-/// The result leads with the user's `next_message` (verbatim, when non-empty)
-/// and a lineage note pointing at the source thread, followed by the
-/// LLM-generated context block.
+/// The result starts with a header naming the source thread and its lineage,
+/// then the user's `next_message` verbatim (when non-empty), then the
+/// LLM-generated background, each part labelled with where it came from.
 ///
 /// # Errors
 /// Returns an error when the thread cannot be loaded, is empty, or the
@@ -150,7 +193,6 @@ pub async fn generate_handoff(
     let generation_prompt =
         build_handoff_prompt(&thread_content, next_message, &build_zdx_context(root));
     let lineage = collect_lineage(thread_id);
-    let handoff_prefix = build_handoff_prefix(&lineage, next_message);
 
     let spec = crate::models::ModelSpec::parse(handoff_model);
     let options = ExecSubagentOptions {
@@ -170,83 +212,106 @@ pub async fn generate_handoff(
 
     let generated_prompt =
         run_exec_subagent_with_cancel(root, &generation_prompt, &options, cancel, None).await?;
-    Ok(format!("{handoff_prefix}\n\n{generated_prompt}"))
+    Ok(build_handoff_seed(
+        thread_id,
+        &lineage,
+        next_message,
+        &generated_prompt,
+    ))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{LineageEntry, build_handoff_prefix, build_lineage_note, join_message_and_note};
+    use super::{
+        LineageEntry, build_handoff_seed, build_source_header, seed_title_text, user_message_block,
+    };
 
     fn entry(id: &str, title: &str) -> LineageEntry {
         (id.to_string(), title.to_string())
     }
 
-    /// `/btw` has no generated context block after the seed, so the note must
-    /// point at the thread for the *full* context, not for gaps "below".
     #[test]
-    fn side_thread_note_asks_for_full_context() {
-        let note = build_lineage_note(&[entry("thread-side", "Parent work")], true);
-        assert!(note.contains("thread-side"));
-        assert!(note.contains("read_thread"));
-        assert!(note.contains("full context"));
-        assert!(
-            !note.contains("below"),
-            "btw has no context block below the seed"
-        );
+    fn side_thread_seed_starts_with_header_then_user_message() {
+        let header = build_source_header("Side question", &[entry("thread-side", "Parent work")]);
+        let block = user_message_block("what files did we touch?").unwrap();
+        let seed = format!("{header}\n\n{block}");
+        assert!(seed.starts_with("[Side question from thread thread-side."));
+        assert!(seed.contains("read_thread"));
+        assert!(seed.ends_with("User message:\nwhat files did we touch?"));
     }
 
     #[test]
-    fn side_thread_seed_leads_with_the_user_message() {
-        let note = build_lineage_note(&[entry("thread-side", "Parent work")], true);
-        let seed = join_message_and_note("what files did we touch?", note);
-        assert!(seed.starts_with("what files did we touch?"));
-        assert!(seed.contains("thread-side"));
-    }
-
-    #[test]
-    fn handoff_prefix_mentions_thread_and_read_thread_tool() {
-        let lineage = vec![entry("thread-123", "Ship feature")];
-        let prefix = build_handoff_prefix(&lineage, "ship the new feature");
-        assert!(prefix.contains("thread-123"));
-        assert!(prefix.contains("read_thread"));
-    }
-
-    #[test]
-    fn handoff_prefix_leads_with_next_message_verbatim() {
-        let msg = "now lets streamline the comments";
+    fn handoff_seed_separates_user_words_from_generated_background() {
         let lineage = vec![entry("thread-xyz", "Streamline comments")];
-        let prefix = build_handoff_prefix(&lineage, msg);
-        assert!(prefix.starts_with(msg), "user message must lead the prefix");
+        let msg = "now lets streamline the comments";
+        let seed = build_handoff_seed("thread-xyz", &lineage, msg, "Open question: keep or drop?");
+
+        assert!(seed.starts_with("[Handoff from thread thread-xyz."));
+        let user = seed
+            .find(&format!("User message:\n{msg}"))
+            .expect("user block");
+        let generated = seed
+            .find("Generated background from thread thread-xyz")
+            .expect("generated block");
         assert!(
-            !prefix.contains("My goal:"),
-            "prefix must not relabel the user's message as a goal"
+            user < generated,
+            "the user's words come before generated text"
         );
+        assert!(seed.ends_with("Open question: keep or drop?"));
+        assert!(!seed.contains("My goal:"));
     }
 
     #[test]
-    fn handoff_prefix_handles_empty_next_message() {
+    fn handoff_seed_without_a_message_has_no_user_block() {
         let lineage = vec![entry("thread-abc", "Some work")];
-        let prefix = build_handoff_prefix(&lineage, "   ");
-        assert!(prefix.contains("thread-abc"));
-        assert!(prefix.contains("read_thread"));
-        // Empty case has no leading user-text section, just the parenthetical.
-        assert!(prefix.starts_with('('));
+        let seed = build_handoff_seed("thread-abc", &lineage, "   ", "Background");
+        assert!(seed.starts_with("[Handoff from thread thread-abc."));
+        assert!(!seed.contains("User message:"));
+        assert!(seed.contains("Generated background from thread thread-abc"));
     }
 
     #[test]
-    fn handoff_prefix_single_thread_keeps_short_wording() {
-        let lineage = vec![entry("thread-solo", "Solo work")];
-        let prefix = build_handoff_prefix(&lineage, "keep going");
-        // No ancestor chain is rendered when the source has no parents.
-        assert!(
-            !prefix.contains("Lineage:"),
-            "single-thread handoff should not render a lineage chain"
-        );
-        assert!(!prefix.contains('←'));
+    fn title_text_is_the_user_message_of_a_seed() {
+        let lineage = vec![entry("thread-xyz", "Streamline comments")];
+        let msg = "first line\n\nUser message:\nnot a label\nGenerated background from thread thread-xyz\n\n[Handoff from thread other.]";
+        let handoff = build_handoff_seed("thread-xyz", &lineage, msg, "Background text");
+        assert_eq!(seed_title_text(&handoff), msg);
+
+        let header = build_source_header("Side question", &lineage);
+        let side = format!("{header}\n\n{}", user_message_block(msg).unwrap());
+        assert_eq!(seed_title_text(&side), msg);
+
+        let chain = vec![entry("thread-b", "B title. Part 2"), entry("thread-a", "A")];
+        let nested = build_handoff_seed("thread-b", &chain, "keep going", "Background");
+        assert_eq!(seed_title_text(&nested), "keep going");
     }
 
     #[test]
-    fn handoff_prefix_renders_full_lineage_in_order() {
+    fn title_text_falls_back_to_background_then_to_the_whole_text() {
+        let lineage = vec![entry("thread-abc", "Some work")];
+        let seed = build_handoff_seed("thread-abc", &lineage, "", "Fix the flaky test\nin CI");
+        assert_eq!(seed_title_text(&seed), "Fix the flaky test\nin CI");
+
+        for text in [
+            "Fix the login bug",
+            "two\n\nparagraphs",
+            "[Handoff from thread x.]",
+            "[Handoff from thread x.]\n\nedited by the user",
+            "[Note from thread x.]\n\nUser message:\nhi",
+        ] {
+            assert_eq!(seed_title_text(text), text);
+        }
+    }
+
+    #[test]
+    fn single_thread_header_has_no_lineage_chain() {
+        let header = build_source_header("Handoff", &[entry("thread-solo", "Solo work")]);
+        assert!(!header.contains("Lineage:"));
+        assert!(!header.contains('←'));
+    }
+
+    #[test]
+    fn header_renders_full_lineage_in_order() {
         // Source first, then ancestors up to the root: D ← C ← B ← A.
         let lineage = vec![
             entry("thread-d", "Deploy"),
@@ -254,25 +319,22 @@ mod tests {
             entry("thread-b", "Build"),
             entry("thread-a", "Analyze"),
         ];
-        let prefix = build_handoff_prefix(&lineage, "keep going");
+        let header = build_source_header("Handoff", &lineage);
 
-        assert!(prefix.starts_with("keep going"), "message must lead");
-        assert!(prefix.contains("Lineage:"));
-        assert!(prefix.contains('←'));
-        assert!(prefix.contains("read_thread"));
-
+        assert!(header.starts_with("[Handoff from thread thread-d \"Deploy\"."));
+        assert!(header.contains("Lineage:"));
+        assert!(header.contains("read_thread"));
         for (id, title) in [
             ("thread-d", "Deploy"),
             ("thread-c", "Cleanup"),
             ("thread-b", "Build"),
             ("thread-a", "Analyze"),
         ] {
-            assert!(prefix.contains(id), "missing ancestor id {id}");
-            assert!(prefix.contains(title), "missing ancestor title {title}");
+            assert!(header.contains(id), "missing ancestor id {id}");
+            assert!(header.contains(title), "missing ancestor title {title}");
         }
-
-        // Ancestors appear source-first, oldest-last.
-        let pos = |needle: &str| prefix.find(needle).unwrap();
+        let chain = &header[header.find("Lineage:").unwrap()..];
+        let pos = |needle: &str| chain.find(needle).unwrap();
         assert!(
             pos("thread-d") < pos("thread-c")
                 && pos("thread-c") < pos("thread-b")

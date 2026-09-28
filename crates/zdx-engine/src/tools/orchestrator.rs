@@ -131,7 +131,7 @@ fn definition_for(op: Op) -> ToolDefinition {
     match op {
         Op::Create => ToolDefinition {
             name: "Create_Thread".to_string(),
-            description: "Create a new worker thread in an existing project directory and queue its first prompt. Returns the worker thread_id (and, when the surface opened one, the mirror_url of the Telegram topic where the user can follow it) while the worker runs in the background; you are notified automatically when its turn finishes. The worker already has the project's AGENTS.md rules, skills, and memory; the prompt is the user's request in their own words plus only what the worker cannot know (decisions from your conversation, threads to read, its slice of a split task, what to report back). Do not rewrite it into a specification.".to_string(),
+            description: "Create a new worker thread in an existing project directory and queue its first prompt. Returns the worker thread_id (and, when the surface opened one, the mirror_url of the Telegram topic where the user can follow it) while the worker runs in the background; you are notified automatically when its turn finishes. The worker already has the project's AGENTS.md rules, skills, and memory. Put the user's words under `User request:` and only what the worker cannot know under `Orchestrator notes:`. Do not rewrite the request into a specification.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -462,7 +462,8 @@ async fn create_thread(
 
     // The resolved root is what gets persisted on the worker, so a default is
     // never invisible: it drives mirror routing and is reported back below.
-    let worker_id = match manager.create_worker(owner, &root, prompt, title, model, thinking_level)
+    let prompt = frame_worker_prompt(owner, prompt);
+    let worker_id = match manager.create_worker(owner, &root, &prompt, title, model, thinking_level)
     {
         Ok(worker_id) => worker_id,
         Err(err) => {
@@ -491,6 +492,13 @@ async fn create_thread(
     }
 }
 
+/// Starts a worker prompt with a line that names the orchestrator thread that
+/// sent it. The body is the orchestrator's own text, so the line claims only
+/// the sender; any `User request:` label inside is the orchestrator's claim.
+fn frame_worker_prompt(owner: &str, prompt: &str) -> String {
+    format!("[Sent by the orchestrator in thread {owner}]\n\n{prompt}")
+}
+
 fn send_thread_message(manager: &Arc<WorkerManager>, owner: &str, input: &Value) -> ToolOutput {
     let thread_id = match required_str(input, "thread_id") {
         Ok(value) => value,
@@ -501,7 +509,7 @@ fn send_thread_message(manager: &Arc<WorkerManager>, owner: &str, input: &Value)
         Err(failure) => return failure,
     };
 
-    match manager.send_message(owner, thread_id, message) {
+    match manager.send_message(owner, thread_id, &frame_worker_prompt(owner, message)) {
         Ok(snapshot) => ToolOutput::success(json!({ "worker": snapshot_json(&snapshot) })),
         Err(err) => ToolOutput::failure("send_thread_message_failed", format!("{err:#}"), None),
     }
@@ -920,13 +928,15 @@ mod tests {
             &json!({"thread_id": id, "message": "stale"}),
         );
         let queue = sent.data().unwrap()["worker"]["queue"].clone();
-        assert_eq!(queue[0]["prompt"], "stale");
+        // The worker sees who sent the prompt before the prompt itself.
+        let framed = "[Sent by the orchestrator in thread owner]\n\nstale";
+        assert_eq!(queue[0]["prompt"], framed);
         let prompt_id = queue[0]["prompt_id"].as_u64().unwrap();
 
         let removed =
             remove_thread_prompt(&manager, &json!({"thread_id": id, "prompt_id": prompt_id}));
         let data = removed.data().unwrap();
-        assert_eq!(data["removed"]["prompt"], "stale");
+        assert_eq!(data["removed"]["prompt"], framed);
         assert_eq!(data["worker"]["queue_depth"], 0);
         assert_eq!(data["worker"]["status"], "running");
 

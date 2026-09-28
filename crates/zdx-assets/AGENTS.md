@@ -8,7 +8,7 @@ Scope: embedded asset content (prompts, instruction layers, default TOMLs, bundl
 - `build.rs`: generates the bundled-skill and bundled-command asset manifests from `bundled_skills/` and `bundled_commands/`
 - `prompts/`: shared prompt templates (identity, system, handoff, thread title, read_thread)
 - `instruction_layers/automation_instruction_layer.md`: headless automation-specific rules
-- `instruction_layers/exec_instruction_layer.md`: exec/terminal-specific output rules
+- `instruction_layers/exec_instruction_layer.md`: unattended `zdx exec` run rules (direct CLI, orchestrator workers, zbar)
 - `instruction_layers/chat_instruction_layer.md`: interactive TUI chat output rules
 - `instruction_layers/telegram_instruction_layer.md`: Telegram bot output rules
 - `default_config.toml`: default configuration template (generated output; do not edit by hand)

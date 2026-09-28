@@ -843,9 +843,6 @@ fn build_worker_update_prompt(
         }
     }
     prompt.push_str(&worker_context_section(worker_context));
-    prompt.push_str(
-        "\nHandle this update: reconcile your todos, follow up on the worker (Send_Thread_Message) or start dependent work if needed, and report the outcome to the user. Use Read_Thread on the worker for full context.",
-    );
     prompt
 }
 

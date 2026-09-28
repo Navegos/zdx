@@ -133,7 +133,6 @@ pub async fn run_exec(
                 config,
                 &options.root,
                 &instruction_layers,
-                false,
             )?,
         )
     };

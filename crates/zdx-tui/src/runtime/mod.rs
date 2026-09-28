@@ -676,7 +676,6 @@ impl TuiRuntime {
                     &config,
                     &root,
                     &crate::tui_instruction_layers(),
-                    true,
                 ) {
                     Ok(effective) => {
                         tab.system_prompt = effective.prompt;

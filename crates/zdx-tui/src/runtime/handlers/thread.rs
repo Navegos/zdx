@@ -169,7 +169,6 @@ pub fn refresh_system_prompt(config: &zdx_engine::config::Config, path: &Path) -
             config,
             path,
             &instruction_layers,
-            true,
         )
         .map(|context| crate::events::SystemPromptRefresh {
             prompt: context.prompt,
@@ -373,7 +372,6 @@ pub async fn thread_create(
             &config,
             &root,
             &instruction_layers,
-            true,
         )
         .unwrap_or_default();
 

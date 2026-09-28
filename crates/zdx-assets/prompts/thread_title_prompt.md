@@ -9,5 +9,5 @@ Rules:
 - Sentence case: capitalize only the first word and proper nouns or acronyms
 - Do not infer beyond the message
 - Drop generic words like "question", "request", or "help"
-- Concise software-engineering terms and acronyms are fine
+- Technical terms and acronyms are fine
 - Output only the title

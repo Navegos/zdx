@@ -179,7 +179,6 @@ pub(crate) fn prepare_bot_turn(
         root,
         &bot_config.model,
         &instruction_layers,
-        true,
         bot_prompt_context(),
     )
     .context("build bot prompt")?;
