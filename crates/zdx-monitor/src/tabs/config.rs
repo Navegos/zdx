@@ -1349,8 +1349,8 @@ fn render_picker_thinking(f: &mut Frame, picker: &ModelPickerState, popup: Rect)
 mod tests {
     use super::*;
 
-    fn label(source: &Option<RowSource>) -> Option<&str> {
-        source.as_ref().map(|source| source.label.as_str())
+    fn label(source: Option<&RowSource>) -> Option<&str> {
+        source.map(|source| source.label.as_str())
     }
 
     #[test]
@@ -1392,7 +1392,8 @@ mod tests {
         assert_ne!(std::env::current_dir().unwrap(), root);
 
         let workspace =
-            workspace_config::workspaces_from(&Default::default(), Some(&root)).remove(0);
+            workspace_config::workspaces_from(&std::collections::BTreeMap::default(), Some(&root))
+                .remove(0);
         let view = load_config_view(&workspace).unwrap();
         let row = row_index(&view.lines, "core", "model");
         assert_eq!(view.model, "selected@high");
@@ -1438,12 +1439,12 @@ mod tests {
             let lines = build_config_lines(&cfg, child.parent().unwrap().parent().unwrap());
             let labels = config_source_labels(&lines, &sources, &global, &child);
             assert_eq!(
-                label(&labels[row_index(&lines, "core", "model")]),
+                label(labels[row_index(&lines, "core", "model")].as_ref()),
                 Some(expected)
             );
             assert_eq!(labels[row_index(&lines, "core", "max_tokens")], None);
             assert_eq!(
-                label(&labels[row_index(&lines, "model modes", "work")]),
+                label(labels[row_index(&lines, "model modes", "work")].as_ref()),
                 Some("parity")
             );
             assert_eq!(
@@ -1451,7 +1452,7 @@ mod tests {
                 None
             );
             let secret_row = row_index(&lines, "providers", "openai.api_key");
-            assert_eq!(label(&labels[secret_row]), Some("parity"));
+            assert_eq!(label(labels[secret_row].as_ref()), Some("parity"));
             assert!(matches!(&lines[secret_row], ConfigLine::Row(_, value) if value == "***"));
             let field = editable_model_fields(&lines)
                 .into_iter()
@@ -1489,11 +1490,11 @@ mod tests {
             &home.path().join(".zdx/config.toml"),
         );
         assert_eq!(
-            label(&labels[row_index(&lines, "core", "model")]),
+            label(labels[row_index(&lines, "core", "model")].as_ref()),
             Some("parity")
         );
         assert_eq!(
-            label(&labels[row_index(&lines, "subagents", "explorer")]),
+            label(labels[row_index(&lines, "subagents", "explorer")].as_ref()),
             Some("parity")
         );
     }
