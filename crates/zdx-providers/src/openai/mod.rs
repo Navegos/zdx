@@ -99,7 +99,7 @@ mod tests {
 
     #[test]
     fn gpt_6_accepts_max_and_never_disables_reasoning() {
-        for model in ["gpt-6-astra", "openai:gpt-6-astra"] {
+        for model in ["gpt-6-astra", "openai:gpt-6-astra", "gpt-6.1-sol"] {
             assert_eq!(
                 responses_reasoning_effort(ThinkingLevel::Max, model),
                 Some("max")

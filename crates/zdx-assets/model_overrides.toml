@@ -183,3 +183,19 @@ reasoning = false
 [[override]]
 id = "google-antigravity:gemini-3.1-pro-high"
 reasoning = false
+
+# GPT-6.1 Sol (released 2026-09-29): not yet in models.dev. The OpenRouter
+# fallback omits cache writes and reports cached input as 0.0999..., so pin the
+# official standard rates (prompts over 272K input tokens are billed higher;
+# the registry stores the base tier only).
+# https://developers.openai.com/api/docs/models/gpt-6.1-sol — verified 2026-09-29
+[[override]]
+id = "openai:gpt-6.1-sol"
+input = 2.0
+output = 10.0
+cache_read = 0.1
+cache_write = 2.5
+context_limit = 1050000
+output_limit = 128000
+reasoning = true
+input_images = true

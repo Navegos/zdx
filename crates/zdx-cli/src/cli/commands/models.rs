@@ -923,6 +923,7 @@ fn normalize_model_lookup_id(model_id: &str) -> String {
 /// Looks up a model in the `OpenRouter` API data and converts it to a `ModelCandidate`.
 fn lookup_openrouter_model(
     provider_id: &str,
+    prefix: Option<&str>,
     model_id: &str,
     openrouter_models: &[OpenRouterModel],
 ) -> Option<ModelCandidate> {
@@ -1010,7 +1011,7 @@ fn lookup_openrouter_model(
         api: None,
     };
 
-    let full_id = format!("{provider_id}:{model_id}");
+    let full_id = format_model_id(prefix, model_id);
     let match_targets = build_match_targets(provider_id, model_id, &full_id);
 
     Some(ModelCandidate {
@@ -1049,7 +1050,9 @@ fn create_default_candidate(
     }
 
     // Try OpenRouter as secondary fallback
-    if let Some(or_candidate) = lookup_openrouter_model(provider_id, model_id, openrouter_models) {
+    if let Some(or_candidate) =
+        lookup_openrouter_model(provider_id, prefix, model_id, openrouter_models)
+    {
         println!("Info: using OpenRouter data for '{}'", or_candidate.full_id);
         return or_candidate;
     }
@@ -1259,15 +1262,20 @@ mod tests {
             supported_parameters: vec!["reasoning".to_string()],
         }];
 
-        let candidate =
-            lookup_openrouter_model("openrouter", "meta/muse-spark-1.3", &models).unwrap();
+        let candidate = lookup_openrouter_model(
+            "openrouter",
+            Some("openrouter"),
+            "meta/muse-spark-1.3",
+            &models,
+        )
+        .unwrap();
         assert_eq!(candidate.full_id, "openrouter:meta/muse-spark-1.3");
         assert_eq!(candidate.display_name, "Muse Spark 1.3");
         assert_eq!(candidate.context_limit, 1_048_576);
         assert!(candidate.capabilities.reasoning);
 
         // Native providers still get the vendor prefix applied.
-        assert!(lookup_openrouter_model("meta", "muse-spark-1.3", &models).is_some());
+        assert!(lookup_openrouter_model("meta", Some("meta"), "muse-spark-1.3", &models).is_some());
     }
 
     #[test]
