@@ -106,6 +106,8 @@ ZDX solves this with a boring, reliable core:
 
 - **stdout:** generated image file path(s), one per line.
 - **stderr:** diagnostics and errors.
+- `openai:gpt-image-2.5-flare` and `openai:gpt-image-2.5-sunburst` (and their dated snapshots) run through the Responses `image_generation` tool with the exact ID in the tool's `model` field. This is the route for explicit Flare/Sunburst selection.
+- `openai-codex:*` image requests are allowed but the subscription backend is server-managed. `zdx imagine` prints a warning on stderr for every such request: the requested image model or variant cannot be guaranteed, the model that ran is not reported, and the requested size and quality were not honored in probes (it chose its own size, for example 1536x1024 for `--size 1K`). Codex responses carry no effective-model field; output-token counts matched the `gpt-image-2.5-flare` tiers, which is suggestive and not proof of the model.
 
 ### `zdx mcp ...` (non-interactive helper, scriptable)
 

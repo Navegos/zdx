@@ -174,7 +174,7 @@ enum Commands {
         #[arg(short, long, value_name = "PATH")]
         out: Option<String>,
 
-        /// Model to use (Gemini API model, openai:gpt-image-2, or openai-codex:gpt-image-2)
+        /// Model to use (Gemini API model, openai:gpt-image-2, openai:gpt-image-2.5-flare, openai:gpt-image-2.5-sunburst, or openai-codex:gpt-image-2; Codex model and size are server-managed)
         #[arg(long, value_name = "MODEL")]
         model: Option<String>,
 

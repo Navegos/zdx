@@ -179,7 +179,9 @@ impl OpenAICodexClient {
     ///
     /// The Responses API uses a mainline model for tool orchestration; when callers pass
     /// `gpt-image-2` as the selected model, use the current Codex-capable default model
-    /// and force the hosted image generation tool.
+    /// and force the hosted image generation tool. The subscription backend manages the
+    /// image engine itself: probes showed it ignores the requested image model, size, and
+    /// quality, and it does not report which model ran.
     ///
     /// # Errors
     /// Returns an error if the request fails or the response cannot be parsed.

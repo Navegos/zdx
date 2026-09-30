@@ -21,6 +21,7 @@ use zdx_engine::providers::{ProviderKind, ProviderSelection, resolve_provider};
 
 const DEFAULT_IMAGINE_MODEL: &str = "gemini:gemini-3.1-flash-image-preview";
 const DEFAULT_OPENAI_RESPONSES_IMAGE_SIZE: &str = "1024x1024";
+const CODEX_IMAGE_NOTICE: &str = "warning: OpenAI Codex subscription image generation is server-managed. The requested image model or variant (for example gpt-image-2.5-flare) cannot be guaranteed, the reported model is not verifiable, and the requested --size and quality were not honored in probes. Use 'openai:<model>' with an API key for explicit model selection.";
 
 pub struct ImagineRunOptions<'a> {
     pub root: &'a Path,
@@ -45,7 +46,7 @@ pub async fn run(options: ImagineRunOptions<'_>) -> Result<()> {
             generate_alibaba_images(&provider_selection.model, &options).await?
         }
         _ => bail!(
-            "zdx imagine supports Gemini, OpenAI, OpenAI Codex, and Alibaba (Qwen-Image) image generation. Use 'gemini:', 'openai:gpt-image-2', 'openai-codex:gpt-image-2', or 'alibaba:qwen-image-3.0-pro'"
+            "zdx imagine supports Gemini, OpenAI, OpenAI Codex, and Alibaba (Qwen-Image) image generation. Use 'gemini:', 'openai:gpt-image-2', 'openai:gpt-image-2.5-flare', 'openai-codex:gpt-image-2', or 'alibaba:qwen-image-3.0-pro'"
         ),
     };
 
@@ -212,6 +213,7 @@ async fn generate_codex_images(
     options: &ImagineRunOptions<'_>,
 ) -> Result<GenerateImageResponse> {
     let image_options = openai_family_image_options("OpenAI Codex", options)?;
+    eprintln!("{CODEX_IMAGE_NOTICE}");
     let codex_config = OpenAICodexConfig::new(
         selection.model.clone(),
         image_reasoning_effort(selection),

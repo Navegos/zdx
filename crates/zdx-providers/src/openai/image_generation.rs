@@ -58,6 +58,10 @@ pub(super) fn build_image_generation_request(
         tool.insert("size".to_string(), json!(size));
     }
 
+    if let Some(image_model) = image_tool_model(model) {
+        tool.insert("model".to_string(), json!(image_model));
+    }
+
     let mut content = vec![json!({"type": "input_text", "text": prompt})];
     for image in &options.source_images {
         content.push(json!({
@@ -95,8 +99,17 @@ pub(super) fn build_image_generation_request(
     request
 }
 
+/// The `gpt-image-2.5-*` models (and their dated snapshots) must be named in the
+/// image tool's `model` field; the top-level Responses model stays a mainline one.
+fn image_tool_model(model: &str) -> Option<&str> {
+    model
+        .to_ascii_lowercase()
+        .starts_with("gpt-image-2.5-")
+        .then_some(model)
+}
+
 fn responses_model_for_image_generation(model: &str) -> &str {
-    if model.eq_ignore_ascii_case("gpt-image-2") {
+    if model.eq_ignore_ascii_case("gpt-image-2") || image_tool_model(model).is_some() {
         "gpt-5.6-sol"
     } else {
         model
@@ -455,6 +468,37 @@ mod tests {
             "gpt-5.6-sol"
         );
         assert_eq!(responses_model_for_image_generation("gpt-5.4"), "gpt-5.4");
+    }
+
+    #[test]
+    fn image_generation_2_5_models_are_named_in_the_tool() {
+        for model in [
+            "gpt-image-2.5-flare",
+            "gpt-image-2.5-sunburst",
+            "gpt-image-2.5-flare-2026-09-08",
+        ] {
+            let request = build_image_generation_request(
+                model,
+                "A red fox",
+                &OpenAIImageGenerationOptions::default(),
+                None,
+                "medium",
+                None,
+            );
+
+            assert_eq!(request["model"], serde_json::json!("gpt-5.6-sol"));
+            assert_eq!(request["tools"][0]["model"], serde_json::json!(model));
+        }
+
+        let legacy = build_image_generation_request(
+            "gpt-image-2",
+            "A red fox",
+            &OpenAIImageGenerationOptions::default(),
+            None,
+            "medium",
+            None,
+        );
+        assert!(legacy["tools"][0].get("model").is_none());
     }
 
     #[test]
