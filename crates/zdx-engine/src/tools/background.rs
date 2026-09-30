@@ -316,6 +316,20 @@ const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// there is therefore no configured foreground bound to clamp to.
 const WAIT_CLAMP_FALLBACK: Duration = Duration::from_mins(2);
 
+/// Upper bound on a `wait_for: "exit"` wait, independent of the foreground
+/// bound. A job the model already chose to wait out gains nothing from a
+/// return every foreground bound, so this is long enough for a slow build.
+const EXIT_WAIT_CEILING: Duration = Duration::from_mins(30);
+
+/// What a `background_output` wait returns on, besides the budget running out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WaitFor {
+    /// New output or exit, whichever comes first.
+    Output,
+    /// Exit only; new output does not end the wait.
+    Exit,
+}
+
 /// Why a `background_output` wait ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Waited {
@@ -337,22 +351,29 @@ impl Waited {
     }
 }
 
-/// Clamps a requested `wait_secs` to the foreground bound.
+/// Clamps a requested `wait_secs` for the given wait mode.
 ///
-/// A wait is a blocked turn by another name, so it must never be allowed to
-/// exceed the bound that exists precisely to stop turns blocking. When
+/// An output wait is a blocked turn by another name, so it must never exceed
+/// the bound that exists precisely to stop turns blocking. When
 /// auto-backgrounding is disabled there is no configured bound, so the default
 /// (120s) still applies rather than letting the wait run unbounded.
-fn clamp_wait(requested: u64, ctx: &ToolContext) -> Duration {
-    let ceiling = ctx
-        .config
-        .as_ref()
-        .and_then(crate::config::Config::bash_foreground_bound)
-        .unwrap_or(WAIT_CLAMP_FALLBACK);
+///
+/// An exit wait is an explicit choice to wait a job out, so it uses its own
+/// fixed ceiling instead of the foreground bound.
+fn clamp_wait(requested: u64, mode: WaitFor, ctx: &ToolContext) -> Duration {
+    let ceiling = match mode {
+        WaitFor::Output => ctx
+            .config
+            .as_ref()
+            .and_then(crate::config::Config::bash_foreground_bound)
+            .unwrap_or(WAIT_CLAMP_FALLBACK),
+        WaitFor::Exit => EXIT_WAIT_CEILING,
+    };
     Duration::from_secs(requested).min(ceiling)
 }
 
-/// Blocks until the job produces new output, exits, or `budget` elapses.
+/// Blocks until the job exits, produces new output (`WaitFor::Output` only),
+/// or `budget` elapses.
 ///
 /// Purely an observer: it reads the job's log lengths and its registry marker
 /// and never signals the process, so abandoning the wait — by cancellation or
@@ -360,11 +381,17 @@ fn clamp_wait(requested: u64, ctx: &ToolContext) -> Duration {
 ///
 /// Works for both adopted and detached jobs: both record their exit in the
 /// marker (adopted via the drain-owned waiter, detached via the spawn waiter).
-async fn wait_for_change(rec: &BackgroundProcess, budget: Duration, ctx: &ToolContext) -> Waited {
+async fn wait_for_change(
+    rec: &BackgroundProcess,
+    mode: WaitFor,
+    budget: Duration,
+    ctx: &ToolContext,
+) -> Waited {
     let stdout_log = background_activity::stdout_log_path(&rec.bg_id);
     let stderr_log = background_activity::stderr_log_path(&rec.bg_id);
-    let baseline =
-        background_activity::log_len(&stdout_log) + background_activity::log_len(&stderr_log);
+    let log_len =
+        || background_activity::log_len(&stdout_log) + background_activity::log_len(&stderr_log);
+    let baseline = log_len();
 
     let deadline = tokio::time::Instant::now() + budget;
     let poll = async {
@@ -374,9 +401,7 @@ async fn wait_for_change(rec: &BackgroundProcess, budget: Duration, ctx: &ToolCo
             if background_activity::get(&rec.bg_id).is_none_or(|current| !current.is_running()) {
                 return Waited::Exit;
             }
-            let current = background_activity::log_len(&stdout_log)
-                + background_activity::log_len(&stderr_log);
-            if current != baseline {
+            if mode == WaitFor::Output && log_len() != baseline {
                 return Waited::Output;
             }
             tokio::time::sleep(WAIT_POLL_INTERVAL).await;
@@ -412,8 +437,10 @@ impl Tool for BackgroundOutput {
                 command that was moved to the background after exceeding its foreground \
                 bound. Status \"running\" with no new output does NOT mean the process is done \
                 or ready — check the status field. To follow a job, prefer waiting on it with \
-                wait_secs over re-reading it in a loop or sleeping between reads. Polling the \
-                same bg_id repeatedly is expected and allowed; each read returns a new read_seq."
+                wait_secs over re-reading it in a loop or sleeping between reads. For a long job \
+                whose progress you do not need, wait it out with wait_for: \"exit\" and a longer \
+                wait_secs. Polling the same bg_id repeatedly is expected and allowed; each read \
+                returns a new read_seq."
                     .to_string(),
             input_schema: json!({
                 "type": "object",
@@ -422,7 +449,12 @@ impl Tool for BackgroundOutput {
                     "wait_secs": {
                         "type": "integer",
                         "minimum": 0,
-                        "description": "Optional. Block until the job writes new output, exits, or this many seconds pass, whichever comes first, then return as usual plus waited_for (\"output\", \"exit\", or \"timeout\"). Clamped to the foreground bound (120s by default), so a longer value silently waits only that long. Waiting never affects the job: it keeps running whatever the wait returns. Omit it to read what is available right now."
+                        "description": "Optional. Block until the job exits, writes new output (default wait_for: \"output\" only), or this many seconds pass, whichever comes first, then return as usual plus waited_for (\"output\", \"exit\", or \"timeout\"). Clamped to the foreground bound (120s by default), or to 1800s with wait_for: \"exit\"; a longer value silently waits only that long. Waiting never affects the job: it keeps running whatever the wait returns. Omit it to read what is available right now."
+                    },
+                    "wait_for": {
+                        "type": "string",
+                        "enum": ["output", "exit"],
+                        "description": "Optional, used with wait_secs. \"output\" (default): return on new output or exit. \"exit\": ignore new output and return only when the job exits or wait_secs runs out."
                     }
                 },
                 "required": ["bg_id"],
@@ -444,11 +476,15 @@ impl Tool for BackgroundOutput {
                 Ok(secs) => secs,
                 Err(out) => return out,
             };
+            let mode = match wait_for_of(&input) {
+                Ok(mode) => mode,
+                Err(out) => return out,
+            };
 
             // Only wait on a job that could still change.
             let waited = match requested {
                 Some(secs) if secs > 0 && rec.is_running() => {
-                    Some(wait_for_change(&rec, clamp_wait(secs, &ctx), &ctx).await)
+                    Some(wait_for_change(&rec, mode, clamp_wait(secs, mode, &ctx), &ctx).await)
                 }
                 Some(_) if !rec.is_running() => Some(Waited::Exit),
                 _ => None,
@@ -502,6 +538,26 @@ fn wait_secs_of(input: &Value) -> Result<Option<u64>, ToolOutput> {
             "wait_secs must be a whole number",
             None,
         )),
+    }
+}
+
+/// Reads the optional `wait_for` mode; absent, null or empty means `output`.
+fn wait_for_of(input: &Value) -> Result<WaitFor, ToolOutput> {
+    let invalid = || {
+        ToolOutput::failure(
+            "invalid_input",
+            "wait_for must be \"output\" or \"exit\"",
+            None,
+        )
+    };
+    match input.get("wait_for") {
+        None | Some(Value::Null) => Ok(WaitFor::Output),
+        Some(Value::String(raw)) => match raw.trim().to_ascii_lowercase().as_str() {
+            "" | "output" => Ok(WaitFor::Output),
+            "exit" => Ok(WaitFor::Exit),
+            _ => Err(invalid()),
+        },
+        Some(_) => Err(invalid()),
     }
 }
 
@@ -928,7 +984,7 @@ mod wait_tests {
         background_activity::kill_background(&bg_id).await;
     }
 
-    /// `wait_secs` is clamped to the foreground bound, so a wait can never
+    /// An output wait is clamped to the foreground bound, so it can never
     /// recreate the blocked-turn problem the bound exists to prevent.
     #[test]
     fn wait_is_clamped_to_the_foreground_bound() {
@@ -938,8 +994,11 @@ mod wait_tests {
             bash_foreground_bound_secs: 30,
             ..Config::default()
         });
-        assert_eq!(clamp_wait(5, &ctx), Duration::from_secs(5));
-        assert_eq!(clamp_wait(3_600, &ctx), Duration::from_secs(30));
+        assert_eq!(clamp_wait(5, WaitFor::Output, &ctx), Duration::from_secs(5));
+        assert_eq!(
+            clamp_wait(3_600, WaitFor::Output, &ctx),
+            Duration::from_secs(30)
+        );
 
         // Auto-backgrounding disabled: the default ceiling still applies rather
         // than letting a wait run unbounded.
@@ -947,11 +1006,179 @@ mod wait_tests {
             bash_foreground_bound_secs: 0,
             ..Config::default()
         });
-        assert_eq!(clamp_wait(3_600, &ctx), WAIT_CLAMP_FALLBACK);
+        assert_eq!(
+            clamp_wait(3_600, WaitFor::Output, &ctx),
+            WAIT_CLAMP_FALLBACK
+        );
 
         // No config at all (leaf/tool-only contexts) behaves the same way.
         ctx.config = None;
-        assert_eq!(clamp_wait(3_600, &ctx), WAIT_CLAMP_FALLBACK);
+        assert_eq!(
+            clamp_wait(3_600, WaitFor::Output, &ctx),
+            WAIT_CLAMP_FALLBACK
+        );
+    }
+
+    /// An exit wait has its own ceiling, independent of the foreground bound
+    /// in every configuration.
+    #[test]
+    fn exit_wait_uses_its_own_ceiling() {
+        let mut ctx = ToolContext::new(std::path::PathBuf::from("."), None);
+        for config in [
+            Some(Config {
+                bash_foreground_bound_secs: 30,
+                ..Config::default()
+            }),
+            Some(Config {
+                bash_foreground_bound_secs: 0,
+                ..Config::default()
+            }),
+            None,
+        ] {
+            ctx.config = config;
+            assert_eq!(
+                clamp_wait(600, WaitFor::Exit, &ctx),
+                Duration::from_mins(10)
+            );
+            assert_eq!(clamp_wait(7_200, WaitFor::Exit, &ctx), EXIT_WAIT_CEILING);
+        }
+    }
+
+    #[test]
+    fn wait_for_accepts_only_known_modes() {
+        for (value, expected) in [
+            (json!(null), WaitFor::Output),
+            (json!(""), WaitFor::Output),
+            (json!("output"), WaitFor::Output),
+            (json!(" Exit "), WaitFor::Exit),
+        ] {
+            let mode = wait_for_of(&json!({ "wait_for": value })).ok();
+            assert_eq!(mode, Some(expected), "wait_for {value:?}");
+        }
+        assert_eq!(wait_for_of(&json!({})).ok(), Some(WaitFor::Output));
+
+        for bad in [json!("forever"), json!(42), json!(true)] {
+            match wait_for_of(&json!({ "wait_for": bad })) {
+                Err(ToolOutput::Failure { error, .. }) => {
+                    assert_eq!(error.code, "invalid_input", "wait_for {bad:?}");
+                }
+                other => panic!("wait_for {bad:?} should be rejected, got {other:?}"),
+            }
+        }
+    }
+
+    async fn read_until_exit(ctx: &ToolContext, bg_id: &str, wait_secs: u64) -> serde_json::Value {
+        let out = BackgroundOutput
+            .execute(
+                &json!({ "bg_id": bg_id, "wait_secs": wait_secs, "wait_for": "exit" }),
+                ctx,
+            )
+            .await;
+        out.data().expect("should have data").clone()
+    }
+
+    /// An exit wait ignores a job's steady output and returns at its exit,
+    /// long before the budget.
+    #[tokio::test]
+    async fn exit_wait_ignores_output_and_returns_on_exit() {
+        let home = crate::test_support::temp_zdx_home();
+        let (ctx, bg_id, _) = start_job(
+            home.path(),
+            "for i in 1 2 3 4 5 6 7 8; do echo tick $i; sleep 0.2; done; exit 3",
+        )
+        .await;
+
+        let started = Instant::now();
+        let data = read_until_exit(&ctx, &bg_id, 600).await;
+
+        assert_eq!(data["waited_for"], "exit");
+        assert_eq!(data["status"], "exited");
+        assert_eq!(data["exit_code"], 3);
+        assert!(data["stdout"].as_str().unwrap().contains("tick 8"));
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "exit wait must return at exit, not ride out the budget: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A noisy job that outlives the budget ends the exit wait on timeout and
+    /// keeps running.
+    #[tokio::test]
+    async fn exit_wait_times_out_without_disturbing_a_noisy_job() {
+        let home = crate::test_support::temp_zdx_home();
+        let (ctx, bg_id, pid) =
+            start_job(home.path(), "while true; do echo tick; sleep 0.1; done").await;
+
+        let started = Instant::now();
+        let data = read_until_exit(&ctx, &bg_id, 1).await;
+
+        assert_eq!(data["waited_for"], "timeout");
+        assert_eq!(data["status"], "running");
+        assert!(
+            started.elapsed() >= Duration::from_secs(1),
+            "output must not end an exit wait early"
+        );
+        assert!(
+            process_exists(pid),
+            "a timed-out wait must leave the job up"
+        );
+
+        background_activity::kill_background(&bg_id).await;
+    }
+
+    /// Without a positive `wait_secs`, `wait_for` alone reads immediately.
+    #[tokio::test]
+    async fn exit_mode_without_wait_secs_reads_immediately() {
+        let home = crate::test_support::temp_zdx_home();
+        let (ctx, bg_id, _) = start_job(home.path(), "sleep 30").await;
+
+        for input in [
+            json!({ "bg_id": bg_id, "wait_for": "exit" }),
+            json!({ "bg_id": bg_id, "wait_for": "exit", "wait_secs": 0 }),
+        ] {
+            let started = Instant::now();
+            let out = BackgroundOutput.execute(&input, &ctx).await;
+            let data = out.data().expect("should have data");
+            assert!(data.get("waited_for").is_none(), "input {input}");
+            assert_eq!(data["status"], "running");
+            assert!(started.elapsed() < Duration::from_secs(2));
+        }
+
+        background_activity::kill_background(&bg_id).await;
+    }
+
+    /// Cancelling the turn ends an exit wait promptly and leaves the job running.
+    #[tokio::test]
+    async fn cancellation_ends_an_exit_wait_but_not_the_job() {
+        let home = crate::test_support::temp_zdx_home();
+        let (mut ctx, bg_id, pid) = start_job(home.path(), "sleep 30").await;
+
+        let cancel = CancellationToken::new();
+        ctx.cancel_token = Some(cancel.clone());
+
+        let waiting = {
+            let ctx = ctx.clone();
+            let bg_id = bg_id.clone();
+            tokio::spawn(async move { read_until_exit(&ctx, &bg_id, 600).await })
+        };
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        cancel.cancel();
+
+        let data = tokio::time::timeout(Duration::from_secs(10), waiting)
+            .await
+            .expect("cancelled exit wait did not return promptly")
+            .unwrap();
+
+        assert_eq!(data["waited_for"], "timeout");
+        assert_eq!(data["status"], "running");
+        assert!(
+            process_exists(pid),
+            "cancelling a wait must never kill the job"
+        );
+
+        background_activity::kill_background(&bg_id).await;
     }
 
     /// Omitting `wait_secs` keeps today's read-now behavior, with no new field.
@@ -1025,6 +1252,57 @@ mod wait_tests {
         assert_eq!(final_read["status"], "exited");
         assert_eq!(final_read["exit_code"], 4);
         assert!(final_read["stdout"].as_str().unwrap().contains("later"));
+    }
+
+    /// The user's actual path: a foreground command outruns the bound, is
+    /// adopted, and one exit wait sees it through past its later output,
+    /// with a budget far above the 1s foreground bound it was adopted under.
+    #[tokio::test]
+    async fn exit_wait_works_for_an_adopted_job() {
+        let home = crate::test_support::temp_zdx_home();
+        let root = home.path().join("work");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let mut ctx = ToolContext::new(root, None);
+        ctx.current_thread_id = Some("thread-exit-wait-adopted".to_string());
+        ctx.config = Some(Config {
+            bash_foreground_bound_secs: 1,
+            ..Config::default()
+        });
+        ctx.background_handoff = true;
+
+        let command = "echo early; sleep 1.5; echo mid; sleep 1.5; echo late; exit 5";
+        let handoff = prepare_handoff(command, &ctx).expect("bound is configured");
+        let leaf = ctx.as_leaf();
+        let backgrounded = zdx_tools::bash::execute(
+            &json!({ "command": command }),
+            &leaf,
+            None,
+            None,
+            Some(handoff),
+        )
+        .await;
+        let data = backgrounded.data().expect("should have data");
+        assert_eq!(data["backgrounded"], true);
+        let bg_id = data["bg_id"].as_str().unwrap().to_string();
+        assert_eq!(
+            background_activity::get(&bg_id).unwrap().mode,
+            background_activity::BackgroundMode::Adopted
+        );
+
+        // Same 1s foreground bound as the handoff: an exit wait ignores it.
+        let started = Instant::now();
+        let data = read_until_exit(&ctx, &bg_id, 600).await;
+
+        assert_eq!(data["waited_for"], "exit");
+        assert_eq!(data["status"], "exited");
+        assert_eq!(data["exit_code"], 5);
+        assert!(data["stdout"].as_str().unwrap().contains("late"));
+        assert!(
+            started.elapsed() > Duration::from_secs(1),
+            "the wait must outlast the 1s foreground bound"
+        );
+        assert!(started.elapsed() < Duration::from_secs(15));
     }
 
     /// Every read stamps a new `read_seq`, including one that waited, so

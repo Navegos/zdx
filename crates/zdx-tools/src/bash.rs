@@ -220,8 +220,9 @@ impl BackgroundedOutput {
             "Command did not complete within its {}s foreground bound and was moved to the \
              background ({}). It is still running — do NOT re-run it. Read its output with \
              background_output (bg_id \"{}\"), passing wait_secs to wait for it rather than \
-             reading it repeatedly, and stop it with background_kill. Status \"running\" with no \
-             new output does NOT mean it is stuck or finished.",
+             reading it repeatedly (add wait_for: \"exit\" to wait out a long job without \
+             waking on each new line of output), and stop it with background_kill. Status \
+             \"running\" with no new output does NOT mean it is stuck or finished.",
             self.elapsed_secs, self.bg_id, self.bg_id
         );
         if self.degraded.registry_failed {
@@ -1405,6 +1406,7 @@ mod handoff_tests {
         assert!(message.contains("moved to the background"), "{message}");
         assert!(message.contains("do NOT re-run"), "{message}");
         assert!(message.contains("background_output"), "{message}");
+        assert!(message.contains(r#"wait_for: "exit""#), "{message}");
 
         assert_eq!(recorder.adopted.load(Ordering::SeqCst), 1);
         let pid = recorder.pid();
