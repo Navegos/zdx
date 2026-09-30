@@ -187,7 +187,6 @@ pub(crate) async fn retry_agent_turn(
         images: Vec::new(),
         audios: Vec::new(),
         documents: Vec::new(),
-        videos: Vec::new(),
         message_thread_id: topic_id,
         is_forum: topic_id.is_some(),
     };
