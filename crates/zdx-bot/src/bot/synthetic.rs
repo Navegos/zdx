@@ -23,7 +23,7 @@ static SYNTHETIC_MESSAGE_ID: AtomicI64 = AtomicI64::new(i64::MAX);
 /// Worker updates are mergeable: several of them waiting behind a running turn
 /// are handled together in one turn instead of one turn each. `/goal`
 /// continuations always run on their own.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SyntheticKind {
     GoalContinuation,
     WorkerUpdate,
@@ -73,7 +73,7 @@ pub(crate) async fn dispatch_synthetic_prompt(
 
     match serde_json::from_value::<crate::telegram::Message>(value) {
         Ok(mut message) => {
-            message.synthetic_worker_update = kind == SyntheticKind::WorkerUpdate;
+            message.synthetic = Some(kind);
             dispatch_message(queues, context, message).await;
             true
         }

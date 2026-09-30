@@ -94,10 +94,61 @@ pub(crate) fn new_staging_map() -> StagingMap {
 /// Whether a live `/btw` staging session is waiting for its question on this
 /// thread. That input opens a side topic instead of touching the current
 /// thread, so it must not wait behind a running turn in the queue.
-pub(crate) fn awaiting_btw_input(context: &BotContext, thread_id: &str) -> bool {
+pub(crate) fn awaiting_btw_input(
+    context: &BotContext,
+    thread_id: &str,
+    synthetic_prompt: bool,
+) -> bool {
     let map = context.staging_map().lock().expect("staging lock poisoned");
-    map.get(thread_id)
-        .is_some_and(|session| session.command == StagingCommand::Btw && !session.is_expired())
+    btw_awaits_input(&map, thread_id, synthetic_prompt)
+}
+
+fn btw_awaits_input(
+    sessions: &HashMap<String, StagingSession>,
+    thread_id: &str,
+    synthetic_prompt: bool,
+) -> bool {
+    !synthetic_prompt
+        && sessions
+            .get(thread_id)
+            .is_some_and(|session| session.command == StagingCommand::Btw && !session.is_expired())
+}
+
+/// What an incoming message is to the staging session on its thread.
+enum SessionInput {
+    /// No live session takes this message; it runs as a normal turn.
+    NotInput,
+    /// The session expired and was removed; clean it up, then run the message
+    /// as a normal turn.
+    Expired(StagingSession),
+    /// The message is the session's input.
+    Input,
+}
+
+/// Decides whether the live session on `thread_id` takes this message as its
+/// input. Removes the session only when it has expired.
+fn classify_session_input(
+    sessions: &mut HashMap<String, StagingSession>,
+    thread_id: &str,
+    message_id: i64,
+    synthetic_prompt: bool,
+) -> SessionInput {
+    // Staged commands wait for the user. A bot-generated prompt (a worker
+    // update, a goal continuation) runs as its own turn and leaves the session
+    // waiting; its synthetic id is always newer than the command's.
+    if synthetic_prompt {
+        return SessionInput::NotInput;
+    }
+    match sessions.get(thread_id) {
+        Some(session) if session.is_expired() => sessions
+            .remove(thread_id)
+            .map_or(SessionInput::NotInput, SessionInput::Expired),
+        // A message that predates the command was already in flight when the
+        // session opened, so it is a normal turn, not staged input.
+        Some(session) if message_id <= session.command_message_id => SessionInput::NotInput,
+        Some(_) => SessionInput::Input,
+        None => SessionInput::NotInput,
+    }
 }
 
 /// Handles the staging flow for one incoming message. Returns `true` when the
@@ -110,8 +161,9 @@ pub(crate) async fn handle_staging_flow(
     reply_to_message_id: Option<i64>,
     topic_id: Option<i64>,
     thread_id: &str,
+    synthetic_prompt: bool,
 ) -> Result<bool> {
-    if let Some(command) = staged_command_request(incoming) {
+    if !synthetic_prompt && let Some(command) = staged_command_request(incoming) {
         start_staging(
             context,
             incoming,
@@ -124,23 +176,18 @@ pub(crate) async fn handle_staging_flow(
         return Ok(true);
     }
 
-    // Drop stale sessions so the message below runs as a normal turn.
-    let expired = {
+    let input = {
         let mut map = context.staging_map().lock().expect("staging lock poisoned");
-        match map.get(thread_id) {
-            Some(session) if session.is_expired() => map.remove(thread_id),
-            // A message that predates the command was already in flight when
-            // the session opened, so it is a normal turn, not staged input.
-            Some(session) if incoming.message_id <= session.command_message_id => {
-                return Ok(false);
-            }
-            Some(_) => None,
-            None => return Ok(false),
-        }
+        classify_session_input(&mut map, thread_id, incoming.message_id, synthetic_prompt)
     };
-    if let Some(session) = expired {
-        cleanup_session_messages(context, incoming.chat_id, &session).await;
-        return Ok(false);
+    match input {
+        SessionInput::NotInput => return Ok(false),
+        // Drop stale sessions so the message runs as a normal turn.
+        SessionInput::Expired(session) => {
+            cleanup_session_messages(context, incoming.chat_id, &session).await;
+            return Ok(false);
+        }
+        SessionInput::Input => {}
     }
 
     if incoming
@@ -1134,17 +1181,26 @@ pub(crate) async fn finish_model_pick(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::time::{Duration, Instant};
 
     use super::{
-        STAGING_TTL, StagingCommand, StagingSession, ask_text, handoff_record, staging_keyboard,
-        suggestion_preview,
+        STAGING_TTL, SessionInput, StagingCommand, StagingSession, ask_text, btw_awaits_input,
+        classify_session_input, handoff_record, staging_keyboard, suggestion_preview,
     };
 
     fn session_created_at(created_at: Instant) -> StagingSession {
+        session_for(StagingCommand::Handoff, 1, created_at)
+    }
+
+    fn session_for(
+        command: StagingCommand,
+        command_message_id: i64,
+        created_at: Instant,
+    ) -> StagingSession {
         StagingSession {
-            command: StagingCommand::Handoff,
-            command_message_id: 1,
+            command,
+            command_message_id,
             model_override: None,
             suggestion_text: None,
             suggestion_message_id: None,
@@ -1152,6 +1208,68 @@ mod tests {
             user_message_ids: vec![],
             created_at,
         }
+    }
+
+    const THREAD: &str = "telegram--100-topic-3";
+
+    fn live_sessions(command: StagingCommand) -> HashMap<String, StagingSession> {
+        HashMap::from([(THREAD.to_string(), session_for(command, 50, Instant::now()))])
+    }
+
+    /// Regression: a worker update arriving while `/handoff` (or any staged
+    /// command) waits for the user's input must not be taken as that input.
+    /// Synthetic ids count down from `i64::MAX`, so the id check alone passes.
+    #[test]
+    fn synthetic_prompt_is_never_staged_input() {
+        for command in [
+            StagingCommand::Handoff,
+            StagingCommand::Btw,
+            StagingCommand::PromptBuilder,
+            StagingCommand::Goal,
+        ] {
+            let mut sessions = live_sessions(command);
+            let input = classify_session_input(&mut sessions, THREAD, i64::MAX - 1, true);
+            assert!(matches!(input, SessionInput::NotInput));
+            assert!(sessions.contains_key(THREAD), "session keeps waiting");
+
+            let input = classify_session_input(&mut sessions, THREAD, 51, false);
+            assert!(matches!(input, SessionInput::Input));
+        }
+    }
+
+    #[test]
+    fn messages_older_than_the_command_are_not_staged_input() {
+        let mut sessions = live_sessions(StagingCommand::Handoff);
+        let input = classify_session_input(&mut sessions, THREAD, 49, false);
+        assert!(matches!(input, SessionInput::NotInput));
+    }
+
+    #[test]
+    fn expired_session_is_removed_and_not_input() {
+        let old = Instant::now()
+            .checked_sub(STAGING_TTL + Duration::from_secs(1))
+            .expect("clock supports back-dating");
+        let mut sessions = HashMap::from([(
+            THREAD.to_string(),
+            session_for(StagingCommand::Btw, 50, old),
+        )]);
+        let input = classify_session_input(&mut sessions, THREAD, 51, false);
+        assert!(matches!(input, SessionInput::Expired(_)));
+        assert!(sessions.is_empty());
+    }
+
+    /// A worker update must stay in the topic queue, not skip it as the
+    /// question a live `/btw` session is waiting for.
+    #[test]
+    fn synthetic_prompt_does_not_route_as_btw_input() {
+        let sessions = live_sessions(StagingCommand::Btw);
+        assert!(btw_awaits_input(&sessions, THREAD, false));
+        assert!(!btw_awaits_input(&sessions, THREAD, true));
+        assert!(!btw_awaits_input(
+            &live_sessions(StagingCommand::Handoff),
+            THREAD,
+            false
+        ));
     }
 
     #[test]

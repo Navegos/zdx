@@ -5,6 +5,7 @@ use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::bot::context::{BotContext, QueueCancelKey, QueuedCancel};
+use crate::bot::synthetic::SyntheticKind;
 use crate::commands::{BotCommand, bypasses_queue, is_topic_blocking_command, parse_command};
 use crate::handlers::message::{
     handle_message, orchestrator_topic_name, post_thread_header, resolve_effective_thread_id,
@@ -289,7 +290,7 @@ fn awaiting_btw_input(context: &BotContext, message: &Message) -> bool {
         return false;
     }
     let thread_id = resolve_effective_thread_id(&thread_id_for_chat(message.chat.id, topic_id));
-    staging::awaiting_btw_input(context, &thread_id)
+    staging::awaiting_btw_input(context, &thread_id, message.synthetic.is_some())
 }
 
 /// Quick check if message should be processed (allowlist + bot filter).
@@ -491,11 +492,11 @@ fn drain_worker_updates(
     head: &Message,
 ) -> (Vec<QueueItem>, Option<QueueItem>) {
     let mut batch = Vec::new();
-    if !head.synthetic_worker_update {
+    if head.synthetic != Some(SyntheticKind::WorkerUpdate) {
         return (batch, None);
     }
     while let Ok(next) = receiver.try_recv() {
-        if next.message.synthetic_worker_update {
+        if next.message.synthetic == Some(SyntheticKind::WorkerUpdate) {
             batch.push(next);
         } else {
             return (batch, Some(next));
@@ -667,7 +668,7 @@ mod tests {
 
     fn worker_update(text: &str) -> Message {
         let mut message = message(-100, "supergroup", Some(3), text);
-        message.synthetic_worker_update = true;
+        message.synthetic = Some(SyntheticKind::WorkerUpdate);
         message
     }
 

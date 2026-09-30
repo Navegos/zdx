@@ -51,6 +51,7 @@ pub(crate) async fn handle_message(
     let bot_config = context.config_for_chat(message.chat.id);
     let synthetic_topic_routed_from_general = message.synthetic_topic_routed_from_general;
     let routed_as_btw_input = message.routed_as_btw_input;
+    let synthetic_prompt = message.synthetic.is_some();
     let provisional_status = if message_has_audio(&message) {
         Some(setup_preprocessing_status(ctx, &message, synthetic_topic_routed_from_general).await)
     } else {
@@ -112,6 +113,7 @@ pub(crate) async fn handle_message(
         reply_ctx.reply_to_message_id,
         reply_ctx.topic_id,
         &thread_id,
+        synthetic_prompt,
     )
     .await?
     {
@@ -185,6 +187,7 @@ pub(crate) async fn retry_agent_turn(
         images: Vec::new(),
         audios: Vec::new(),
         documents: Vec::new(),
+        videos: Vec::new(),
         message_thread_id: topic_id,
         is_forum: topic_id.is_some(),
     };

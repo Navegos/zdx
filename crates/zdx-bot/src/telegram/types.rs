@@ -110,6 +110,14 @@ pub struct Message {
     pub audio: Option<Audio>,
     #[serde(default)]
     pub document: Option<Document>,
+    #[serde(default)]
+    pub video: Option<Video>,
+    /// Round video message recorded in the Telegram client.
+    #[serde(default)]
+    pub video_note: Option<Video>,
+    /// GIF or silent H.264/MPEG-4 clip.
+    #[serde(default)]
+    pub animation: Option<Video>,
     /// Unique identifier of a message thread or forum topic.
     #[serde(default, rename = "message_thread_id")]
     pub thread_id: Option<i64>,
@@ -125,10 +133,12 @@ pub struct Message {
     /// expired or already used), it is re-dispatched as an ordinary message.
     #[serde(skip)]
     pub routed_as_btw_input: bool,
-    /// Internal marker for a synthetic `[worker update]` prompt. Consecutive
-    /// pending ones are merged into a single orchestrator turn by the queue.
+    /// Internal marker for a bot-generated prompt (worker update, `/goal`
+    /// continuation). Staged commands wait for the user, so these never start
+    /// or complete one. Consecutive pending worker updates are merged into a
+    /// single orchestrator turn by the queue.
     #[serde(skip)]
-    pub synthetic_worker_update: bool,
+    pub(crate) synthetic: Option<crate::bot::synthetic::SyntheticKind>,
     /// Additional Telegram messages that belong to the same media album.
     #[serde(skip)]
     pub grouped_messages: Vec<Message>,
@@ -222,6 +232,19 @@ pub struct Audio {
 
 #[derive(Debug, Deserialize)]
 pub struct Document {
+    pub file_id: String,
+    #[serde(default)]
+    pub file_name: Option<String>,
+    #[serde(default)]
+    pub mime_type: Option<String>,
+    #[serde(default)]
+    pub file_size: Option<u64>,
+}
+
+/// Shared shape of Telegram `Video`, `VideoNote`, and `Animation`; the fields a
+/// type does not send stay `None`.
+#[derive(Debug, Deserialize)]
+pub struct Video {
     pub file_id: String,
     #[serde(default)]
     pub file_name: Option<String>,
