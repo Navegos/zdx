@@ -22,7 +22,7 @@ pub use rich::RichMessage;
 #[allow(unused_imports)]
 pub use types::{
     Audio, CallbackQuery, Document, InlineKeyboardButton, InlineKeyboardMarkup, Message, PhotoSize,
-    TelegramFile, Update, Voice, WebAppInfo,
+    TelegramFile, Update, Video, Voice, WebAppInfo,
 };
 
 pub struct TelegramSettings {
@@ -241,6 +241,14 @@ impl TelegramClient {
             http,
             base_url: "https://api.telegram.org".to_string(),
             token,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_base_url(token: String, base_url: String) -> Self {
+        Self {
+            base_url,
+            ..Self::new(token)
         }
     }
 

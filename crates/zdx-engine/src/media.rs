@@ -19,7 +19,7 @@ pub const DEFAULT_ASK_MEDIA_MODEL: &str = "gemini:gemini-3.5-flash-lite";
 /// Max raw file size sent inline. Base64 inflates ~33%, so keep well under
 /// Gemini's ~20 MB total inline request cap. Larger files need the File API
 /// (not yet supported).
-const MAX_INLINE_BYTES: usize = 15 * 1024 * 1024;
+pub const MAX_INLINE_BYTES: usize = 15 * 1024 * 1024;
 
 /// Reads `path`, sends it inline to a Gemini model with `prompt`, and returns
 /// the model's text answer.

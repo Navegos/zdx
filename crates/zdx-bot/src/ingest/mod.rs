@@ -8,13 +8,16 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use tokio_util::sync::CancellationToken;
 use zdx_engine::config::{Config, paths};
 
-use crate::telegram::{Audio, Document, Message, PhotoSize, TelegramClient, Voice};
+use crate::telegram::{Audio, Document, Message, PhotoSize, TelegramClient, Video, Voice};
 use crate::transcribe;
-use crate::types::{IncomingAudio, IncomingDocument, IncomingImage, IncomingMessage};
+use crate::types::{
+    IncomingAudio, IncomingDocument, IncomingImage, IncomingMessage, IncomingVideo, VideoStatus,
+};
 
 const MAX_IMAGE_BYTES: u64 = 3_932_160; // 3.75MB
 const MAX_AUDIO_BYTES: u64 = 25 * 1024 * 1024; // 25MB
 const MAX_DOCUMENT_BYTES: u64 = 25 * 1024 * 1024; // 25MB
+const MAX_VIDEO_BYTES: u64 = zdx_engine::media::MAX_INLINE_BYTES as u64;
 const SUPPORTED_IMAGE_MIMES: &[&str] = &["image/jpeg", "image/png", "image/gif", "image/webp"];
 
 pub(crate) struct AllowlistConfig<'a> {
@@ -32,7 +35,34 @@ struct AttachmentCollection {
     images: Vec<IncomingImage>,
     audios: Vec<IncomingAudio>,
     documents: Vec<IncomingDocument>,
+    videos: Vec<IncomingVideo>,
     had_attachments: bool,
+}
+
+struct VideoRef<'a> {
+    id: &'a str,
+    size: Option<u64>,
+    name: Option<&'a str>,
+}
+
+impl<'a> From<&'a Video> for VideoRef<'a> {
+    fn from(video: &'a Video) -> Self {
+        Self {
+            id: &video.file_id,
+            size: video.file_size,
+            name: video.file_name.as_deref(),
+        }
+    }
+}
+
+impl<'a> From<&'a Document> for VideoRef<'a> {
+    fn from(document: &'a Document) -> Self {
+        Self {
+            id: &document.file_id,
+            size: document.file_size,
+            name: document.file_name.as_deref(),
+        }
+    }
 }
 
 struct AudioSource<'a> {
@@ -68,10 +98,16 @@ pub(crate) async fn parse_incoming_message(
         images,
         audios,
         documents,
+        videos,
         had_attachments,
     } = attachments;
 
-    if text.is_none() && images.is_empty() && audios.is_empty() && documents.is_empty() {
+    if text.is_none()
+        && images.is_empty()
+        && audios.is_empty()
+        && documents.is_empty()
+        && videos.is_empty()
+    {
         return handle_empty_message(client, &target, had_attachments).await;
     }
 
@@ -87,6 +123,7 @@ pub(crate) async fn parse_incoming_message(
         images,
         audios,
         documents,
+        videos,
         message_thread_id: target.thread,
         is_forum: message.chat.is_forum_enabled(),
     }))
@@ -146,6 +183,7 @@ async fn validate_access(
     Ok(None)
 }
 
+#[allow(clippy::too_many_lines)]
 async fn collect_attachments(
     client: &TelegramClient,
     config: &Config,
@@ -156,6 +194,7 @@ async fn collect_attachments(
     let mut images = Vec::new();
     let mut audios = Vec::new();
     let mut documents = Vec::new();
+    let mut videos = Vec::new();
     let mut had_attachments = false;
 
     for current in std::iter::once(message).chain(message.grouped_messages.iter()) {
@@ -175,6 +214,8 @@ async fn collect_attachments(
 
         if let Some(document) = current.document.as_ref()
             && let Some(mime) = document.mime_type.as_deref()
+            && current.animation.is_none()
+            && !mime.starts_with("video/")
         {
             had_attachments = true;
             if mime.starts_with("image/") {
@@ -241,14 +282,50 @@ async fn collect_attachments(
             )
             .await?;
         }
+
+        for (kind, video) in video_attachments(current) {
+            had_attachments = true;
+            push_attachment(
+                &mut videos,
+                load_video(client, target.chat, current_message_id, kind, &video),
+                "video attachment",
+            )
+            .await?;
+        }
     }
 
     Ok(AttachmentCollection {
         images,
         audios,
         documents,
+        videos,
         had_attachments,
     })
+}
+
+/// Telegram video media on one message, labelled by kind, including a file
+/// sent with a `video/*` MIME type. A GIF-style `animation` also sets
+/// `document` for backward compatibility, so that document is not counted.
+fn video_attachments(message: &Message) -> Vec<(&'static str, VideoRef<'_>)> {
+    let video_document = message.document.as_ref().filter(|document| {
+        message.animation.is_none()
+            && document
+                .mime_type
+                .as_deref()
+                .is_some_and(|mime| mime.starts_with("video/"))
+    });
+    [
+        ("Video", message.video.as_ref().map(VideoRef::from)),
+        (
+            "Video note",
+            message.video_note.as_ref().map(VideoRef::from),
+        ),
+        ("Animation", message.animation.as_ref().map(VideoRef::from)),
+        ("Video file", video_document.map(VideoRef::from)),
+    ]
+    .into_iter()
+    .filter_map(|(kind, video)| video.map(|video| (kind, video)))
+    .collect()
 }
 
 async fn push_attachment<T>(
@@ -434,6 +511,49 @@ async fn load_generic_document(
     }))
 }
 
+/// Downloads a video for `ask_media`. The limit is `ask_media`'s inline cap, so
+/// a saved video is always one the agent can inspect; a larger one is reported
+/// to the agent instead of dropped.
+async fn load_video(
+    client: &TelegramClient,
+    chat_id: i64,
+    message_id: i64,
+    kind: &'static str,
+    video: &VideoRef<'_>,
+) -> Result<Option<IncomingVideo>> {
+    let too_large = |size_bytes| {
+        tracing::debug!(
+            chat_id,
+            size_bytes,
+            "Skipping video exceeding ask_media limit"
+        );
+        Ok(Some(IncomingVideo {
+            kind,
+            status: VideoStatus::TooLarge { size_bytes },
+        }))
+    };
+    if let Some(size) = video.size.filter(|size| *size > MAX_VIDEO_BYTES) {
+        return too_large(size);
+    }
+
+    let (file_path, bytes) = download_file_bytes(client, video.id).await?;
+    if bytes.len() as u64 > MAX_VIDEO_BYTES {
+        return too_large(bytes.len() as u64);
+    }
+
+    let file_name = video
+        .name
+        .and_then(file_name_from_path)
+        .or_else(|| file_name_from_path(&file_path))
+        .unwrap_or_else(|| format!("video_{message_id}.mp4"));
+    let local_path = save_media_bytes(chat_id, message_id, &file_name, &bytes)?;
+
+    Ok(Some(IncomingVideo {
+        kind,
+        status: VideoStatus::Saved(local_path),
+    }))
+}
+
 async fn load_voice_attachment(
     client: &TelegramClient,
     config: &Config,
@@ -613,10 +733,21 @@ fn save_media_bytes(
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
+    use std::collections::HashSet;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use super::extract_text;
-    use crate::telegram::Message;
+    use axum::routing::{get, post};
+    use axum::{Json, Router};
+    use serde_json::json;
+    use zdx_engine::config::Config;
+
+    use super::{AllowlistConfig, MAX_VIDEO_BYTES, extract_text, parse_incoming_message};
+    use crate::agent::build_user_text;
+    use crate::telegram::{Message, TelegramClient};
+    use crate::types::{IncomingMessage, VideoStatus};
 
     fn message(value: serde_json::Value) -> Message {
         serde_json::from_value(value).expect("valid message")
@@ -675,5 +806,179 @@ mod tests {
     #[test]
     fn a_message_without_any_text_stays_empty() {
         assert!(extract_text(&with(4, &json!({ "rich_message": { "blocks": [] } }))).is_none());
+    }
+
+    const TOKEN: &str = "test-token";
+    const VIDEO_BYTES: &[u8] = b"synthetic-mp4-bytes";
+
+    /// Fake Bot API: `getFile` maps a file id to `videos/<id>.mp4`, and the file
+    /// endpoint serves fixed bytes. Returns the base URL and the `getFile` count.
+    async fn fake_telegram() -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let get_file_calls = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::clone(&get_file_calls);
+        let app = Router::new()
+            .route(
+                &format!("/bot{TOKEN}/getFile"),
+                post(move |Json(body): Json<serde_json::Value>| {
+                    let calls = Arc::clone(&calls);
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        let file_id = body["file_id"].as_str().unwrap_or_default().to_string();
+                        Json(json!({
+                            "ok": true,
+                            "result": { "file_id": file_id, "file_path": format!("videos/{file_id}.mp4") },
+                        }))
+                    }
+                }),
+            )
+            .route(
+                &format!("/file/bot{TOKEN}/videos/{{name}}"),
+                get(|| async { VIDEO_BYTES }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake Telegram");
+        let addr = listener.local_addr().expect("fake Telegram address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve fake Telegram");
+        });
+        (format!("http://{addr}"), get_file_calls, server)
+    }
+
+    async fn ingest(base_url: String, message: Message) -> Option<IncomingMessage> {
+        let client = TelegramClient::with_base_url(TOKEN.to_string(), base_url);
+        let user_ids = HashSet::from([7]);
+        let chat_ids = HashSet::from([42]);
+        parse_incoming_message(
+            &client,
+            AllowlistConfig {
+                user_ids: &user_ids,
+                chat_ids: &chat_ids,
+            },
+            &Config::default(),
+            message,
+            None,
+        )
+        .await
+        .expect("ingest message")
+    }
+
+    fn saved_video_path(incoming: &IncomingMessage) -> PathBuf {
+        assert_eq!(incoming.videos.len(), 1, "exactly one video attachment");
+        let VideoStatus::Saved(path) = &incoming.videos[0].status else {
+            panic!("video was not saved");
+        };
+        path.clone()
+    }
+
+    /// The reported regression: a captioned video used to reach the agent as
+    /// its caption alone.
+    #[tokio::test]
+    async fn captioned_video_reaches_the_agent_as_a_saved_file() {
+        let _home = zdx_engine::test_support::temp_zdx_home();
+        let (base_url, _, server) = fake_telegram().await;
+        let message = with(
+            10,
+            &json!({
+                "caption": "check the keyboard animation",
+                "video": { "file_id": "vid1", "file_size": 19, "mime_type": "video/mp4" },
+            }),
+        );
+
+        let incoming = ingest(base_url, message).await.expect("turn runs");
+        let path = saved_video_path(&incoming);
+        assert_eq!(fs::read(&path).expect("saved video"), VIDEO_BYTES);
+        assert!(path.to_string_lossy().ends_with("10_vid1.mp4"));
+
+        let prompt = build_user_text(&incoming);
+        assert!(prompt.starts_with("check the keyboard animation"));
+        assert!(prompt.contains(&format!(
+            "Video attachment saved at {} — use the `ask_media` tool on it",
+            path.display()
+        )));
+        server.abort();
+    }
+
+    /// A video with no caption used to be dropped as an empty message.
+    #[tokio::test]
+    async fn video_note_without_caption_runs_a_turn() {
+        let _home = zdx_engine::test_support::temp_zdx_home();
+        let (base_url, _, server) = fake_telegram().await;
+        let message = with(11, &json!({ "video_note": { "file_id": "note1" } }));
+
+        let incoming = ingest(base_url, message).await.expect("turn runs");
+        assert!(incoming.text.is_none());
+        let path = saved_video_path(&incoming);
+        assert!(build_user_text(&incoming).starts_with(&format!(
+            "Video note attachment saved at {}",
+            path.display()
+        )));
+        server.abort();
+    }
+
+    /// Telegram also sets `document` on an animation; it must load once.
+    #[tokio::test]
+    async fn animation_is_loaded_once_despite_its_document_twin() {
+        let _home = zdx_engine::test_support::temp_zdx_home();
+        let (base_url, get_file_calls, server) = fake_telegram().await;
+        let message = with(
+            12,
+            &json!({
+                "animation": { "file_id": "gif1", "file_name": "loop.mp4", "mime_type": "video/mp4" },
+                "document": { "file_id": "gif1", "file_name": "loop.mp4", "mime_type": "video/mp4" },
+            }),
+        );
+
+        let incoming = ingest(base_url, message).await.expect("turn runs");
+        assert!(incoming.documents.is_empty());
+        assert_eq!(incoming.videos[0].kind, "Animation");
+        assert!(saved_video_path(&incoming).ends_with("12_loop.mp4"));
+        assert_eq!(get_file_calls.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn video_sent_as_a_file_uses_the_video_path() {
+        let _home = zdx_engine::test_support::temp_zdx_home();
+        let (base_url, _, server) = fake_telegram().await;
+        let message = with(
+            13,
+            &json!({
+                "document": { "file_id": "doc1", "file_name": "screen.mov", "mime_type": "video/quicktime" },
+            }),
+        );
+
+        let incoming = ingest(base_url, message).await.expect("turn runs");
+        assert!(incoming.documents.is_empty());
+        assert_eq!(incoming.videos[0].kind, "Video file");
+        assert!(saved_video_path(&incoming).ends_with("13_screen.mov"));
+        server.abort();
+    }
+
+    /// A video over the `ask_media` limit is not downloaded, but the agent is
+    /// told why instead of the video vanishing.
+    #[tokio::test]
+    async fn oversized_video_is_reported_without_download() {
+        let _home = zdx_engine::test_support::temp_zdx_home();
+        let (base_url, get_file_calls, server) = fake_telegram().await;
+        let message = with(
+            14,
+            &json!({ "video": { "file_id": "big1", "file_size": MAX_VIDEO_BYTES + 1 } }),
+        );
+
+        let incoming = ingest(base_url, message).await.expect("turn runs");
+        assert!(matches!(
+            incoming.videos[0].status,
+            VideoStatus::TooLarge { .. }
+        ));
+        assert_eq!(get_file_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            build_user_text(&incoming),
+            "Video attachment was not downloaded: it is 15.0 MiB and the limit is 15 MiB. \
+             Ask the user for a shorter or compressed clip."
+        );
+        server.abort();
     }
 }

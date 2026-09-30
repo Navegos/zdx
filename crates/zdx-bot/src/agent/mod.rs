@@ -14,7 +14,7 @@ use zdx_engine::core::events::AgentEvent;
 use zdx_engine::core::thread_persistence::{self, Thread, ThreadEvent};
 use zdx_engine::providers::{ChatContentBlock, ChatMessage, MessageContent};
 
-use crate::types::IncomingMessage;
+use crate::types::{IncomingMessage, VideoStatus};
 
 pub(crate) const STATUS_WAITING: &str = "⏳ Waiting for model...";
 pub(crate) const STATUS_THINKING: &str = "🧠 Thinking...";
@@ -556,6 +556,22 @@ pub(crate) fn build_user_text(incoming: &IncomingMessage) -> String {
             doc.file_name,
             doc.local_path.display()
         ));
+    }
+
+    for video in &incoming.videos {
+        parts.push(match &video.status {
+            VideoStatus::Saved(path) => format!(
+                "{} attachment saved at {} — use the `ask_media` tool on it to watch it.",
+                video.kind,
+                path.display()
+            ),
+            VideoStatus::TooLarge { size_bytes } => format!(
+                "{} attachment was not downloaded: it is {:.1} MiB and the limit is {} MiB. Ask the user for a shorter or compressed clip.",
+                video.kind,
+                *size_bytes as f64 / (1024.0 * 1024.0),
+                zdx_engine::media::MAX_INLINE_BYTES / (1024 * 1024)
+            ),
+        });
     }
 
     if parts.is_empty() {

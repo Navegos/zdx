@@ -8,6 +8,7 @@ pub struct IncomingMessage {
     pub images: Vec<IncomingImage>,
     pub audios: Vec<IncomingAudio>,
     pub documents: Vec<IncomingDocument>,
+    pub videos: Vec<IncomingVideo>,
     /// Forum topic ID (for supergroups with topics enabled).
     pub message_thread_id: Option<i64>,
     /// Whether the group is a forum-enabled supergroup.
@@ -28,4 +29,18 @@ pub struct IncomingAudio {
 pub struct IncomingDocument {
     pub local_path: PathBuf,
     pub file_name: String,
+}
+
+pub struct IncomingVideo {
+    /// Human label for the Telegram media kind ("Video", "Video note", ...).
+    pub kind: &'static str,
+    pub status: VideoStatus,
+}
+
+pub enum VideoStatus {
+    Saved(PathBuf),
+    /// Not downloaded because it is over the media-understanding limit.
+    TooLarge {
+        size_bytes: u64,
+    },
 }

@@ -110,6 +110,14 @@ pub struct Message {
     pub audio: Option<Audio>,
     #[serde(default)]
     pub document: Option<Document>,
+    #[serde(default)]
+    pub video: Option<Video>,
+    /// Round video message recorded in the Telegram client.
+    #[serde(default)]
+    pub video_note: Option<Video>,
+    /// GIF or silent H.264/MPEG-4 clip.
+    #[serde(default)]
+    pub animation: Option<Video>,
     /// Unique identifier of a message thread or forum topic.
     #[serde(default, rename = "message_thread_id")]
     pub thread_id: Option<i64>,
@@ -224,6 +232,19 @@ pub struct Audio {
 
 #[derive(Debug, Deserialize)]
 pub struct Document {
+    pub file_id: String,
+    #[serde(default)]
+    pub file_name: Option<String>,
+    #[serde(default)]
+    pub mime_type: Option<String>,
+    #[serde(default)]
+    pub file_size: Option<u64>,
+}
+
+/// Shared shape of Telegram `Video`, `VideoNote`, and `Animation`; the fields a
+/// type does not send stay `None`.
+#[derive(Debug, Deserialize)]
+pub struct Video {
     pub file_id: String,
     #[serde(default)]
     pub file_name: Option<String>,
