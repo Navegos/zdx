@@ -655,7 +655,8 @@ async fn start_goal(
 /// Opens the side topic for `/btw` immediately — no preview, no Accept tap.
 ///
 /// The seed is the user's question plus a pointer at the current thread, which
-/// the new topic's agent resolves with `Read_Thread`. On failure the staging
+/// the new topic's agent resolves with `Read_Thread`. The question itself is
+/// posted into the new topic as its visible record. On failure the staging
 /// session is kept so the next message retries.
 async fn start_btw_topic(
     context: &Arc<BotContext>,
@@ -684,7 +685,7 @@ async fn start_btw_topic(
         thread_id,
         "Btw",
         seed,
-        None,
+        Some(btw_record(input)),
         false,
         model_override,
     )
@@ -1039,6 +1040,14 @@ fn handoff_record(suggestion: &str) -> String {
     format!("🔀 <b>Handoff context</b>\n\n{truncated}")
 }
 
+/// The user's `/btw` question posted into the new topic. The seed reaches the
+/// agent synthetically, so without this the prompt never shows up in the chat.
+fn btw_record(question: &str) -> String {
+    let quoted = format!("<blockquote>{}</blockquote>", escape_html(question));
+    let truncated = truncate_telegram_html(&quoted, SUGGESTION_PREVIEW_MAX_CHARS);
+    format!("💬 <b>Side question</b>\n{truncated}")
+}
+
 fn accept_discard_keyboard() -> InlineKeyboardMarkup {
     InlineKeyboardMarkup {
         inline_keyboard: vec![vec![
@@ -1186,7 +1195,7 @@ mod tests {
 
     use super::{
         STAGING_TTL, SessionInput, StagingCommand, StagingSession, ask_text, btw_awaits_input,
-        classify_session_input, handoff_record, staging_keyboard, suggestion_preview,
+        btw_record, classify_session_input, handoff_record, staging_keyboard, suggestion_preview,
     };
 
     fn session_created_at(created_at: Instant) -> StagingSession {
@@ -1305,6 +1314,15 @@ mod tests {
         assert!(record.contains("<b>Fix</b> <code>&lt;script&gt;</code> &amp; stuff"));
         assert!(!record.contains("Accept"));
         assert!(!record.contains("regenerate"));
+    }
+
+    /// The btw seed is synthetic too, so the user's question is echoed into
+    /// the new topic as an escaped quote.
+    #[test]
+    fn btw_record_quotes_the_question_escaped() {
+        let record = btw_record("what does <T> & `x` mean?");
+        assert!(record.contains("Side question"));
+        assert!(record.contains("<blockquote>what does &lt;T&gt; &amp; `x` mean?</blockquote>"));
     }
 
     /// Handoff and btw both seed a fresh topic, so both require running inside
