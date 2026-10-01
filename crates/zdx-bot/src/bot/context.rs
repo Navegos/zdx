@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 use tokio::sync::{Mutex, Notify};
@@ -86,8 +85,6 @@ pub(crate) struct BotContext {
     /// Owner-thread → Telegram route for orchestrator completion callbacks.
     /// Populated on every orchestrator turn; lost on restart by design.
     orchestrator_routes: RwLock<HashMap<String, OrchestratorRoute>>,
-    /// Whether a `/restart q` is waiting for all agent runs to finish.
-    restart_queued: AtomicBool,
     /// Thread id → (chat, message id) of the pinned header posted this
     /// process, so worker events can refresh an orchestrator's card in place.
     thread_headers: RwLock<HashMap<String, (i64, i64)>>,
@@ -160,7 +157,6 @@ impl BotContext {
             command_picker_map,
             launcher_map,
             orchestrator_routes: RwLock::new(HashMap::new()),
-            restart_queued: AtomicBool::new(false),
             thread_headers: RwLock::new(HashMap::new()),
         }
     }
@@ -302,19 +298,6 @@ impl BotContext {
     /// Signal the bot to exit (with code 42) so a supervisor can restart it.
     pub(crate) fn request_exit(&self) {
         self.exit_signal.notify_one();
-    }
-
-    /// Claims the single pending `/restart q` slot; `false` when one is
-    /// already waiting for the machine to go idle.
-    pub(crate) fn try_claim_queued_restart(&self) -> bool {
-        self.restart_queued
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-    }
-
-    /// Releases the pending `/restart q` slot (the wait ended without exiting).
-    pub(crate) fn release_queued_restart(&self) {
-        self.restart_queued.store(false, Ordering::Release);
     }
 
     /// Wait for an exit signal.

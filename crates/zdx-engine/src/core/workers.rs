@@ -678,6 +678,21 @@ impl WorkerManager {
         grouped
     }
 
+    /// True when no worker is running a prompt or has one queued.
+    ///
+    /// A worker that settled has already sent its `Completed` event (both
+    /// happen under one lock), so a caller that checks this first and then
+    /// finds the event channel empty knows no completion is still undelivered.
+    ///
+    /// # Panics
+    /// Panics if the internal worker state lock is poisoned.
+    #[must_use]
+    pub fn all_idle(&self) -> bool {
+        let map = self.state.lock().expect("worker state lock poisoned");
+        map.values()
+            .all(|state| state.status != WorkerStatus::Running && state.queue.is_empty())
+    }
+
     /// Cancels the current turn (if any) and clears all queued prompts. The
     /// worker stays managed and a later `send_message` resumes it.
     ///
@@ -919,40 +934,40 @@ fn spawn_worker_task(manager: Arc<WorkerManager>, worker_thread_id: String, wake
             let cancel = request.cancel.clone();
             let result = (manager.runner)(request).await;
 
-            let event = {
-                let mut map = manager.state.lock().expect("worker state lock poisoned");
-                let Some(state) = map.get_mut(&worker_thread_id) else {
-                    break;
-                };
-                state.current_cancel = None;
-                state.turn_started_at = None;
-                state.last_activity_at = None;
-                state.current_tools.clear();
-                match &result {
-                    Ok(text) => {
-                        state.status = WorkerStatus::Completed;
-                        state.latest_final_text = Some(text.clone());
-                        state.last_error = None;
-                    }
-                    Err(err) => {
-                        state.status = if cancel.is_cancelled() {
-                            WorkerStatus::Cancelled
-                        } else {
-                            WorkerStatus::Failed
-                        };
-                        state.last_error = Some(format!("{err:#}"));
-                    }
-                }
-                CompletionEvent {
-                    owner_thread_id: state.owner_thread_id.clone(),
-                    worker_thread_id: worker_thread_id.clone(),
-                    status: state.status,
-                    final_text: result.as_ref().ok().cloned(),
-                    error: state.last_error.clone(),
-                    mirror_url: manager.mirror_url(&worker_thread_id),
-                }
+            // The event is sent under the same lock that settles the status, so
+            // a reader that sees this worker idle also sees its completion
+            // already in the channel (see `all_idle`).
+            let mut map = manager.state.lock().expect("worker state lock poisoned");
+            let Some(state) = map.get_mut(&worker_thread_id) else {
+                break;
             };
-
+            state.current_cancel = None;
+            state.turn_started_at = None;
+            state.last_activity_at = None;
+            state.current_tools.clear();
+            match &result {
+                Ok(text) => {
+                    state.status = WorkerStatus::Completed;
+                    state.latest_final_text = Some(text.clone());
+                    state.last_error = None;
+                }
+                Err(err) => {
+                    state.status = if cancel.is_cancelled() {
+                        WorkerStatus::Cancelled
+                    } else {
+                        WorkerStatus::Failed
+                    };
+                    state.last_error = Some(format!("{err:#}"));
+                }
+            }
+            let event = CompletionEvent {
+                owner_thread_id: state.owner_thread_id.clone(),
+                worker_thread_id: worker_thread_id.clone(),
+                status: state.status,
+                final_text: result.as_ref().ok().cloned(),
+                error: state.last_error.clone(),
+                mirror_url: manager.mirror_url(&worker_thread_id),
+            };
             if manager
                 .events_tx
                 .send(WorkerEvent::Completed(event))
@@ -960,6 +975,7 @@ fn spawn_worker_task(manager: Arc<WorkerManager>, worker_thread_id: String, wake
             {
                 tracing::debug!(worker = %worker_thread_id, "Worker event channel closed");
             }
+            drop(map);
         }
     });
 }
@@ -1000,6 +1016,43 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         panic!("worker should settle quickly");
+    }
+
+    #[tokio::test]
+    async fn idle_workers_have_already_sent_their_completion() {
+        let _home = temp_zdx_home();
+        let project = tempfile::tempdir().unwrap();
+        let release = Arc::new(Notify::new());
+        let gate = Arc::clone(&release);
+        let runner: WorkerRunner = Arc::new(move |_request: WorkerRunRequest| {
+            let gate = Arc::clone(&gate);
+            Box::pin(async move {
+                gate.notified().await;
+                Ok("done".to_string())
+            })
+        });
+        let (manager, mut rx) = WorkerManager::with_runner(runner);
+        assert!(manager.all_idle());
+
+        manager
+            .create_worker("owner", project.path(), "work", None, None, None)
+            .unwrap();
+        assert!(!manager.all_idle());
+
+        release.notify_one();
+        for _ in 0..500 {
+            if manager.all_idle() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(manager.all_idle());
+        // Already queued the moment the worker reads as idle: never a later send.
+        let mut saw_completion = false;
+        while let Ok(event) = rx.try_recv() {
+            saw_completion |= matches!(event, WorkerEvent::Completed(_));
+        }
+        assert!(saw_completion);
     }
 
     #[tokio::test]

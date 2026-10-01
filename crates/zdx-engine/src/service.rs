@@ -9,6 +9,8 @@ use std::process::Command;
 use std::{fmt, fs};
 
 use anyhow::{Context, Result, bail};
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 
 use crate::agent_activity;
 use crate::config::paths;
@@ -19,7 +21,8 @@ use crate::pidfile::{self, ServiceStatus};
 pub const SUPERVISOR_ENV: &str = "ZDX_SERVICE_SUPERVISOR";
 
 /// A ZDX service that can run under launchd.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Service {
     Bot,
     Daemon,
@@ -365,6 +368,133 @@ fn restart_unchecked(service: Service) -> Result<String> {
     })
 }
 
+/// A restart that waits until no agent run is active.
+///
+/// Persisted at `$ZDX_HOME/run/restart-queue.json` so any surface (Telegram
+/// `/restart q`, `zdx service restart --queue`) can request one. The running
+/// bot service performs it, because a queued restart has to outlive the agent
+/// run that asked for it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueuedRestart {
+    pub services: Vec<Service>,
+    pub requested_at: DateTime<Utc>,
+    /// Thread that asked last; the bot announces the restart there when it
+    /// is a Telegram thread.
+    pub thread_id: Option<String>,
+}
+
+impl QueuedRestart {
+    #[must_use]
+    pub fn includes(&self, service: Service) -> bool {
+        self.services.contains(&service)
+    }
+
+    /// True once every requested service runs a process started after the
+    /// request — a forced or manual restart already did the work.
+    #[must_use]
+    pub fn is_fulfilled(&self) -> bool {
+        self.services
+            .iter()
+            .all(|service| match pidfile::status(service.name()) {
+                ServiceStatus::Running {
+                    started: Some(started),
+                    ..
+                } => DateTime::<Utc>::from(started) > self.requested_at,
+                _ => false,
+            })
+    }
+}
+
+/// Result of [`queue_restart`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueueRestartOutcome {
+    /// The pending request after this call (merged with any earlier one).
+    pub request: QueuedRestart,
+    /// An unfulfilled request was already pending and absorbed this one.
+    pub already_pending: bool,
+}
+
+/// Queues a gated restart of `services` for the bot service to perform once
+/// no agent run is active.
+///
+/// One request is pending at a time: a new call merges its services into the
+/// pending one, moves `requested_at` to now so the restart picks up whatever
+/// was installed before this call, and takes over the announcement thread
+/// when it names one.
+///
+/// # Errors
+/// Returns an error when the bot service is not running under a supervisor —
+/// nothing would perform the restart — or when the request cannot be written.
+pub fn queue_restart(services: &[Service], thread_id: Option<&str>) -> Result<QueueRestartOutcome> {
+    let bot_running = matches!(
+        pidfile::status(Service::Bot.name()),
+        ServiceStatus::Running { .. }
+    );
+    if !bot_running || !pidfile::is_supervised(Service::Bot.name()) {
+        bail!(
+            "the bot service is not running under a supervisor, so nothing would perform a queued restart; run `zdx service restart` once agent runs finish"
+        );
+    }
+
+    let pending = queued_restart()?.filter(|request| !request.is_fulfilled());
+    let already_pending = pending.is_some();
+    let mut merged = pending
+        .as_ref()
+        .map_or_else(Vec::new, |p| p.services.clone());
+    merged.extend(services.iter().copied());
+    let request = QueuedRestart {
+        services: Service::ALL
+            .into_iter()
+            .filter(|service| merged.contains(service))
+            .collect(),
+        requested_at: Utc::now(),
+        thread_id: thread_id
+            .map(str::to_string)
+            .or_else(|| pending.and_then(|p| p.thread_id)),
+    };
+    write_queued_restart(&request)?;
+    Ok(QueueRestartOutcome {
+        request,
+        already_pending,
+    })
+}
+
+/// The pending queued restart, if any.
+///
+/// # Errors
+/// Returns an error when the request file exists but cannot be read or parsed.
+pub fn queued_restart() -> Result<Option<QueuedRestart>> {
+    let path = restart_queue_path();
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err).with_context(|| format!("read {}", path.display())),
+    };
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .with_context(|| format!("parse {}", path.display()))
+}
+
+/// Drops the pending queued restart. Silent no-op when none is pending.
+pub fn clear_queued_restart() {
+    let _ = fs::remove_file(restart_queue_path());
+}
+
+fn write_queued_restart(request: &QueuedRestart) -> Result<()> {
+    let path = restart_queue_path();
+    let dir = path.parent().context("restart queue path has no parent")?;
+    fs::create_dir_all(dir).with_context(|| format!("create run dir {}", dir.display()))?;
+    // Write-then-rename so the bot never reads a half-written request.
+    let tmp = dir.join(format!("restart-queue.json.{}.tmp", std::process::id()));
+    fs::write(&tmp, serde_json::to_vec_pretty(request)?)
+        .with_context(|| format!("write {}", tmp.display()))?;
+    fs::rename(&tmp, &path).with_context(|| format!("write {}", path.display()))
+}
+
+fn restart_queue_path() -> PathBuf {
+    paths::zdx_home().join("run").join("restart-queue.json")
+}
+
 /// Polls the PID file briefly so restart can report the replacement PID.
 fn wait_for_new_pid(service: Service, old_pid: u32) -> Option<u32> {
     for _ in 0..40 {
@@ -587,5 +717,52 @@ mod tests {
 
         drop(run);
         assert!(ensure_restart_allowed(false).is_ok());
+    }
+
+    #[test]
+    fn queue_restart_requires_supervised_bot() {
+        let _home = crate::test_support::temp_zdx_home();
+        let err = queue_restart(&Service::ALL, None).expect_err("no bot to perform it");
+        assert!(format!("{err:#}").contains("bot service is not running"));
+        assert_eq!(queued_restart().unwrap(), None);
+    }
+
+    #[test]
+    fn queue_restart_merges_into_pending_request() {
+        let _home = crate::test_support::temp_zdx_home();
+        let _bot = pidfile::write("bot").unwrap();
+        pidfile::mark_supervised("bot").unwrap();
+
+        let first = queue_restart(&[Service::Daemon], Some("telegram--100-topic-1")).unwrap();
+        assert!(!first.already_pending);
+        assert_eq!(first.request.services, vec![Service::Daemon]);
+
+        let second = queue_restart(&[Service::Bot], None).unwrap();
+        assert!(second.already_pending);
+        assert_eq!(second.request.services, Service::ALL.to_vec());
+        assert_eq!(
+            second.request.thread_id.as_deref(),
+            Some("telegram--100-topic-1")
+        );
+        assert!(second.request.requested_at >= first.request.requested_at);
+        assert_eq!(queued_restart().unwrap(), Some(second.request.clone()));
+        // The daemon is not running, so the request is still owed.
+        assert!(!second.request.is_fulfilled());
+
+        clear_queued_restart();
+        assert_eq!(queued_restart().unwrap(), None);
+    }
+
+    #[test]
+    fn queued_restart_is_fulfilled_by_a_newer_process() {
+        let _home = crate::test_support::temp_zdx_home();
+        let request = QueuedRestart {
+            services: vec![Service::Bot],
+            requested_at: Utc::now() - chrono::Duration::hours(1),
+            thread_id: None,
+        };
+        assert!(!request.is_fulfilled());
+        let _bot = pidfile::write("bot").unwrap();
+        assert!(request.is_fulfilled());
     }
 }

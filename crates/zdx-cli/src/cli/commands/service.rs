@@ -4,6 +4,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
+use zdx_engine::agent_activity;
 use zdx_engine::service::{self, Service};
 
 /// `zdx service install [--program PATH]` — write and bootstrap the launchd agents.
@@ -61,7 +62,9 @@ pub fn restart(target: &str, force: bool) -> Result<()> {
     let services = Service::parse_target(target)?;
     let statuses = service::restart_many(&services, force).map_err(|err| {
         if err.downcast_ref::<service::RestartBlocked>().is_some() {
-            anyhow!("{err}; wait for active work to finish or retry with `--force` to interrupt it")
+            anyhow!(
+                "{err}; queue it with `--queue`, wait for active work to finish, or retry with `--force` to interrupt it"
+            )
         } else {
             err
         }
@@ -72,12 +75,51 @@ pub fn restart(target: &str, force: bool) -> Result<()> {
     Ok(())
 }
 
+/// `zdx service restart <target> --queue` — hand the restart to the bot,
+/// which performs it once no agent run is active.
+///
+/// # Errors
+/// Returns an error if the target is unknown, the bot service is not running
+/// under a supervisor, or the request cannot be written.
+pub fn queue_restart(target: &str) -> Result<()> {
+    let services = Service::parse_target(target)?;
+    // Lets the bot announce the restart in the Telegram topic that asked.
+    let thread_id = std::env::var("ZDX_THREAD_ID")
+        .ok()
+        .filter(|id| !id.trim().is_empty());
+    let outcome = service::queue_restart(&services, thread_id.as_deref())?;
+    let active = agent_activity::list_active().len();
+    let names = service_names(&outcome.request.services);
+    if outcome.already_pending {
+        println!("A restart was already queued; it now covers {names}.");
+    } else {
+        println!("Restart queued for {names}.");
+    }
+    println!(
+        "The bot performs it as soon as no agent run is active ({active} active now). Check with `zdx service status`."
+    );
+    Ok(())
+}
+
+fn service_names(services: &[Service]) -> String {
+    services
+        .iter()
+        .map(|s| s.name())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// `zdx service status [--json]`.
 ///
 /// # Errors
 /// Returns an error only if JSON serialization fails.
 pub fn status(json: bool) -> Result<()> {
     let states: Vec<_> = Service::ALL.into_iter().map(service::state).collect();
+    // An unreadable request is reported as none here; the bot drops it on its next check.
+    let queued = service::queued_restart()
+        .ok()
+        .flatten()
+        .filter(|request| !request.is_fulfilled());
 
     if json {
         let items: Vec<serde_json::Value> = states
@@ -95,7 +137,9 @@ pub fn status(json: bool) -> Result<()> {
             .collect();
         println!(
             "{}",
-            serde_json::to_string_pretty(&serde_json::json!({ "services": items }))?
+            serde_json::to_string_pretty(
+                &serde_json::json!({ "services": items, "queued_restart": queued })
+            )?
         );
         return Ok(());
     }
@@ -115,6 +159,16 @@ pub fn status(json: bool) -> Result<()> {
             (None, _) => "stopped".to_string(),
         };
         println!("  {:<8} {detail}  [{launchd}]", s.service.name());
+    }
+    if let Some(request) = queued {
+        println!(
+            "Queued restart: {} · requested {} · waits for agent runs to finish",
+            service_names(&request.services),
+            request
+                .requested_at
+                .with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M:%S")
+        );
     }
     Ok(())
 }

@@ -428,8 +428,13 @@ enum ServiceCommands {
         target: String,
 
         /// Restart even when agent runs are active
-        #[arg(long)]
+        #[arg(long, conflicts_with = "queue")]
         force: bool,
+
+        /// Queue the restart: the bot performs it as soon as no agent run is
+        /// active (safe to call from inside an agent run)
+        #[arg(long)]
+        queue: bool,
     },
     /// Show launchd registration and live process status
     Status {
@@ -1403,7 +1408,14 @@ fn dispatch_service(command: ServiceCommands, context: &DispatchContext<'_>) -> 
         ServiceCommands::Uninstall { target } => commands::service::uninstall(&target),
         ServiceCommands::Start { target } => commands::service::start(&target),
         ServiceCommands::Stop { target } => commands::service::stop(&target),
-        ServiceCommands::Restart { target, force } => commands::service::restart(&target, force),
+        ServiceCommands::Restart {
+            target,
+            queue: true,
+            ..
+        } => commands::service::queue_restart(&target),
+        ServiceCommands::Restart { target, force, .. } => {
+            commands::service::restart(&target, force)
+        }
         ServiceCommands::Status { json } => commands::service::status(json),
         ServiceCommands::Logs { target, lines, err } => {
             commands::service::logs(&target, lines, err)

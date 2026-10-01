@@ -14,6 +14,7 @@ use crate::bot::context::BotContext;
 use crate::commands::{
     BotCommand, ModelSubcommand, RestartMode, parse_command, parse_restart_command,
 };
+use crate::restart_queue::{RestartAttempt, attempt_restart};
 use crate::telegram::markdown::{to_telegram_html, truncate_telegram_html};
 use crate::telegram::{InlineKeyboardButton, InlineKeyboardMarkup};
 
@@ -229,9 +230,6 @@ pub(super) async fn handle_general_forum_commands(
     Ok(true)
 }
 
-/// How often a queued restart re-checks for active agent runs.
-const QUEUED_RESTART_POLL: std::time::Duration = std::time::Duration::from_secs(3);
-
 pub(super) async fn handle_restart_command(
     context: &Arc<BotContext>,
     incoming: &crate::types::IncomingMessage,
@@ -266,26 +264,26 @@ pub(super) async fn handle_restart_command(
 
     match restart.mode {
         RestartMode::Queued => {
-            if !context.try_claim_queued_restart() {
-                reply(
-                    "⏳ A restart is already queued; it fires as soon as no agent run is active."
-                        .to_string(),
-                )
-                .await?;
-                return Ok(true);
-            }
-            let active = tokio::task::spawn_blocking(|| agent_activity::list_active().len())
-                .await
-                .unwrap_or_default();
-            reply(format!(
-                "⏳ Restart queued. I'll restart as soon as no agent run is active ({active} active now).\n\n<code>/restart f</code> restarts immediately instead."
-            ))
-            .await?;
-            spawn_queued_restart(
-                Arc::clone(context),
-                incoming.chat_id,
-                incoming.message_thread_id,
-            );
+            let thread_id = thread_id_for_chat(incoming.chat_id, incoming.message_thread_id);
+            let (outcome, active) = tokio::task::spawn_blocking(move || {
+                let outcome = service::queue_restart(&Service::ALL, Some(&thread_id));
+                (outcome, agent_activity::list_active().len())
+            })
+            .await
+            .context("join queue restart task")?;
+            let text = match outcome {
+                Ok(outcome) if outcome.already_pending => format!(
+                    "⏳ A restart is already queued; it fires once no agent run, worker, or pending worker update is left ({active} agent runs active now) and will be announced here."
+                ),
+                Ok(_) => format!(
+                    "⏳ Restart queued. I'll restart once no agent run, worker, or pending worker update is left ({active} agent runs active now).\n\n<code>/restart f</code> restarts immediately instead."
+                ),
+                Err(err) => format!(
+                    "⚠️ Couldn't queue the restart.\n<code>{}</code>",
+                    escape_html(&format!("{err:#}"))
+                ),
+            };
+            reply(text).await?;
             Ok(true)
         }
         RestartMode::Gated | RestartMode::Force => {
@@ -315,81 +313,6 @@ pub(super) async fn handle_restart_command(
             Ok(true)
         }
     }
-}
-
-enum RestartAttempt {
-    /// Daemon restarted (status text, HTML-escaped); the bot should exit.
-    Restarting(String),
-    /// Refused because this many agent runs are active.
-    Blocked(usize),
-    /// Daemon restart failed (error text, HTML-escaped); the bot stays up.
-    Failed(String),
-}
-
-/// Restarts the daemon (gated unless `force`) without exiting the bot.
-async fn attempt_restart(force: bool) -> Result<RestartAttempt> {
-    let outcome = tokio::task::spawn_blocking(move || service::restart(Service::Daemon, force))
-        .await
-        .context("join daemon restart task")?;
-    Ok(match outcome {
-        Ok(status) => RestartAttempt::Restarting(escape_html(&status)),
-        Err(err) => match err.downcast_ref::<service::RestartBlocked>() {
-            Some(blocked) => RestartAttempt::Blocked(blocked.active_runs()),
-            None => RestartAttempt::Failed(escape_html(&format!("{err:#}"))),
-        },
-    })
-}
-
-/// Waits until no agent run is active, then performs the gated restart. A run
-/// starting between the check and the restart is caught by the gate itself,
-/// which simply puts the wait back to sleep.
-fn spawn_queued_restart(context: Arc<BotContext>, chat_id: i64, topic_id: Option<i64>) {
-    tokio::spawn(async move {
-        loop {
-            let idle = tokio::task::spawn_blocking(|| agent_activity::list_active().is_empty())
-                .await
-                .unwrap_or(false);
-            if idle {
-                match attempt_restart(false).await {
-                    Ok(RestartAttempt::Restarting(status)) => {
-                        let text = format!(
-                            "🔄 {status}.\n👋 Queued restart: no agent run is active, exiting bot… launchd will restart it shortly."
-                        );
-                        if let Err(err) = context
-                            .client()
-                            .send_message(chat_id, &text, None, topic_id)
-                            .await
-                        {
-                            tracing::warn!(err = %format!("{err:#}"), "Failed to announce queued restart");
-                        }
-                        context.request_exit();
-                        return;
-                    }
-                    Ok(RestartAttempt::Blocked(_)) => {}
-                    Ok(RestartAttempt::Failed(error)) => {
-                        let text = format!(
-                            "⚠️ Queued restart failed, so I left the bot running.\n<code>{error}</code>"
-                        );
-                        if let Err(err) = context
-                            .client()
-                            .send_message(chat_id, &text, None, topic_id)
-                            .await
-                        {
-                            tracing::warn!(err = %format!("{err:#}"), "Failed to report queued restart failure");
-                        }
-                        context.release_queued_restart();
-                        return;
-                    }
-                    Err(err) => {
-                        tracing::warn!(err = %format!("{err:#}"), "Queued restart task failed");
-                        context.release_queued_restart();
-                        return;
-                    }
-                }
-            }
-            tokio::time::sleep(QUEUED_RESTART_POLL).await;
-        }
-    });
 }
 
 async fn handle_model_command(

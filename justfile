@@ -118,6 +118,10 @@ install: build-release
 deploy: install
     ~/.local/bin/zdx service restart all
 
+# Build, install, and queue the restart until agent runs, workers, and orchestrator updates are done
+safe-deploy: install
+    ~/.local/bin/zdx service restart all --queue
+
 # (Re)create ~/.local/bin/zdxd as a symlink to the debug build
 install-debug:
     cargo build -p zdx

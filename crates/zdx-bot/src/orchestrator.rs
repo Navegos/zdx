@@ -105,7 +105,8 @@ struct Bridge {
     live: HashMap<String, LiveTurn>,
 }
 
-/// Spawns the process-lifetime bridge task.
+/// Spawns the process-lifetime bridge task. It also performs queued restarts
+/// (see `restart_queue`), since it alone knows no completion is in flight.
 pub(crate) fn spawn_completion_bridge(
     context: Arc<BotContext>,
     queues: ChatQueueMap,
@@ -119,6 +120,7 @@ pub(crate) fn spawn_completion_bridge(
             live: HashMap::new(),
         };
         bridge.recover_mirrors().await;
+        let mut restart_poll = tokio::time::interval(crate::restart_queue::POLL);
 
         loop {
             let next_flush = bridge.next_flush_at();
@@ -126,6 +128,20 @@ pub(crate) fn spawn_completion_bridge(
                 event = events_rx.recv() => {
                     let Some(event) = event else { break };
                     bridge.handle(event).await;
+                }
+                _ = restart_poll.tick() => {
+                    // Checked on this task, between events, so a worker
+                    // completion is never half-delivered when a queued restart
+                    // fires. Order matters: idle workers have already sent their
+                    // completion, so an empty channel after that means none is
+                    // pending; a non-empty chat queue means an orchestrator turn
+                    // (including a `[worker update]`) is still queued or running.
+                    let settled = bridge.context.worker_manager().all_idle()
+                        && events_rx.is_empty()
+                        && bridge.queues.lock().await.is_empty();
+                    if settled {
+                        crate::restart_queue::tick(&bridge.context).await;
+                    }
                 }
                 () = async {
                     match next_flush {

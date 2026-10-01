@@ -98,6 +98,7 @@ fn test_service_restart_blocks_active_agent_unless_forced() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("restart blocked"))
+        .stderr(predicate::str::contains("--queue"))
         .stderr(predicate::str::contains("--force"));
 
     crate::fixtures::zdx_cmd()
@@ -107,4 +108,80 @@ fn test_service_restart_blocks_active_agent_unless_forced() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("not installed"));
+}
+
+/// Writes PID and supervision markers for a "bot" that is this test process,
+/// so `--queue` sees a live supervised bot without launchd.
+fn fake_supervised_bot(home: &std::path::Path) {
+    let run = home.join("run");
+    std::fs::create_dir_all(&run).unwrap();
+    let pid = std::process::id().to_string();
+    std::fs::write(run.join("bot.pid"), &pid).unwrap();
+    std::fs::write(run.join("bot.supervised"), &pid).unwrap();
+}
+
+#[test]
+fn test_service_restart_queue_requires_running_bot() {
+    let dir = tempdir().unwrap();
+
+    crate::fixtures::zdx_cmd()
+        .env("ZDX_HOME", dir.path())
+        .env("HOME", dir.path())
+        .args(["service", "restart", "--queue"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("bot service is not running"));
+    assert!(!dir.path().join("run/restart-queue.json").exists());
+}
+
+#[test]
+fn test_service_restart_queue_rejects_force() {
+    crate::fixtures::zdx_cmd()
+        .args(["service", "restart", "--queue", "--force"])
+        .assert()
+        .failure();
+}
+
+/// `--queue` records one request for the bot to perform, merges a second
+/// request into it, keeps the requesting thread for the announcement, and
+/// reports it through `service status --json`.
+#[test]
+fn test_service_restart_queue_records_and_merges_request() {
+    let dir = tempdir().unwrap();
+    fake_supervised_bot(dir.path());
+
+    crate::fixtures::zdx_cmd()
+        .env("ZDX_HOME", dir.path())
+        .env("HOME", dir.path())
+        .env("ZDX_THREAD_ID", "telegram--100-topic-7")
+        .args(["service", "restart", "daemon", "--queue"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Restart queued for daemon"));
+
+    crate::fixtures::zdx_cmd()
+        .env("ZDX_HOME", dir.path())
+        .env("HOME", dir.path())
+        .env_remove("ZDX_THREAD_ID")
+        .args(["service", "restart", "bot", "--queue"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "already queued; it now covers bot, daemon",
+        ));
+
+    let output = crate::fixtures::zdx_cmd()
+        .env("ZDX_HOME", dir.path())
+        .env("HOME", dir.path())
+        .args(["service", "status", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let parsed: Value = serde_json::from_slice(&output).unwrap();
+    let queued = &parsed["queued_restart"];
+    assert_eq!(queued["services"], serde_json::json!(["bot", "daemon"]));
+    assert_eq!(queued["thread_id"], "telegram--100-topic-7");
+    assert!(queued["requested_at"].is_string());
 }

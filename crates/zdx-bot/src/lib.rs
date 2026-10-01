@@ -28,6 +28,7 @@ mod goal;
 mod handlers;
 mod ingest;
 mod orchestrator;
+mod restart_queue;
 mod retry;
 pub(crate) mod server;
 mod staging;
