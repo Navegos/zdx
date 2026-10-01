@@ -9,6 +9,9 @@ pub struct IncomingMessage {
     pub audios: Vec<IncomingAudio>,
     pub documents: Vec<IncomingDocument>,
     pub videos: Vec<IncomingVideo>,
+    /// Attachments that could not be loaded, as prompt sentences, so the agent
+    /// is told instead of the attachment silently vanishing.
+    pub notices: Vec<String>,
     /// Forum topic ID (for supergroups with topics enabled).
     pub message_thread_id: Option<i64>,
     /// Whether the group is a forum-enabled supergroup.
@@ -16,9 +19,36 @@ pub struct IncomingMessage {
 }
 
 pub struct IncomingImage {
+    /// The original file as received, kept at full resolution.
     pub local_path: PathBuf,
-    pub mime_type: String,
-    pub data: String,
+    pub delivery: ImageDelivery,
+}
+
+pub enum ImageDelivery {
+    /// Sent to the model as an image block.
+    Inline {
+        mime_type: String,
+        data: String,
+        /// The model gets a smaller copy than the saved original.
+        downscaled: bool,
+    },
+    /// Saved only; `reason` says why the model cannot see it inline.
+    SavedOnly {
+        reason: String,
+        /// The saved file fits `ask_media`'s type and size limits.
+        ask_media: bool,
+    },
+}
+
+impl IncomingImage {
+    pub fn inline(&self) -> Option<(&str, &str)> {
+        match &self.delivery {
+            ImageDelivery::Inline {
+                mime_type, data, ..
+            } => Some((mime_type, data)),
+            ImageDelivery::SavedOnly { .. } => None,
+        }
+    }
 }
 
 pub struct IncomingAudio {

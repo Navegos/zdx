@@ -11,10 +11,19 @@ use zdx_engine::config::{Config, paths};
 use crate::telegram::{Audio, Document, Message, PhotoSize, TelegramClient, Video, Voice};
 use crate::transcribe;
 use crate::types::{
-    IncomingAudio, IncomingDocument, IncomingImage, IncomingMessage, IncomingVideo, VideoStatus,
+    ImageDelivery, IncomingAudio, IncomingDocument, IncomingImage, IncomingMessage, IncomingVideo,
+    VideoStatus,
 };
 
-const MAX_IMAGE_BYTES: u64 = 3_932_160; // 3.75MB
+/// Bot API `getFile` refuses anything larger, so a bigger file can never be
+/// downloaded.
+const TELEGRAM_DOWNLOAD_LIMIT_BYTES: u64 = 20 * 1024 * 1024;
+/// Images go to the model at most this size. Smaller than the provider cap on
+/// purpose: it keeps uploads fast and cheap and still leaves screenshot text
+/// legible; 1568px is Anthropic's standard-tier long edge, which it would
+/// downscale to anyway. The saved file keeps full resolution.
+const INLINE_IMAGE_EDGE: u32 = 1568;
+const INLINE_IMAGE_BYTES: usize = 1024 * 1024;
 const MAX_AUDIO_BYTES: u64 = 25 * 1024 * 1024; // 25MB
 const MAX_DOCUMENT_BYTES: u64 = 25 * 1024 * 1024; // 25MB
 const MAX_VIDEO_BYTES: u64 = zdx_engine::media::MAX_INLINE_BYTES as u64;
@@ -36,16 +45,30 @@ struct AttachmentCollection {
     audios: Vec<IncomingAudio>,
     documents: Vec<IncomingDocument>,
     videos: Vec<IncomingVideo>,
+    notices: Vec<String>,
     had_attachments: bool,
 }
 
-struct VideoRef<'a> {
+/// An attachment that could not be loaded, with the sentence the agent gets
+/// in its place. Any other load error yields a generic notice.
+#[derive(Debug)]
+struct AttachmentNotice(String);
+
+impl std::fmt::Display for AttachmentNotice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for AttachmentNotice {}
+
+struct FileRef<'a> {
     id: &'a str,
     size: Option<u64>,
     name: Option<&'a str>,
 }
 
-impl<'a> From<&'a Video> for VideoRef<'a> {
+impl<'a> From<&'a Video> for FileRef<'a> {
     fn from(video: &'a Video) -> Self {
         Self {
             id: &video.file_id,
@@ -55,7 +78,7 @@ impl<'a> From<&'a Video> for VideoRef<'a> {
     }
 }
 
-impl<'a> From<&'a Document> for VideoRef<'a> {
+impl<'a> From<&'a Document> for FileRef<'a> {
     fn from(document: &'a Document) -> Self {
         Self {
             id: &document.file_id,
@@ -99,6 +122,7 @@ pub(crate) async fn parse_incoming_message(
         audios,
         documents,
         videos,
+        notices,
         had_attachments,
     } = attachments;
 
@@ -107,6 +131,7 @@ pub(crate) async fn parse_incoming_message(
         && audios.is_empty()
         && documents.is_empty()
         && videos.is_empty()
+        && notices.is_empty()
     {
         return handle_empty_message(client, &target, had_attachments).await;
     }
@@ -124,6 +149,7 @@ pub(crate) async fn parse_incoming_message(
         audios,
         documents,
         videos,
+        notices,
         message_thread_id: target.thread,
         is_forum: message.chat.is_forum_enabled(),
     }))
@@ -195,6 +221,7 @@ async fn collect_attachments(
     let mut audios = Vec::new();
     let mut documents = Vec::new();
     let mut videos = Vec::new();
+    let mut notices = Vec::new();
     let mut had_attachments = false;
 
     for current in std::iter::once(message).chain(message.grouped_messages.iter()) {
@@ -203,10 +230,16 @@ async fn collect_attachments(
         if let Some(photos) = current.photo.as_deref() {
             had_attachments = true;
             if let Some(photo) = select_best_photo(photos) {
+                let source = FileRef {
+                    id: &photo.file_id,
+                    size: photo.file_size,
+                    name: None,
+                };
                 push_attachment(
                     &mut images,
-                    load_photo_attachment(client, target.chat, current_message_id, photo),
-                    "photo attachment",
+                    &mut notices,
+                    load_image(client, target.chat, current_message_id, &source),
+                    "photo",
                 )
                 .await?;
             }
@@ -221,13 +254,20 @@ async fn collect_attachments(
             if mime.starts_with("image/") {
                 push_attachment(
                     &mut images,
-                    load_document_image(client, target.chat, current_message_id, document),
-                    "document image",
+                    &mut notices,
+                    load_image(
+                        client,
+                        target.chat,
+                        current_message_id,
+                        &FileRef::from(document),
+                    ),
+                    "image file",
                 )
                 .await?;
             } else if mime.starts_with("audio/") {
                 push_attachment(
                     &mut audios,
+                    &mut notices,
                     load_audio_attachment(
                         client,
                         config,
@@ -236,14 +276,15 @@ async fn collect_attachments(
                         document,
                         cancel_token,
                     ),
-                    "document audio",
+                    "audio file",
                 )
                 .await?;
             } else {
                 push_attachment(
                     &mut documents,
+                    &mut notices,
                     load_generic_document(client, target.chat, current_message_id, document),
-                    "generic document",
+                    "file",
                 )
                 .await?;
             }
@@ -253,6 +294,7 @@ async fn collect_attachments(
             had_attachments = true;
             push_attachment(
                 &mut audios,
+                &mut notices,
                 load_voice_attachment(
                     client,
                     config,
@@ -261,7 +303,7 @@ async fn collect_attachments(
                     voice,
                     cancel_token,
                 ),
-                "voice attachment",
+                "voice message",
             )
             .await?;
         }
@@ -270,6 +312,7 @@ async fn collect_attachments(
             had_attachments = true;
             push_attachment(
                 &mut audios,
+                &mut notices,
                 load_audio_message(
                     client,
                     config,
@@ -287,8 +330,9 @@ async fn collect_attachments(
             had_attachments = true;
             push_attachment(
                 &mut videos,
+                &mut notices,
                 load_video(client, target.chat, current_message_id, kind, &video),
-                "video attachment",
+                "video",
             )
             .await?;
         }
@@ -299,6 +343,7 @@ async fn collect_attachments(
         audios,
         documents,
         videos,
+        notices,
         had_attachments,
     })
 }
@@ -306,7 +351,7 @@ async fn collect_attachments(
 /// Telegram video media on one message, labelled by kind, including a file
 /// sent with a `video/*` MIME type. A GIF-style `animation` also sets
 /// `document` for backward compatibility, so that document is not counted.
-fn video_attachments(message: &Message) -> Vec<(&'static str, VideoRef<'_>)> {
+fn video_attachments(message: &Message) -> Vec<(&'static str, FileRef<'_>)> {
     let video_document = message.document.as_ref().filter(|document| {
         message.animation.is_none()
             && document
@@ -315,13 +360,10 @@ fn video_attachments(message: &Message) -> Vec<(&'static str, VideoRef<'_>)> {
                 .is_some_and(|mime| mime.starts_with("video/"))
     });
     [
-        ("Video", message.video.as_ref().map(VideoRef::from)),
-        (
-            "Video note",
-            message.video_note.as_ref().map(VideoRef::from),
-        ),
-        ("Animation", message.animation.as_ref().map(VideoRef::from)),
-        ("Video file", video_document.map(VideoRef::from)),
+        ("Video", message.video.as_ref().map(FileRef::from)),
+        ("Video note", message.video_note.as_ref().map(FileRef::from)),
+        ("Animation", message.animation.as_ref().map(FileRef::from)),
+        ("Video file", video_document.map(FileRef::from)),
     ]
     .into_iter()
     .filter_map(|(kind, video)| video.map(|video| (kind, video)))
@@ -330,6 +372,7 @@ fn video_attachments(message: &Message) -> Vec<(&'static str, VideoRef<'_>)> {
 
 async fn push_attachment<T>(
     output: &mut Vec<T>,
+    notices: &mut Vec<String>,
     load_future: impl std::future::Future<Output = Result<Option<T>>>,
     label: &str,
 ) -> Result<()> {
@@ -337,7 +380,17 @@ async fn push_attachment<T>(
         Ok(Some(item)) => output.push(item),
         Ok(None) => {}
         Err(err) if transcribe::is_operation_cancelled(&err) => return Err(err),
-        Err(err) => tracing::error!(err = %format!("{err:#}"), label, "Failed to load attachment"),
+        Err(err) => {
+            tracing::error!(err = %format!("{err:#}"), label, "Failed to load attachment");
+            // The raw error is not passed on: a download error carries the
+            // file URL, which embeds the bot token.
+            notices.push(match err.downcast_ref::<AttachmentNotice>() {
+                Some(notice) => notice.0.clone(),
+                None => format!(
+                    "One attachment ({label}) could not be loaded from Telegram, so it is missing from this message. Tell the user and ask them to resend it."
+                ),
+            });
+        }
     }
     Ok(())
 }
@@ -396,88 +449,84 @@ fn select_best_photo(photos: &[PhotoSize]) -> Option<&PhotoSize> {
     })
 }
 
-async fn load_photo_attachment(
+/// Downloads an image, saves the original, and prepares the copy the model
+/// sees. An image the model cannot take inline is still saved and described,
+/// never dropped.
+async fn load_image(
     client: &TelegramClient,
     chat_id: i64,
     message_id: i64,
-    photo: &PhotoSize,
+    source: &FileRef<'_>,
 ) -> Result<Option<IncomingImage>> {
-    if photo.file_size.unwrap_or(0) > MAX_IMAGE_BYTES {
-        tracing::debug!(chat_id, "Skipping photo exceeding max image size");
-        return Ok(None);
+    if let Some(size) = source
+        .size
+        .filter(|size| *size > TELEGRAM_DOWNLOAD_LIMIT_BYTES)
+    {
+        return Err(AttachmentNotice(format!(
+            "An image attachment was not downloaded: it is {} and Telegram bots can only download files up to {}. Ask the user for a smaller file.",
+            format_mib(size),
+            format_mib(TELEGRAM_DOWNLOAD_LIMIT_BYTES)
+        ))
+        .into());
     }
 
-    let (file_path, bytes) = download_file_bytes(client, &photo.file_id).await?;
-    if bytes.len() as u64 > MAX_IMAGE_BYTES {
-        tracing::debug!(chat_id, "Downloaded photo exceeds max image size");
-        return Ok(None);
-    }
-
-    let Some(mime_type) = detect_image_mime(&bytes) else {
-        tracing::debug!(chat_id, "Unsupported image type");
-        return Ok(None);
-    };
-
-    let filename =
-        file_name_from_path(&file_path).unwrap_or_else(|| format!("photo_{message_id}.bin"));
-    let local_path = save_media_bytes(chat_id, message_id, &filename, &bytes)?;
-    // The saved file keeps full resolution; only the provider-bound copy is
-    // clamped, since vision APIs reject images over their pixel cap.
-    let (bytes, mime_type) = match zdx_engine::images::downscale_for_provider(&bytes) {
-        Some((resized, resized_mime)) => (resized, resized_mime.to_string()),
-        None => (bytes, mime_type),
-    };
-    let data = BASE64.encode(&bytes);
-
-    Ok(Some(IncomingImage {
-        local_path,
-        mime_type,
-        data,
-    }))
-}
-
-async fn load_document_image(
-    client: &TelegramClient,
-    chat_id: i64,
-    message_id: i64,
-    document: &Document,
-) -> Result<Option<IncomingImage>> {
-    if document.file_size.unwrap_or(0) > MAX_IMAGE_BYTES {
-        tracing::debug!(chat_id, "Skipping document image exceeding max size");
-        return Ok(None);
-    }
-
-    let (file_path, bytes) = download_file_bytes(client, &document.file_id).await?;
-    if bytes.len() as u64 > MAX_IMAGE_BYTES {
-        tracing::debug!(chat_id, "Downloaded document image exceeds max size");
-        return Ok(None);
-    }
-
-    let Some(mime_type) = select_image_mime(document.mime_type.as_deref(), &bytes) else {
-        tracing::debug!(chat_id, "Unsupported document image type");
-        return Ok(None);
-    };
-
-    let filename = document
-        .file_name
-        .as_deref()
+    let (file_path, bytes) = download_file_bytes(client, source.id).await?;
+    let file_name = source
+        .name
         .and_then(file_name_from_path)
         .or_else(|| file_name_from_path(&file_path))
         .unwrap_or_else(|| format!("image_{message_id}.bin"));
-    let local_path = save_media_bytes(chat_id, message_id, &filename, &bytes)?;
-    // The saved file keeps full resolution; only the provider-bound copy is
-    // clamped, since vision APIs reject images over their pixel cap.
-    let (bytes, mime_type) = match zdx_engine::images::downscale_for_provider(&bytes) {
-        Some((resized, resized_mime)) => (resized, resized_mime.to_string()),
-        None => (bytes, mime_type),
-    };
-    let data = BASE64.encode(&bytes);
+    let local_path = save_media_bytes(chat_id, message_id, &file_name, &bytes)?;
+    let delivery = prepare_inline_image(&local_path, &bytes);
 
     Ok(Some(IncomingImage {
         local_path,
-        mime_type,
-        data,
+        delivery,
     }))
+}
+
+/// Shrinks an image to the inline limits, or explains why the model cannot
+/// see it. An image the decoder cannot read (GIF, for one) is sent as-is when
+/// it is a type providers accept and already within the byte limit.
+fn prepare_inline_image(local_path: &Path, bytes: &[u8]) -> ImageDelivery {
+    if let Some((resized, mime_type)) =
+        zdx_engine::images::downscale_to_fit(bytes, INLINE_IMAGE_EDGE, INLINE_IMAGE_BYTES)
+    {
+        return ImageDelivery::Inline {
+            mime_type: mime_type.to_string(),
+            data: BASE64.encode(resized),
+            downscaled: true,
+        };
+    }
+
+    let detected = infer::get(bytes).map(|kind| kind.mime_type());
+    let reason = match detected {
+        Some(mime) if SUPPORTED_IMAGE_MIMES.contains(&mime) => {
+            if bytes.len() <= INLINE_IMAGE_BYTES {
+                return ImageDelivery::Inline {
+                    mime_type: mime.to_string(),
+                    data: BASE64.encode(bytes),
+                    downscaled: false,
+                };
+            }
+            format!(
+                "it is {} and could not be shrunk below the {} inline limit",
+                format_mib(bytes.len() as u64),
+                format_mib(INLINE_IMAGE_BYTES as u64)
+            )
+        }
+        Some(mime) => format!("the model cannot take {mime} images directly"),
+        None => "its image format was not recognized".to_string(),
+    };
+
+    ImageDelivery::SavedOnly {
+        reason,
+        ask_media: zdx_engine::media::can_ask_media(local_path, bytes.len() as u64),
+    }
+}
+
+fn format_mib(bytes: u64) -> String {
+    format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
 }
 
 async fn load_generic_document(
@@ -519,7 +568,7 @@ async fn load_video(
     chat_id: i64,
     message_id: i64,
     kind: &'static str,
-    video: &VideoRef<'_>,
+    video: &FileRef<'_>,
 ) -> Result<Option<IncomingVideo>> {
     let too_large = |size_bytes| {
         tracing::debug!(
@@ -679,25 +728,6 @@ async fn load_audio_by_id(
     }))
 }
 
-fn detect_image_mime(bytes: &[u8]) -> Option<String> {
-    let kind = infer::get(bytes)?;
-    let mime = kind.mime_type();
-    if SUPPORTED_IMAGE_MIMES.contains(&mime) {
-        Some(mime.to_string())
-    } else {
-        None
-    }
-}
-
-fn select_image_mime(declared: Option<&str>, bytes: &[u8]) -> Option<String> {
-    if let Some(mime) = declared
-        && SUPPORTED_IMAGE_MIMES.contains(&mime)
-    {
-        return Some(mime.to_string());
-    }
-    detect_image_mime(bytes)
-}
-
 async fn download_file_bytes(client: &TelegramClient, file_id: &str) -> Result<(String, Vec<u8>)> {
     let file = client.get_file(file_id).await?;
     let file_path = file
@@ -733,21 +763,27 @@ fn save_media_bytes(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use std::fs;
+    use std::io::Cursor;
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use axum::extract::Path as AxumPath;
     use axum::routing::{get, post};
     use axum::{Json, Router};
+    use base64::Engine as _;
     use serde_json::json;
     use zdx_engine::config::Config;
 
-    use super::{AllowlistConfig, MAX_VIDEO_BYTES, extract_text, parse_incoming_message};
+    use super::{
+        AllowlistConfig, BASE64, INLINE_IMAGE_BYTES, INLINE_IMAGE_EDGE, MAX_VIDEO_BYTES,
+        TELEGRAM_DOWNLOAD_LIMIT_BYTES, extract_text, parse_incoming_message,
+    };
     use crate::agent::build_user_text;
     use crate::telegram::{Message, TelegramClient};
-    use crate::types::{IncomingMessage, VideoStatus};
+    use crate::types::{ImageDelivery, IncomingMessage, VideoStatus};
 
     fn message(value: serde_json::Value) -> Message {
         serde_json::from_value(value).expect("valid message")
@@ -814,6 +850,23 @@ mod tests {
     /// Fake Bot API: `getFile` maps a file id to `videos/<id>.mp4`, and the file
     /// endpoint serves fixed bytes. Returns the base URL and the `getFile` count.
     async fn fake_telegram() -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        fake_telegram_with(HashMap::new()).await
+    }
+
+    /// Fake Bot API. `files` maps a file id to its `file_path` and bytes; any
+    /// other id is served as `videos/<id>.mp4` with fixed bytes, except
+    /// `broken`, which `getFile` rejects. Returns the base URL and the
+    /// `getFile` count.
+    async fn fake_telegram_with(
+        files: HashMap<&'static str, (&'static str, Vec<u8>)>,
+    ) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let files = Arc::new(files);
+        let by_path: Arc<HashMap<String, Vec<u8>>> = Arc::new(
+            files
+                .values()
+                .map(|(path, bytes)| ((*path).to_string(), bytes.clone()))
+                .collect(),
+        );
         let get_file_calls = Arc::new(AtomicUsize::new(0));
         let calls = Arc::clone(&get_file_calls);
         let app = Router::new()
@@ -821,19 +874,39 @@ mod tests {
                 &format!("/bot{TOKEN}/getFile"),
                 post(move |Json(body): Json<serde_json::Value>| {
                     let calls = Arc::clone(&calls);
+                    let files = Arc::clone(&files);
                     async move {
                         calls.fetch_add(1, Ordering::SeqCst);
                         let file_id = body["file_id"].as_str().unwrap_or_default().to_string();
+                        if file_id == "broken" {
+                            return Json(json!({
+                                "ok": false,
+                                "error_code": 400,
+                                "description": "Bad Request: file is too big",
+                            }));
+                        }
+                        let file_path = files.get(file_id.as_str()).map_or_else(
+                            || format!("videos/{file_id}.mp4"),
+                            |(path, _)| (*path).to_string(),
+                        );
                         Json(json!({
                             "ok": true,
-                            "result": { "file_id": file_id, "file_path": format!("videos/{file_id}.mp4") },
+                            "result": { "file_id": file_id, "file_path": file_path },
                         }))
                     }
                 }),
             )
             .route(
-                &format!("/file/bot{TOKEN}/videos/{{name}}"),
-                get(|| async { VIDEO_BYTES }),
+                &format!("/file/bot{TOKEN}/{{*path}}"),
+                get(move |AxumPath(path): AxumPath<String>| {
+                    let by_path = Arc::clone(&by_path);
+                    async move {
+                        by_path
+                            .get(&path)
+                            .cloned()
+                            .unwrap_or_else(|| VIDEO_BYTES.to_vec())
+                    }
+                }),
             );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -979,6 +1052,182 @@ mod tests {
             "Video attachment was not downloaded: it is 15.0 MiB and the limit is 15 MiB. \
              Ask the user for a shorter or compressed clip."
         );
+        server.abort();
+    }
+
+    fn png(width: u32, height: u32) -> Vec<u8> {
+        let img = image::RgbImage::from_fn(width, height, |x, y| {
+            image::Rgb([(x % 256) as u8, (y % 256) as u8, 128])
+        });
+        let mut buf = Vec::new();
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut Cursor::new(&mut buf), image::ImageFormat::Png)
+            .expect("encode test PNG");
+        buf
+    }
+
+    fn inline_bytes(delivery: &ImageDelivery) -> (Vec<u8>, bool) {
+        let ImageDelivery::Inline {
+            data, downscaled, ..
+        } = delivery
+        else {
+            panic!("image was not sent inline");
+        };
+        (BASE64.decode(data).expect("valid base64"), *downscaled)
+    }
+
+    fn photo_sizes(small: &str, big: &str) -> serde_json::Value {
+        json!([
+            { "file_id": small, "width": 90, "height": 60, "file_size": 1000 },
+            { "file_id": big, "width": 900, "height": 600, "file_size": 9000 },
+        ])
+    }
+
+    /// Two photos sent as one album reach a single turn as two inline images,
+    /// each from its largest size, with the caption first.
+    #[tokio::test]
+    async fn two_photo_album_reaches_one_turn_as_two_images() {
+        let _home = zdx_engine::test_support::temp_zdx_home();
+        let (base_url, get_file_calls, server) = fake_telegram_with(HashMap::from([
+            ("a_big", ("photos/a_big.png", png(90, 60))),
+            ("b_big", ("photos/b_big.png", png(90, 60))),
+        ]))
+        .await;
+        let mut album = with(
+            20,
+            &json!({ "media_group_id": "g1", "caption": "compare these", "photo": photo_sizes("a_small", "a_big") }),
+        );
+        album.grouped_messages.push(with(
+            21,
+            &json!({ "media_group_id": "g1", "photo": photo_sizes("b_small", "b_big") }),
+        ));
+
+        let incoming = ingest(base_url, album).await.expect("turn runs");
+
+        assert_eq!(get_file_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(incoming.images.len(), 2);
+        assert!(incoming.images[0].local_path.ends_with("20_a_big.png"));
+        assert!(incoming.images[1].local_path.ends_with("21_b_big.png"));
+        for image in &incoming.images {
+            assert!(!inline_bytes(&image.delivery).1, "small image sent as-is");
+        }
+        let prompt = build_user_text(&incoming);
+        assert!(prompt.starts_with("compare these\n\nImage attachment saved at "));
+        assert_eq!(prompt.matches("Image attachment saved at").count(), 2);
+        server.abort();
+    }
+
+    /// A large image is saved whole, and the model gets a smaller copy within
+    /// the inline limits. The byte-budget path is covered by
+    /// `zdx_tools::image_downscale`; noisy fixtures big enough to hit it here
+    /// take minutes in a debug build.
+    #[tokio::test]
+    async fn large_image_is_saved_whole_and_sent_downscaled() {
+        let _home = zdx_engine::test_support::temp_zdx_home();
+        // Small in pixels on purpose: image work is slow in a debug build.
+        let original = png(3200, 100);
+        let (base_url, _, server) = fake_telegram_with(HashMap::from([(
+            "shot",
+            ("documents/shot.png", original.clone()),
+        )]))
+        .await;
+        let message = with(
+            22,
+            &json!({ "document": { "file_id": "shot", "file_name": "screen.png", "mime_type": "image/png", "file_size": original.len() } }),
+        );
+
+        let incoming = ingest(base_url, message).await.expect("turn runs");
+        let image = &incoming.images[0];
+        assert_eq!(fs::read(&image.local_path).expect("saved"), original);
+        let (sent, downscaled) = inline_bytes(&image.delivery);
+        assert!(downscaled);
+        assert!(sent.len() <= INLINE_IMAGE_BYTES);
+        let (width, height) = image::load_from_memory(&sent)
+            .map(|img| (img.width(), img.height()))
+            .expect("decodable inline copy");
+        assert_eq!(
+            (width, height),
+            (INLINE_IMAGE_EDGE, 49),
+            "aspect ratio kept"
+        );
+        assert!(build_user_text(&incoming).contains("You see a downscaled copy"));
+        server.abort();
+    }
+
+    /// Image files the model cannot take inline are saved and described, not
+    /// dropped: HEIC points to `ask_media`; an unknown format says neither path
+    /// can read it.
+    #[tokio::test]
+    async fn non_inline_images_are_saved_with_guidance() {
+        let _home = zdx_engine::test_support::temp_zdx_home();
+        let mut heic = vec![0, 0, 0, 0x18];
+        heic.extend_from_slice(b"ftypheic\0\0\0\0mif1heic");
+        heic.resize(64, 0);
+        let svg = b"<svg xmlns='http://www.w3.org/2000/svg'/>".to_vec();
+        let (base_url, _, server) = fake_telegram_with(HashMap::from([
+            ("heic", ("documents/photo.heic", heic)),
+            ("svg", ("documents/logo.svg", svg)),
+        ]))
+        .await;
+        let mut message = with(
+            23,
+            &json!({ "document": { "file_id": "heic", "file_name": "IMG_1.HEIC", "mime_type": "image/heic" } }),
+        );
+        message.grouped_messages.push(with(
+            24,
+            &json!({ "document": { "file_id": "svg", "file_name": "logo.svg", "mime_type": "image/svg+xml" } }),
+        ));
+
+        let incoming = ingest(base_url, message).await.expect("turn runs");
+        assert_eq!(incoming.images.len(), 2);
+        assert!(incoming.images.iter().all(|image| image.inline().is_none()));
+        assert!(incoming.images[0].local_path.ends_with("23_IMG_1.HEIC"));
+        assert!(incoming.images[1].local_path.exists());
+
+        let prompt = build_user_text(&incoming);
+        assert!(
+            prompt.contains("not attached for you to see: the model cannot take image/heif images directly. Use the `ask_media` tool"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains(
+                "its image format was not recognized. `ask_media` cannot read this file either"
+            ),
+            "{prompt}"
+        );
+        server.abort();
+    }
+
+    /// A photo that cannot be downloaded still runs a turn that tells the
+    /// agent, without leaking the download error.
+    #[tokio::test]
+    async fn failed_image_downloads_become_notices() {
+        let _home = zdx_engine::test_support::temp_zdx_home();
+        let (base_url, get_file_calls, server) = fake_telegram().await;
+        let mut message = with(
+            25,
+            &json!({ "photo": [{ "file_id": "broken", "width": 900, "height": 600 }] }),
+        );
+        message.grouped_messages.push(with(
+            26,
+            &json!({ "document": { "file_id": "huge", "file_name": "big.png", "mime_type": "image/png", "file_size": TELEGRAM_DOWNLOAD_LIMIT_BYTES + 1 } }),
+        ));
+
+        let incoming = ingest(base_url, message).await.expect("turn runs");
+        assert!(incoming.images.is_empty());
+        assert_eq!(
+            get_file_calls.load(Ordering::SeqCst),
+            1,
+            "oversized file not requested"
+        );
+        assert_eq!(
+            incoming.notices,
+            vec![
+                "One attachment (photo) could not be loaded from Telegram, so it is missing from this message. Tell the user and ask them to resend it.".to_string(),
+                "An image attachment was not downloaded: it is 20.0 MiB and Telegram bots can only download files up to 20.0 MiB. Ask the user for a smaller file.".to_string(),
+            ]
+        );
+        assert!(!build_user_text(&incoming).contains(TOKEN));
         server.abort();
     }
 }

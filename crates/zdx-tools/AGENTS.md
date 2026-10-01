@@ -12,7 +12,7 @@ Leaf tool implementations that only need a root directory and optional timeout �
 - `src/file_lock.rs`: per-canonical-path in-process mutex; `edit`, `write`, and `apply_patch` hold it across their read→write so concurrent tool calls on the same file serialize (different files stay parallel)
 - `src/write.rs`: file writing
 - `src/read.rs`: file reading (text + images)
-- `src/image_downscale.rs`: pixel-dimension clamp for provider-bound images (`downscale_for_provider`, `MAX_PROVIDER_IMAGE_EDGE`); re-exported as `zdx_engine::images::downscale_for_provider`
+- `src/image_downscale.rs`: pixel-dimension clamp for provider-bound images (`downscale_for_provider`, `MAX_PROVIDER_IMAGE_EDGE`) and `downscale_to_fit` for callers that want tighter edge/byte limits (applies EXIF orientation when it re-encodes); re-exported from `zdx_engine::images`
 - `src/glob.rs`: file discovery by name pattern
 - `src/grep.rs`: regex search across files
 - `src/walk.rs`: shared traversal policy for `glob`/`grep` — the wall-clock `WalkBudget` (5s, sliceable into phases), `.git` pruning, and the shallow-then-parallel `walk()`

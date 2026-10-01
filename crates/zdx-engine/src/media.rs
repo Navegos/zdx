@@ -74,6 +74,13 @@ pub async fn ask_media(
         .context("Gemini media understanding request failed")
 }
 
+/// Whether [`ask_media`] can take `path`: a supported type within the inline
+/// size limit. Says nothing about whether the request itself will succeed.
+#[must_use]
+pub fn can_ask_media(path: &Path, size_bytes: u64) -> bool {
+    media_mime_for_path(path).is_some() && size_bytes <= MAX_INLINE_BYTES as u64
+}
+
 /// Maps a file extension to a Gemini-supported MIME type.
 fn media_mime_for_path(path: &Path) -> Option<&'static str> {
     let ext = path.extension()?.to_str()?.to_ascii_lowercase();

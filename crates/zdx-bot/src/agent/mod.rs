@@ -14,7 +14,7 @@ use zdx_engine::core::events::AgentEvent;
 use zdx_engine::core::thread_persistence::{self, Thread, ThreadEvent};
 use zdx_engine::providers::{ChatContentBlock, ChatMessage, MessageContent};
 
-use crate::types::{IncomingMessage, VideoStatus};
+use crate::types::{ImageDelivery, IncomingImage, IncomingMessage, VideoStatus};
 
 pub(crate) const STATUS_WAITING: &str = "⏳ Waiting for model...";
 pub(crate) const STATUS_THINKING: &str = "🧠 Thinking...";
@@ -70,17 +70,22 @@ pub(crate) fn record_user_message(
         ))
         .context("append user message")?;
 
-    if incoming.images.is_empty() {
+    let inline: Vec<_> = incoming
+        .images
+        .iter()
+        .filter_map(IncomingImage::inline)
+        .collect();
+    if inline.is_empty() {
         messages.push(ChatMessage::user(text).with_runtime_context(block, key));
         return Ok(());
     }
 
-    let mut blocks = Vec::with_capacity(1 + incoming.images.len());
+    let mut blocks = Vec::with_capacity(1 + inline.len());
     blocks.push(ChatContentBlock::text(text));
-    for image in &incoming.images {
+    for (mime_type, data) in inline {
         blocks.push(ChatContentBlock::Image {
-            mime_type: image.mime_type.clone(),
-            data: image.data.clone(),
+            mime_type: mime_type.to_string(),
+            data: data.to_string(),
         });
     }
 
@@ -544,10 +549,29 @@ pub(crate) fn build_user_text(incoming: &IncomingMessage) -> String {
     }
 
     for image in &incoming.images {
-        parts.push(format!(
-            "Image attachment saved at {}.",
-            image.local_path.display()
-        ));
+        let path = image.local_path.display();
+        parts.push(match &image.delivery {
+            ImageDelivery::Inline {
+                downscaled: false, ..
+            } => format!("Image attachment saved at {path}."),
+            ImageDelivery::Inline {
+                downscaled: true, ..
+            } => format!(
+                "Image attachment saved at {path}. You see a downscaled copy; the saved file is the full-resolution original — use `ask_media` on it if you need fine detail."
+            ),
+            ImageDelivery::SavedOnly {
+                reason,
+                ask_media: true,
+            } => format!(
+                "Image attachment saved at {path}, but it was not attached for you to see: {reason}. Use the `ask_media` tool on the saved file to inspect it."
+            ),
+            ImageDelivery::SavedOnly {
+                reason,
+                ask_media: false,
+            } => format!(
+                "Image attachment saved at {path}, but it was not attached for you to see: {reason}. `ask_media` cannot read this file either; ask the user to resend it as a PNG or JPEG."
+            ),
+        });
     }
 
     for doc in &incoming.documents {
@@ -573,6 +597,8 @@ pub(crate) fn build_user_text(incoming: &IncomingMessage) -> String {
             ),
         });
     }
+
+    parts.extend(incoming.notices.iter().cloned());
 
     if parts.is_empty() {
         "User sent an attachment.".to_string()

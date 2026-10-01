@@ -57,23 +57,47 @@ const JPEG_QUALITY_LADDER: [u8; 3] = [90, 75, 60];
 /// quality 60.
 #[must_use]
 pub fn downscale_for_provider(data: &[u8]) -> Option<(Vec<u8>, &'static str)> {
+    downscale_to_fit(data, MAX_PROVIDER_IMAGE_EDGE, MAX_PROVIDER_IMAGE_BYTES)
+}
+
+/// Re-encodes `data` when either edge exceeds `max_edge` or it is larger than
+/// `max_bytes`, with the same hard bounds and format choice as
+/// [`downscale_for_provider`]. Callers that want a smaller, cheaper payload
+/// than the provider cap pass tighter limits.
+///
+/// Returns `None` when the image already fits or cannot be decoded. EXIF
+/// orientation is applied before re-encoding, since the re-encoded bytes carry
+/// no EXIF and would otherwise show a camera photo sideways.
+#[must_use]
+pub fn downscale_to_fit(
+    data: &[u8],
+    max_edge: u32,
+    max_bytes: usize,
+) -> Option<(Vec<u8>, &'static str)> {
+    use image::ImageDecoder as _;
+
     let (width, height) = image::ImageReader::new(Cursor::new(data))
         .with_guessed_format()
         .ok()?
         .into_dimensions()
         .ok()?;
 
-    if width <= MAX_PROVIDER_IMAGE_EDGE && height <= MAX_PROVIDER_IMAGE_EDGE {
+    if width <= max_edge && height <= max_edge && data.len() <= max_bytes {
         return None;
     }
 
-    let decoded = image::ImageReader::new(Cursor::new(data))
+    let mut decoder = image::ImageReader::new(Cursor::new(data))
         .with_guessed_format()
         .ok()?
-        .decode()
+        .into_decoder()
         .ok()?;
+    let orientation = decoder.orientation().ok();
+    let mut pixels = image::DynamicImage::from_decoder(decoder).ok()?;
+    if let Some(orientation) = orientation {
+        pixels.apply_orientation(orientation);
+    }
 
-    encode_within(&decoded, MAX_PROVIDER_IMAGE_EDGE, MAX_PROVIDER_IMAGE_BYTES)
+    encode_within(&pixels, max_edge, max_bytes)
 }
 
 /// Encodes `decoded` within both an edge limit and a byte budget.
@@ -259,6 +283,30 @@ mod tests {
         let (width, height) = dimensions(&resized);
         assert_eq!(width, MAX_PROVIDER_IMAGE_EDGE);
         assert!(height <= MAX_PROVIDER_IMAGE_EDGE);
+    }
+
+    /// A caller with a tighter byte budget gets a re-encode even when the
+    /// edges already fit.
+    #[test]
+    fn re_encodes_an_image_within_the_edge_but_over_the_byte_budget() {
+        let mut img = image::RgbImage::new(800, 800);
+        let mut seed: u32 = 7;
+        for pixel in img.pixels_mut() {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *pixel = image::Rgb([(seed >> 16) as u8, (seed >> 8) as u8, seed as u8]);
+        }
+        let mut source = Vec::new();
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut Cursor::new(&mut source), image::ImageFormat::Png)
+            .unwrap();
+        let budget = 200_000;
+        assert!(source.len() > budget);
+
+        let (resized, mime) =
+            downscale_to_fit(&source, 1000, budget).expect("over budget must re-encode");
+
+        assert_eq!(mime, "image/jpeg");
+        assert!(resized.len() <= budget);
     }
 
     #[test]
