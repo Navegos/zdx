@@ -25,6 +25,8 @@ has been removed.
 - `src/lib/diff.ts`: unified-diff parser with word-level intra-line segmentation
 - `src/lib/highlight.ts`: compact line-local syntax tokenizer + span merger (six `--hljs-*` classes)
 - `src/lib/markdown.ts`: `marked` + allowlist sanitizer (model output is untrusted)
+- `src/lib/time.ts`: quota reset formatting — `resets in 2h 14m` countdown plus a local clock time
+  (`today 14:30`, `tomorrow 09:00`, `Thu 14:30`). Both take `now` explicitly.
 - `src/lib/workers.ts`: worker roll-up shaping/formatting shared by the thread list, the Agent
   summary and the Workers pane. `failed` is always its own bucket — folding it into `settled` hides
   the one state the reader has to act on. Empty buckets are omitted, and a roll-up whose workers are
@@ -63,7 +65,7 @@ has been removed.
   **must not be rendered alike**: a `live` row is backed by the in-memory `WorkerManager`, while a
   row with `live: false` was recovered from persisted lineage after a restart and knows only that
   the worker existed. Those render dashed, as `status unavailable`, never as settled.
-- `src/views/MonitorView.svelte`: section-aware monitor (`overview` renders everything). Subscription quotas arrive **after** the rest of the dashboard — the server refreshes them off the request path — so render from `subscriptions_status`, not from list length: `pending` shows the section as loading, `stale` shows the values with their age, and the overview quota tile reads `—` rather than `0%` until real windows exist.
+- `src/views/MonitorView.svelte`: section-aware monitor (`overview` renders everything). Subscription quotas arrive **after** the rest of the dashboard — the server refreshes them off the request path — so render from `subscriptions_status`, not from list length: `pending` shows the section as loading, `stale` shows the values with their age, and the overview quota tile reads `—` rather than `0%` until real windows exist. Each quota window shows its `resets_at` as a countdown and a local time, computed against a client `now` ticked with the 30s poll — the snapshot can be minutes old, so never measure against its fetch time. A window without `resets_at` shows no reset line rather than a guess.
 - `src/views/WorkspacesPane.svelte`: `?view=monitor&section=workspaces` — workspace chips, then each model setting with its origin (`set here` highlighted, `from <ancestor>`, `global`, `default`) and, for own-overlay overrides, what a reset falls back to. Read-only; `MonitorView` fetches `/api/workspaces` for this section instead of `/api/monitor`, does not poll it, and `overview` does not include it.
 - `src/views/ThreadListView.svelte`: recent-thread browser (`?view=threads`). Each row opens the
   thread in-app; threads bound to a Telegram topic also get a jump button that calls

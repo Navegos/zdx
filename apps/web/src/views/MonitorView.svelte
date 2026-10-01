@@ -3,6 +3,7 @@
   import type { MonitorResponse, WorkspacesResponse } from "$lib/types";
   import { router, MONITOR_SECTION_LABELS, type MonitorSection } from "$lib/router.svelte";
   import { haptic } from "$lib/telegram";
+  import { resetClock, resetCountdown } from "$lib/time";
   import WorkspacesPane from "./WorkspacesPane.svelte";
 
   interface Props {
@@ -16,6 +17,8 @@
   let workspaces = $state<WorkspacesResponse | null>(null);
   let error = $state("");
   let loading = $state(true);
+  // Reset countdowns are measured against this, not against the snapshot time.
+  let now = $state(Date.now());
 
   async function load(showSpinner = true) {
     if (showSpinner) loading = true;
@@ -29,6 +32,7 @@
       error = e instanceof ApiError ? e.message : String(e);
     } finally {
       loading = false;
+      now = Date.now();
     }
   }
 
@@ -40,6 +44,7 @@
   // Workspace settings change only on edits, so they refresh manually.
   $effect(() => {
     const timer = setInterval(() => {
+      now = Date.now();
       if (document.visibilityState === "visible" && section !== "workspaces") load(false);
     }, 30_000);
     return () => clearInterval(timer);
@@ -239,6 +244,7 @@
                        the same label (two `weekly` quotas on different scopes),
                        so the label is not unique and would abort the render. -->
                   {#each sub.windows as w, wi (wi)}
+                    {@const reset = w.resets_at ? new Date(w.resets_at) : null}
                     <div class="mt-1.5">
                       <div class="flex items-baseline justify-between font-mono text-xxs">
                         <span class="text-muted-foreground">{w.label}</span>
@@ -253,6 +259,16 @@
                           style="width: {w.used_percent}%"
                         ></div>
                       </div>
+                      {#if reset && !Number.isNaN(reset.getTime())}
+                        <div
+                          class="mt-0.5 flex items-baseline justify-between gap-2 font-mono text-xxs text-muted-foreground"
+                        >
+                          <span class="tabular-nums">{resetCountdown(reset, now)}</span>
+                          <time class="tabular-nums" datetime={w.resets_at}
+                            >{resetClock(reset, now)}</time
+                          >
+                        </div>
+                      {/if}
                     </div>
                   {/each}
                 </div>

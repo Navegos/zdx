@@ -880,8 +880,18 @@ export const demoMonitor: MonitorResponse = {
       plan: "max-20x",
       error: null,
       windows: [
-        { label: "5h", used_percent: 34, resets_at: null, scope: "session" },
-        { label: "7d", used_percent: 78, resets_at: null, scope: "weekly" },
+        {
+          label: "5h",
+          used_percent: 34,
+          resets_at: new Date(Date.now() + 2 * 3_600_000 + 14 * 60_000).toISOString(),
+          scope: "session",
+        },
+        {
+          label: "7d",
+          used_percent: 78,
+          resets_at: new Date(Date.now() + 3 * 86_400_000 + 5 * 3_600_000).toISOString(),
+          scope: "weekly",
+        },
       ],
     },
   ],
