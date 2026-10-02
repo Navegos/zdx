@@ -713,14 +713,22 @@ fn toggle_config_target(app: &mut MonitorApp) {
     ));
 }
 
-fn workspace_picker_item(workspace: &Workspace) -> String {
-    let mut item = format!("{}  {}", workspace.name, workspace.root.display());
+/// Picker label: name and tags first, path last, so a narrow popup trims the
+/// path instead of the name.
+fn workspace_picker_item(workspace: &Workspace, home: Option<&Path>) -> String {
+    let mut item = workspace.name.clone();
     if workspace.current {
         item.push_str("  · monitor root");
     }
     if !workspace.profiles.is_empty() {
         let _ = write!(item, "  · {}", workspace.profiles.join(", "));
     }
+    let path = match home.and_then(|home| workspace.root.strip_prefix(home).ok()) {
+        Some(relative) if relative.as_os_str().is_empty() => "~".to_string(),
+        Some(relative) => format!("~/{}", relative.display()),
+        None => workspace.root.display().to_string(),
+    };
+    let _ = write!(item, "  {path}");
     item
 }
 
@@ -735,12 +743,18 @@ fn open_workspace_picker(app: &mut MonitorApp) {
         Ok(_) => {}
         Err(e) => app.set_status(format!("Failed to list workspaces: {e:#}")),
     }
+    let home = config::paths::home_dir();
     let items = app
         .config_workspaces
         .iter()
-        .map(|workspace| (workspace_picker_item(workspace), workspace.profiles.len()))
+        .map(|workspace| {
+            (
+                workspace_picker_item(workspace, home.as_deref()),
+                workspace_config::own_override_count(workspace).ok(),
+            )
+        })
         .collect();
-    let mut picker = TargetPickerState::from_items(items);
+    let mut picker = TargetPickerState::from_maybe_counted(items);
     picker.selected = app
         .config_workspace_index
         .min(picker.matches.len().saturating_sub(1));
@@ -1348,6 +1362,26 @@ fn render_picker_thinking(f: &mut Frame, picker: &ModelPickerState, popup: Rect)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workspace_picker_item_puts_tags_before_home_relative_path() {
+        let workspace = Workspace {
+            root: "/home/user/projects/example".into(),
+            name: "example".to_string(),
+            profiles: vec!["alpha".to_string(), "beta".to_string()],
+            current: true,
+            overlay_path: "/home/user/projects/example/.zdx/config.toml".into(),
+            has_overlay: true,
+        };
+        assert_eq!(
+            workspace_picker_item(&workspace, Some(Path::new("/home/user"))),
+            "example  · monitor root  · alpha, beta  ~/projects/example"
+        );
+        assert_eq!(
+            workspace_picker_item(&workspace, Some(Path::new("/other"))),
+            "example  · monitor root  · alpha, beta  /home/user/projects/example"
+        );
+    }
 
     fn label(source: Option<&RowSource>) -> Option<&str> {
         source.map(|source| source.label.as_str())

@@ -55,7 +55,7 @@ pub fn render(f: &mut Frame, app: &MonitorApp) {
     if app.active_section == Section::Config
         && let Some(picker) = &app.config_workspace_picker
     {
-        render_picker(f, picker, f.area(), "workspace · (n) Telegram bindings");
+        render_picker(f, picker, f.area(), "workspace · (n) local overrides");
     }
 
     if let Some(state) = &app.agent_overlay {
@@ -191,15 +191,17 @@ fn render_picker(f: &mut Frame, picker: &TargetPickerState, area: Rect, noun: &s
     let offset = picker.selected.saturating_sub(visible.saturating_sub(1));
     let end = (offset + visible).min(picker.matches.len());
 
+    let width = rows[1].width as usize;
     let items: Vec<ListItem> = picker.matches[offset..end]
         .iter()
         .enumerate()
         .map(|(i, &item_index)| {
             let global = offset + i;
             let (target, count) = &picker.items[item_index];
+            let (label, suffix) = picker_row_text(target, *count, width);
             let row = Line::from(vec![
-                Span::styled(target.clone(), Style::default().fg(Color::Cyan)),
-                Span::styled(format!("  ({count})"), Style::default().fg(Color::DarkGray)),
+                Span::styled(label, Style::default().fg(Color::Cyan)),
+                Span::styled(suffix, Style::default().fg(Color::DarkGray)),
             ]);
             let item = ListItem::new(row);
             if global == picker.selected {
@@ -210,6 +212,17 @@ fn render_picker(f: &mut Frame, picker: &TargetPickerState, area: Rect, noun: &s
         })
         .collect();
     f.render_widget(List::new(items), rows[1]);
+}
+
+/// Splits a picker row into its label and count suffix, trimming the end of
+/// the label so the count always fits in `width` columns.
+fn picker_row_text(target: &str, count: Option<usize>, width: usize) -> (String, String) {
+    let suffix = match count {
+        Some(count) => format!("  ({count})"),
+        None => "  (?)".to_string(),
+    };
+    let label_width = width.saturating_sub(suffix.chars().count());
+    (truncate_chars(target, label_width), suffix)
 }
 
 /// Build a centered Rect using `percent_x` × `percent_y` of `area`.
@@ -232,6 +245,17 @@ mod tests {
 
     use super::*;
     use crate::tabs::threads::TimingOverlayState;
+
+    #[test]
+    fn picker_row_keeps_count_visible_when_label_is_trimmed() {
+        let (label, suffix) = picker_row_text("example  ~/projects/example", Some(3), 20);
+        assert_eq!(suffix, "  (3)");
+        assert_eq!(label, "example  ~/pro…");
+        assert_eq!(label.chars().count() + suffix.chars().count(), 20);
+
+        let (label, suffix) = picker_row_text("short", None, 20);
+        assert_eq!((label.as_str(), suffix.as_str()), ("short", "  (?)"));
+    }
 
     #[test]
     fn timing_overlay_renders_title_and_unavailable_state() {

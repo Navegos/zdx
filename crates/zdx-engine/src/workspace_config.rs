@@ -261,6 +261,21 @@ pub fn load_settings(workspace: &Workspace) -> Result<Vec<Setting>> {
     )
 }
 
+/// Number of model settings that `workspace`'s own overlay sets. Values it
+/// only inherits from global or ancestor overlays are not counted.
+///
+/// # Errors
+/// Returns an error if a layer cannot be read or parsed.
+pub fn own_override_count(workspace: &Workspace) -> Result<usize> {
+    if !workspace.has_overlay {
+        return Ok(0);
+    }
+    Ok(load_settings(workspace)?
+        .iter()
+        .filter(|setting| setting.overridden_here())
+        .count())
+}
+
 /// Resolves every model setting of `workspace` from an explicit layer list
 /// (lowest precedence first). The inherited view is the same list without the
 /// workspace's own overlay.
@@ -580,6 +595,29 @@ mod tests {
 
         let tldr = setting(&settings, "tldr_model");
         assert_eq!(tldr.source.layer, Layer::Default);
+    }
+
+    #[test]
+    fn override_count_ignores_inherited_values() {
+        let _home = crate::test_support::temp_zdx_home();
+        let (_dir, _global, _parent, workspace) = fixture();
+        let workspace = Workspace::new(config::canonical_or_self(&workspace.root), false);
+        let global = paths::config_path();
+        fs::create_dir_all(global.parent().unwrap()).unwrap();
+        fs::write(&global, "title_model = \"global:title\"\n").unwrap();
+        assert_eq!(own_override_count(&workspace).unwrap(), 0);
+
+        fs::create_dir_all(workspace.overlay_path.parent().unwrap()).unwrap();
+        fs::write(
+            &workspace.overlay_path,
+            "model = \"app:model@medium\"\ntldr_model = \"app:tldr\"\n",
+        )
+        .unwrap();
+        let workspace = Workspace::new(workspace.root.clone(), false);
+        assert_eq!(own_override_count(&workspace).unwrap(), 2);
+
+        fs::write(&workspace.overlay_path, "model = [").unwrap();
+        assert!(own_override_count(&workspace).is_err());
     }
 
     #[test]

@@ -762,9 +762,9 @@ mod log_view_tests {
         assert_eq!(
             picker.items,
             vec![
-                ("zdx_engine::core::agent".to_string(), 2),
-                ("zdx_bot::bot".to_string(), 1),
-                ("zdx_engine::tools".to_string(), 1),
+                ("zdx_engine::core::agent".to_string(), Some(2)),
+                ("zdx_bot::bot".to_string(), Some(1)),
+                ("zdx_engine::tools".to_string(), Some(1)),
             ]
         );
         assert_eq!(picker.selected_target(), Some("zdx_engine::core::agent"));

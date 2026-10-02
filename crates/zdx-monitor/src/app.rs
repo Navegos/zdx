@@ -297,8 +297,8 @@ impl MonitorApp {
 pub struct TargetPickerState {
     pub filter: String,
     /// Distinct targets in the loaded lines with their line counts, most
-    /// frequent first.
-    pub items: Vec<(String, usize)>,
+    /// frequent first. `None` is an unknown count, rendered as `(?)`.
+    pub items: Vec<(String, Option<usize>)>,
     /// Indices into `items` matching `filter`.
     pub matches: Vec<usize>,
     /// Index into `matches` of the highlighted row.
@@ -316,19 +316,22 @@ impl TargetPickerState {
         }
         let mut items: Vec<(String, usize)> = counts.into_iter().collect();
         items.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        let mut state = Self {
-            filter: String::new(),
-            items,
-            matches: Vec::new(),
-            selected: 0,
-        };
-        state.recompute();
-        state
+        Self::from_items(items)
     }
 
     /// Picker over pre-counted items (e.g. project roots from the thread index),
     /// keeping the caller's ordering.
     pub(crate) fn from_items(items: Vec<(String, usize)>) -> Self {
+        Self::from_maybe_counted(
+            items
+                .into_iter()
+                .map(|(target, count)| (target, Some(count)))
+                .collect(),
+        )
+    }
+
+    /// Like [`Self::from_items`], but a count may be unknown.
+    pub(crate) fn from_maybe_counted(items: Vec<(String, Option<usize>)>) -> Self {
         let mut state = Self {
             filter: String::new(),
             items,
