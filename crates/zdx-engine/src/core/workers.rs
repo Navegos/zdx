@@ -15,7 +15,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, Weak};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::Value;
@@ -108,18 +108,14 @@ impl WorkerActivity {
 #[derive(Debug, Clone)]
 pub enum WorkerEvent {
     /// A brand-new worker thread was created via `create_worker` (re-attached
-    /// workers do not re-emit this). Carries the first prompt so the mirror
-    /// topic can show it.
+    /// workers do not re-emit this).
     Created {
         owner_thread_id: String,
         worker_thread_id: String,
-        root: PathBuf,
-        title: Option<String>,
-        prompt: String,
     },
     /// The orchestrator queued a follow-up prompt via `send_message`.
-    /// Topic-originated prompts do not emit this (the user's own message is
-    /// already visible in the mirror topic).
+    /// Prompts typed in a legacy mirror topic do not emit this (the user's
+    /// own message is already visible there).
     Prompted {
         worker_thread_id: String,
         prompt: String,
@@ -214,6 +210,9 @@ struct WorkerState {
     last_activity_at: Option<Instant>,
     /// When the current turn started running.
     turn_started_at: Option<Instant>,
+    /// Last time this worker was created/attached, prompted, started a turn,
+    /// or finished one. Orders `list_for_owner` newest first.
+    touched_at: Instant,
 }
 
 impl WorkerState {
@@ -244,15 +243,11 @@ pub struct WorkerManager {
     state: Mutex<HashMap<String, WorkerState>>,
     /// Source of `QueuedPrompt::id`, unique across all workers in this process.
     next_prompt_id: std::sync::atomic::AtomicU64,
-    /// Worker thread id → surface mirror link, registered by the bridge once
-    /// it has opened (or failed to open, `None`) the mirror, or recovered it
+    /// Worker thread id → legacy surface mirror link, recovered by the bridge
     /// after a restart. Kept apart from `state` so a link can outlive/precede
     /// the worker's managed state. Lock order when both are needed: `state`
     /// first, then `mirrors`.
-    mirrors: Mutex<HashMap<String, Option<String>>>,
-    /// Signals that a worker's mirror link was resolved, for
-    /// `wait_for_mirror_url`.
-    mirror_resolved_signal: Notify,
+    mirrors: Mutex<HashMap<String, String>>,
     events_tx: mpsc::UnboundedSender<WorkerEvent>,
     runner: WorkerRunner,
 }
@@ -284,7 +279,6 @@ impl WorkerManager {
             state: Mutex::new(HashMap::new()),
             next_prompt_id: std::sync::atomic::AtomicU64::new(1),
             mirrors: Mutex::new(HashMap::new()),
-            mirror_resolved_signal: Notify::new(),
             events_tx,
             runner: (make_runner.take().expect("runner factory runs once"))(Weak::clone(weak)),
         });
@@ -324,22 +318,20 @@ impl WorkerManager {
         }
     }
 
-    /// Records the outcome of opening a worker's surface mirror: `Some(url)`
-    /// for a linkable mirror (e.g. a Telegram topic), `None` when the surface
-    /// opened none or it has no link. Either way it resolves any pending
-    /// `wait_for_mirror_url`.
+    /// Registers the link of a worker's legacy surface mirror (a Telegram
+    /// topic recovered after a restart). New workers are silent and never
+    /// register one.
     ///
     /// # Panics
     /// Panics if the internal mirror lock is poisoned.
-    pub fn set_mirror_url(&self, worker_thread_id: &str, url: Option<String>) {
+    pub fn set_mirror_url(&self, worker_thread_id: &str, url: String) {
         self.mirrors
             .lock()
             .expect("worker mirror lock poisoned")
             .insert(worker_thread_id.to_string(), url);
-        self.mirror_resolved_signal.notify_waiters();
     }
 
-    /// The registered mirror link for a worker, if any.
+    /// The registered legacy mirror link for a worker, if any.
     ///
     /// # Panics
     /// Panics if the internal mirror lock is poisoned.
@@ -350,37 +342,6 @@ impl WorkerManager {
             .expect("worker mirror lock poisoned")
             .get(worker_thread_id)
             .cloned()
-            .flatten()
-    }
-
-    fn mirror_resolved(&self, worker_thread_id: &str) -> bool {
-        self.mirrors
-            .lock()
-            .expect("worker mirror lock poisoned")
-            .contains_key(worker_thread_id)
-    }
-
-    /// Waits up to `timeout` for the surface to resolve a worker's mirror and
-    /// returns its link, if it has one. The mirror is opened asynchronously by
-    /// the surface bridge, so callers that want to hand the link back
-    /// immediately (`create_thread`) wait a bounded moment instead of
-    /// blocking on it.
-    pub async fn wait_for_mirror_url(
-        &self,
-        worker_thread_id: &str,
-        timeout: Duration,
-    ) -> Option<String> {
-        let deadline = tokio::time::Instant::now() + timeout;
-        loop {
-            let notified = self.mirror_resolved_signal.notified();
-            if self.mirror_resolved(worker_thread_id) {
-                return self.mirror_url(worker_thread_id);
-            }
-            tokio::select! {
-                () = notified => {}
-                () = tokio::time::sleep_until(deadline) => return self.mirror_url(worker_thread_id),
-            }
-        }
     }
 
     /// Creates a new visible worker thread in `root`, queues its first prompt,
@@ -443,17 +404,10 @@ impl WorkerManager {
         let worker_id = thread.id.clone();
 
         // Emit Created before the FIFO task can exist: a fast first prompt
-        // could otherwise complete and emit Completed ahead of Created, and
-        // the bridge would have no mirror topic for the first result.
+        // could otherwise complete and emit Completed ahead of Created.
         let event = WorkerEvent::Created {
             owner_thread_id: owner_thread_id.to_string(),
             worker_thread_id: worker_id.clone(),
-            root: root.clone(),
-            title: title
-                .map(str::trim)
-                .filter(|t| !t.is_empty())
-                .map(str::to_string),
-            prompt: prompt.to_string(),
         };
         if self.events_tx.send(event).is_err() {
             tracing::debug!(worker = %worker_id, "Worker event channel closed");
@@ -593,6 +547,7 @@ impl WorkerManager {
                         state.owner_thread_id = owner.to_string();
                     }
                     state.queue.push_back(prompt);
+                    state.touched_at = Instant::now();
                     if state.status != WorkerStatus::Running {
                         state.status = WorkerStatus::Queued;
                     }
@@ -617,6 +572,7 @@ impl WorkerManager {
                         current_tools: Vec::new(),
                         last_activity_at: None,
                         turn_started_at: None,
+                        touched_at: Instant::now(),
                     });
                     (state.snapshot(worker_thread_id, mirror_url), Some(wake))
                 }
@@ -642,20 +598,24 @@ impl WorkerManager {
             .map(|state| state.snapshot(worker_thread_id, mirror_url))
     }
 
-    /// Snapshots of every worker owned by `owner_thread_id`.
+    /// Snapshots of every worker owned by `owner_thread_id`, most recently
+    /// touched first (created, prompted, started, or finished a turn); ties
+    /// fall back to thread id so the order is stable.
     ///
     /// # Panics
     /// Panics if the internal worker state lock is poisoned.
     #[must_use]
     pub fn list_for_owner(&self, owner_thread_id: &str) -> Vec<WorkerSnapshot> {
         let map = self.state.lock().expect("worker state lock poisoned");
-        let mut workers: Vec<WorkerSnapshot> = map
+        let mut workers: Vec<(Instant, WorkerSnapshot)> = map
             .iter()
             .filter(|(_, state)| state.owner_thread_id == owner_thread_id)
-            .map(|(id, state)| state.snapshot(id, self.mirror_url(id)))
+            .map(|(id, state)| (state.touched_at, state.snapshot(id, self.mirror_url(id))))
             .collect();
-        workers.sort_by(|a, b| a.thread_id.cmp(&b.thread_id));
-        workers
+        workers.sort_by(|(a_at, a), (b_at, b)| {
+            b_at.cmp(a_at).then_with(|| a.thread_id.cmp(&b.thread_id))
+        });
+        workers.into_iter().map(|(_, snapshot)| snapshot).collect()
     }
 
     /// Status of every managed worker, grouped by owning thread.
@@ -910,7 +870,9 @@ fn spawn_worker_task(manager: Arc<WorkerManager>, worker_thread_id: String, wake
                     let cancel = CancellationToken::new();
                     state.current_cancel = Some(cancel.clone());
                     state.status = WorkerStatus::Running;
-                    state.turn_started_at = Some(Instant::now());
+                    let now = Instant::now();
+                    state.turn_started_at = Some(now);
+                    state.touched_at = now;
                     state.last_activity_at = None;
                     state.current_tools.clear();
                     WorkerRunRequest {
@@ -943,6 +905,7 @@ fn spawn_worker_task(manager: Arc<WorkerManager>, worker_thread_id: String, wake
             };
             state.current_cancel = None;
             state.turn_started_at = None;
+            state.touched_at = Instant::now();
             state.last_activity_at = None;
             state.current_tools.clear();
             match &result {
@@ -983,6 +946,7 @@ fn spawn_worker_task(manager: Arc<WorkerManager>, worker_thread_id: String, wake
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     use super::*;
     use crate::test_support::temp_zdx_home;
@@ -1440,12 +1404,9 @@ mod tests {
             WorkerEvent::Created {
                 owner_thread_id,
                 worker_thread_id,
-                title,
-                ..
             } => {
                 assert_eq!(owner_thread_id, "owner");
                 assert_eq!(worker_thread_id, worker_id);
-                assert_eq!(title.as_deref(), Some("Mirror Me"));
             }
             other => panic!("expected Created first, got {other:?}"),
         }
@@ -1585,8 +1546,46 @@ mod tests {
         );
     }
 
+    /// The orchestrator card lists the first few workers, so the owner's list
+    /// must put the most recently touched worker first, not the oldest id.
     #[tokio::test]
-    async fn mirror_url_is_awaitable_and_flows_into_snapshots_and_completions() {
+    async fn list_for_owner_puts_most_recently_touched_first() {
+        let _home = temp_zdx_home();
+        let project = tempfile::tempdir().unwrap();
+        let (manager, _events_rx) = WorkerManager::with_runner(instant_runner("r"));
+
+        let mut ids = Vec::new();
+        for prompt in ["one", "two", "three"] {
+            let id = manager
+                .create_worker("owner", project.path(), prompt, None, None, None)
+                .unwrap();
+            wait_idle(&manager, &id).await;
+            ids.push(id);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let order = |manager: &Arc<WorkerManager>| -> Vec<String> {
+            manager
+                .list_for_owner("owner")
+                .into_iter()
+                .map(|w| w.thread_id)
+                .collect()
+        };
+        assert_eq!(
+            order(&manager),
+            vec![ids[2].clone(), ids[1].clone(), ids[0].clone()]
+        );
+
+        // Prompting the oldest worker moves it to the top.
+        manager.send_message("owner", &ids[0], "again").unwrap();
+        wait_idle(&manager, &ids[0]).await;
+        assert_eq!(
+            order(&manager),
+            vec![ids[0].clone(), ids[2].clone(), ids[1].clone()]
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_mirror_url_flows_into_snapshots_and_completions() {
         let _home = temp_zdx_home();
         let project = tempfile::tempdir().unwrap();
 
@@ -1601,44 +1600,16 @@ mod tests {
             .create_worker("owner", project.path(), "go", None, None, None)
             .unwrap();
 
-        // Nothing registered yet: a bounded wait returns None promptly.
-        assert_eq!(
-            manager
-                .wait_for_mirror_url(&worker_id, Duration::from_millis(10))
-                .await,
-            None
-        );
+        // New workers are silent: nothing registers a mirror for them.
+        assert_eq!(manager.mirror_url(&worker_id), None);
 
-        let waiter = {
-            let manager = Arc::clone(&manager);
-            let id = worker_id.clone();
-            tokio::spawn(async move {
-                manager
-                    .wait_for_mirror_url(&id, Duration::from_secs(5))
-                    .await
-            })
-        };
-        tokio::time::sleep(Duration::from_millis(5)).await;
-        manager.set_mirror_url(&worker_id, Some("https://t.me/c/1/2".to_string()));
-        assert_eq!(waiter.await.unwrap().as_deref(), Some("https://t.me/c/1/2"));
-
+        manager.set_mirror_url(&worker_id, "https://t.me/c/1/2".to_string());
         assert_eq!(
             manager.snapshot(&worker_id).unwrap().mirror_url.as_deref(),
             Some("https://t.me/c/1/2")
         );
         let event = next_completion(&mut events_rx).await;
         assert_eq!(event.mirror_url.as_deref(), Some("https://t.me/c/1/2"));
-
-        // A mirror resolved without a link releases the waiter immediately.
-        let started = tokio::time::Instant::now();
-        manager.set_mirror_url("other-worker", None);
-        assert_eq!(
-            manager
-                .wait_for_mirror_url("other-worker", Duration::from_secs(5))
-                .await,
-            None
-        );
-        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[tokio::test]

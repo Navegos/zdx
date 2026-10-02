@@ -285,7 +285,7 @@ async fn stream_turn_events(
 }
 
 /// Worker thread id from a successful `Create_Thread` / `Send_Thread_Message`
-/// result, so the reply can link the worker's mirror topic.
+/// result, so the reply can link the worker.
 fn touched_worker_id(
     tool_name: &str,
     result: &zdx_engine::core::events::ToolOutput,

@@ -78,11 +78,21 @@ pub(crate) fn append_thread_link(base: Option<&str>, thread_id: &str, text: &str
     }
 }
 
+/// Where a worker link points: its legacy mirror topic when it still has one,
+/// otherwise the worker thread in the Mini App. New workers are silent and
+/// never get a topic, so for them this is always the Mini App deep link.
+/// `None` only when neither exists.
+pub(crate) fn worker_link(
+    mirror_url: Option<String>,
+    mini_app_base: Option<&str>,
+    worker_thread_id: &str,
+) -> Option<String> {
+    mirror_url.or_else(|| mini_app_base.map(|base| format!("{base}?startapp={worker_thread_id}")))
+}
+
 /// Appends one `🛠 <title>` link per worker this turn created or messaged, so
 /// the user can follow the work without relying on the model to mention it.
-/// Points at the worker's mirror topic when it has a link (group-hosted), or
-/// at the worker thread in the Mini App otherwise (DM-hosted mirrors have no
-/// topic link form). Skipped only when neither exists.
+/// See [`worker_link`] for where each link points.
 fn with_worker_links(
     context: &BotContext,
     chat_id: i64,
@@ -93,11 +103,11 @@ fn with_worker_links(
     let links: Vec<(String, String)> = touched_workers
         .iter()
         .filter_map(|worker| {
-            let url = context.worker_manager().mirror_url(worker).or_else(|| {
-                mini_app
-                    .as_ref()
-                    .map(|base| format!("{base}?startapp={worker}"))
-            })?;
+            let url = worker_link(
+                context.worker_manager().mirror_url(worker),
+                mini_app.as_deref(),
+                worker,
+            )?;
             let title = thread_persistence::read_thread_title(worker)
                 .ok()
                 .flatten()

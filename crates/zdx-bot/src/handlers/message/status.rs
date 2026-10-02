@@ -448,9 +448,8 @@ fn format_status_message_with_heading(
 }
 
 /// Formats the live worker section of the orchestrator card. Each worker
-/// line links to its mirror topic, or to the worker thread in the Mini App
-/// when the mirror has no topic link (`mini_app_url` set), so the card is a
-/// jump table as well as a status.
+/// line links per [`super::worker_link`], so the card is a jump table as well
+/// as a status.
 fn format_worker_lines(
     workers: &[zdx_engine::core::workers::WorkerSnapshot],
     mini_app_url: Option<&str>,
@@ -472,6 +471,8 @@ fn format_worker_lines(
     let mut lines = vec![format!(
         "Workers: <code>{running} running · {queued} queued · {done} settled</code>"
     )];
+    // `list_for_owner` returns workers most recently touched first, so these
+    // are the newest five.
     for worker in workers.iter().take(5) {
         let glyph = match worker.status {
             WorkerStatus::Running => "⚙️",
@@ -485,10 +486,7 @@ fn format_worker_lines(
             .flatten()
             .unwrap_or_else(|| worker.thread_id.chars().take(8).collect());
         let title = escape_html(&title);
-        let url = worker
-            .mirror_url
-            .clone()
-            .or_else(|| mini_app_url.map(|base| format!("{base}?startapp={}", worker.thread_id)));
+        let url = super::worker_link(worker.mirror_url.clone(), mini_app_url, &worker.thread_id);
         let label = match url {
             Some(url) => format!("<a href=\"{url}\">{title}</a>"),
             None => title,

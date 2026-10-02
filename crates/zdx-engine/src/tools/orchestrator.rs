@@ -12,7 +12,6 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 
 use serde_json::{Value, json};
 
@@ -25,9 +24,6 @@ use crate::core::workers::{WorkerManager, WorkerSnapshot};
 const MAX_FINAL_TEXT_CHARS: usize = 4000;
 /// Longest queued-prompt excerpt returned per queue entry.
 const MAX_QUEUED_PROMPT_CHARS: usize = 300;
-/// How long `create_thread` waits for the surface bridge to open the worker's
-/// mirror before returning without a link. The worker is already queued.
-const MIRROR_LINK_WAIT: Duration = Duration::from_secs(5);
 
 /// Which orchestrator control a tool instance implements.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,7 +101,7 @@ impl Tool for OrchestratorTool {
                 );
             };
             match op {
-                Op::Create => create_thread(&manager, &owner, &input, &ctx).await,
+                Op::Create => create_thread(&manager, &owner, &input, &ctx),
                 Op::Send => send_thread_message(&manager, &owner, &input),
                 Op::Status => tokio::task::spawn_blocking(move || {
                     get_thread_status(&manager, &owner, &input, ctx.config.as_ref())
@@ -131,7 +127,7 @@ fn definition_for(op: Op) -> ToolDefinition {
     match op {
         Op::Create => ToolDefinition {
             name: "Create_Thread".to_string(),
-            description: "Create a new worker thread in an existing project directory and queue its first prompt. Returns the worker thread_id (and, when the surface opened one, the mirror_url of the Telegram topic where the user can follow it) while the worker runs in the background; you are notified automatically when its turn finishes. The worker already has the project's AGENTS.md rules, skills, and memory. Put the user's words under `User request:` and only what the worker cannot know under `Orchestrator notes:`. Do not rewrite the request into a specification.".to_string(),
+            description: "Create a new worker thread in an existing project directory and queue its first prompt. Returns the worker thread_id while the worker runs in the background; its history stays available through the link added to your reply. You are notified automatically when its turn finishes. The worker already has the project's AGENTS.md rules, skills, and memory. Put the user's words under `User request:` and only what the worker cannot know under `Orchestrator notes:`. Do not rewrite the request into a specification.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -433,7 +429,7 @@ fn resolve_worker_root(
         })
 }
 
-async fn create_thread(
+fn create_thread(
     manager: &Arc<WorkerManager>,
     owner: &str,
     input: &Value,
@@ -461,7 +457,7 @@ async fn create_thread(
     };
 
     // The resolved root is what gets persisted on the worker, so a default is
-    // never invisible: it drives mirror routing and is reported back below.
+    // never invisible: it is reported back below.
     let prompt = frame_worker_prompt(owner, prompt);
     let worker_id = match manager.create_worker(owner, &root, &prompt, title, model, thinking_level)
     {
@@ -470,22 +466,15 @@ async fn create_thread(
             return ToolOutput::failure("create_thread_failed", format!("{err:#}"), None);
         }
     };
-    // The mirror topic opens asynchronously; wait a bounded moment so the
-    // link can be handed back in the same result. The worker is already queued.
-    let mirror_url = manager
-        .wait_for_mirror_url(&worker_id, MIRROR_LINK_WAIT)
-        .await;
     match manager.snapshot(&worker_id) {
         Some(snapshot) => ToolOutput::success(json!({
             "thread_id": worker_id,
-            "mirror_url": mirror_url,
             "root": root.display().to_string(),
             "root_source": root_source,
             "worker": snapshot_json(&snapshot),
         })),
         None => ToolOutput::success(json!({
             "thread_id": worker_id,
-            "mirror_url": mirror_url,
             "root": root.display().to_string(),
             "root_source": root_source,
         })),
@@ -662,6 +651,8 @@ fn cancel_thread(manager: &Arc<WorkerManager>, input: &Value) -> ToolOutput {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     fn mode_config() -> crate::config::Config {

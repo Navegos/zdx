@@ -184,11 +184,11 @@ impl Default for TelegramServerConfig {
 /// Per-chat Telegram project profile.
 ///
 /// A profile plays one of two roles. An ordinary **workspace** profile binds a
-/// chat to a root and owns that root for worker-mirror routing and workspace
-/// skill attribution. An **orchestrator** profile (`orchestrator = true`) is a
-/// management home base: it keeps the same chat→root binding for its own turns
-/// but is excluded from both, so a management group and a workspace group may
-/// share a `cwd` without competing for worker traffic.
+/// chat to a root and owns that root for workspace skill attribution and the
+/// orchestrator's workspace list. An **orchestrator** profile
+/// (`orchestrator = true`) is a management home base: it keeps the same
+/// chat→root binding for its own turns but is excluded from both, so a
+/// management group and a workspace group may share a `cwd`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TelegramProfileConfig {
     /// Telegram chat ID routed to this profile.
@@ -226,8 +226,8 @@ impl TelegramProfileConfig {
             .map_or_else(|| self.cwd_path(), expand_tilde)
     }
 
-    /// Whether this profile owns its root for worker-mirror routing and
-    /// workspace skill attribution. Orchestrator homes never do.
+    /// Whether this profile owns its root for workspace skill attribution and
+    /// is listed as a worker destination. Orchestrator homes never do.
     #[must_use]
     pub fn is_routable_workspace(&self) -> bool {
         !self.orchestrator
@@ -1212,9 +1212,8 @@ impl Config {
     ///
     /// # Errors
     /// Returns an error if profile names/cwds are blank, chat IDs are
-    /// duplicated, two routable workspaces resolve to the same root, a
-    /// `worker_root` is blank or missing on disk, or a configured orchestrator
-    /// group's default worker root is not covered by any routable workspace.
+    /// duplicated, two routable workspaces resolve to the same root, or a
+    /// `worker_root` is blank or missing on disk.
     pub fn validate_telegram_profiles(&self) -> Result<()> {
         let mut seen_chat_ids: BTreeMap<i64, &str> = BTreeMap::new();
         for (name, profile) in &self.telegram.profiles {
@@ -1248,8 +1247,8 @@ impl Config {
         }
 
         // Only routable workspaces own a root. Two of them on one root would
-        // make mirror routing and skill attribution depend on profile name
-        // ordering, so reject it. An orchestrator home sharing a workspace's
+        // make workspace skill attribution depend on profile name ordering,
+        // so reject it. An orchestrator home sharing a workspace's
         // root stays legal: that is the separation this enables.
         let mut seen_roots: BTreeMap<PathBuf, &str> = BTreeMap::new();
         for (name, profile) in &self.telegram.profiles {
@@ -1260,29 +1259,8 @@ impl Config {
             if let Some(existing_name) = seen_roots.insert(root.clone(), name) {
                 bail!(
                     "telegram workspaces '{existing_name}' and '{name}' resolve to the same root {}; \
-                     worker routing would depend on profile name order",
+                     skill attribution would depend on profile name order",
                     root.display()
-                );
-            }
-        }
-
-        // A configured orchestrator group must have somewhere to send workers
-        // that carry no project root of their own. Without this, every such
-        // worker silently loses its mirror. Legacy DM orchestrators have no
-        // profile and are unaffected.
-        for (name, profile) in &self.telegram.profiles {
-            if profile.is_routable_workspace() {
-                continue;
-            }
-            let worker_root = canonical_or_self(&profile.worker_root_path());
-            let covered = seen_roots
-                .keys()
-                .any(|workspace| worker_root.starts_with(workspace));
-            if !covered {
-                bail!(
-                    "telegram orchestrator '{name}' has no routable workspace covering its default \
-                     worker root {}; add a workspace profile for it or point worker_root at one",
-                    worker_root.display()
                 );
             }
         }
@@ -4938,7 +4916,7 @@ allowlist_user_ids = [42]
         };
         ok.validate_telegram_profiles().unwrap();
 
-        // Two routable workspaces on one root would route by name order.
+        // Two routable workspaces on one root would attribute skills by name order.
         let clash = Config {
             telegram: TelegramConfig {
                 profiles: BTreeMap::from([
@@ -4954,15 +4932,16 @@ allowlist_user_ids = [42]
     }
 
     #[test]
-    fn validate_requires_a_routable_default_for_orchestrator_groups() {
+    fn validate_orchestrator_worker_root_needs_only_an_existing_directory() {
         let dir = tempfile::tempdir().unwrap();
         let control = dir.path().join("control");
         let elsewhere = dir.path().join("elsewhere");
         fs::create_dir_all(&control).unwrap();
         fs::create_dir_all(&elsewhere).unwrap();
 
-        // No workspace covers the orchestrator's default worker root.
-        let orphan = Config {
+        // An orchestrator whose default worker root no workspace covers is
+        // valid: workers are silent and need no Telegram host.
+        let standalone = Config {
             telegram: TelegramConfig {
                 profiles: BTreeMap::from([(
                     "control".to_string(),
@@ -4970,15 +4949,14 @@ allowlist_user_ids = [42]
                         chat_id: -100_001,
                         cwd: control.display().to_string(),
                         orchestrator: true,
-                        worker_root: None,
+                        worker_root: Some(elsewhere.display().to_string()),
                     },
                 )]),
                 ..Default::default()
             },
             ..Default::default()
         };
-        let err = format!("{:#}", orphan.validate_telegram_profiles().unwrap_err());
-        assert!(err.contains("no routable workspace"), "{err}");
+        standalone.validate_telegram_profiles().unwrap();
 
         // A blank or missing worker_root is rejected outright.
         let blank = Config {
@@ -5016,35 +4994,6 @@ allowlist_user_ids = [42]
         };
         let err = format!("{:#}", missing.validate_telegram_profiles().unwrap_err());
         assert!(err.contains("not an existing directory"), "{err}");
-
-        // Pointing it at a covered workspace root passes.
-        let routed = Config {
-            telegram: TelegramConfig {
-                profiles: BTreeMap::from([
-                    (
-                        "control".to_string(),
-                        TelegramProfileConfig {
-                            chat_id: -100_001,
-                            cwd: control.display().to_string(),
-                            orchestrator: true,
-                            worker_root: Some(elsewhere.display().to_string()),
-                        },
-                    ),
-                    (
-                        "commons".to_string(),
-                        TelegramProfileConfig {
-                            chat_id: -100_002,
-                            cwd: elsewhere.display().to_string(),
-                            orchestrator: false,
-                            worker_root: None,
-                        },
-                    ),
-                ]),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        routed.validate_telegram_profiles().unwrap();
     }
 
     #[test]

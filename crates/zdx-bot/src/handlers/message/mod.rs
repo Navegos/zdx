@@ -27,7 +27,7 @@ pub(crate) use launcher::{
     LauncherMap, create_topic_with_model, handle_callback as handle_launcher_callback,
     new_launcher_map, render_launcher, schedule_repost as schedule_launcher_repost,
 };
-pub(crate) use response::append_thread_link;
+pub(crate) use response::{append_thread_link, worker_link};
 pub(crate) use thread_header::{
     handle_callback as handle_thread_header_callback, post_thread_header, refresh_thread_header,
 };
@@ -386,7 +386,7 @@ struct TurnResult {
     had_error: bool,
     error_message: Option<String>,
     /// Worker thread ids this turn created or messaged (orchestrator turns),
-    /// in first-touch order, so the reply can link their mirror topics.
+    /// in first-touch order, so the reply can link them.
     touched_workers: Vec<String>,
 }
 
@@ -414,8 +414,8 @@ fn format_user_error_message(message: &str) -> String {
     format!("❌ Request failed.\n\n<pre>{}</pre>", escape_html(&compact))
 }
 
-/// Prefix marking a forum topic as an orchestrator home base, mirroring the
-/// `🛠` prefix a worker's mirror topic carries. Applied to the Telegram topic
+/// Prefix marking a forum topic as an orchestrator home base, like the `🛠`
+/// prefix legacy worker mirror topics carry. Applied to the Telegram topic
 /// name only; the persisted thread title stays clean.
 pub(crate) const ORCHESTRATOR_TOPIC_PREFIX: &str = "🎛️";
 

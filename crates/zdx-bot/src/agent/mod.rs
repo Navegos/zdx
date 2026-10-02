@@ -255,13 +255,12 @@ fn prepare_persistent_profile_turn(
 }
 
 /// Telegram **workspace** groups bound to the bot, so the orchestrator can pick
-/// worker roots deliberately and tell the user where a worker's mirror topic
-/// will appear. Each workspace also lists the project skills its workers
+/// worker roots deliberately. Each workspace also lists the project skills its workers
 /// discover there, since the orchestrator's own skill catalog only covers its
 /// home root.
 ///
-/// Orchestrator homes are not listed: they never host worker mirrors and never
-/// own skills. `chat_id` is the current chat, used to state its configured
+/// Orchestrator homes are not listed: they are not worker destinations and
+/// never own skills. `chat_id` is the current chat, used to state its configured
 /// default worker root. `None` when no workspace profiles are configured.
 fn telegram_workspaces_block(config: &Config, chat_id: Option<i64>) -> Option<String> {
     let workspaces: Vec<_> = config
@@ -277,7 +276,7 @@ fn telegram_workspaces_block(config: &Config, chat_id: Option<i64>) -> Option<St
     let skills = workspace_skills(config);
 
     let mut block = String::from(
-        "# Telegram Workspaces\n\nWorkspace groups bound to this bot (profile — root). A worker created inside one of these roots gets its mirror topic in that group (deepest matching root wins). A worker whose root no workspace covers falls back to the workspace covering your default worker root; if neither matches it runs with no mirror topic and you are warned. Your own management group never hosts worker topics. Tell the user where to follow each worker.\n\nWorkers in a root automatically discover that project's skills (listed under it); you do not have them yourself. Use them to know what a workspace can do and to point a worker at the right one by name when the task matches.\n\n",
+        "# Telegram Workspaces\n\nWorkspace groups bound to this bot (profile — root), the project roots workers usually run in.\n\nWorkers in a root automatically discover that project's skills (listed under it); you do not have them yourself. Use them to know what a workspace can do and to point a worker at the right one by name when the task matches.\n\n",
     );
     for (name, profile) in workspaces {
         let root = shorten_home(&profile.cwd_path().display().to_string(), &home);
@@ -510,8 +509,8 @@ pub(crate) fn event_to_status(event: &AgentEvent) -> Option<String> {
     }
 }
 
-/// One-line "running tool" status shared by turn status messages and worker
-/// mirror topics.
+/// One-line "running tool" status shared by turn status messages and legacy
+/// worker mirror topics.
 pub(crate) fn tool_running_status(name: &str) -> String {
     let emoji = match name {
         "bash" => "🔧",
@@ -810,10 +809,10 @@ mod tests {
         };
         let block = telegram_workspaces_block(&config, None).unwrap();
         assert!(block.starts_with("# Telegram Workspaces"));
-        assert!(block.contains("mirror topic in that group"));
+        assert!(block.contains("the project roots workers usually run in"));
         assert!(block.contains("- dub (chat -1001) — `/tmp/work/dub`"));
-        // Orchestrator homes never host mirrors, so they are not offered as
-        // workspaces at all.
+        // Orchestrator homes are not worker destinations, so they are not
+        // offered as workspaces at all.
         assert!(!block.contains("zdx (chat -1002)"));
 
         // Rendered for the orchestrator's own chat, the block states the

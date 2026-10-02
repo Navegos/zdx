@@ -1,39 +1,34 @@
 //! Orchestrator worker bridge.
 //!
-//! Consumes [`WorkerEvent`]s from the engine's `WorkerManager`:
+//! Consumes [`WorkerEvent`]s from the engine's `WorkerManager`. Workers are
+//! **silent**: a new worker gets no Telegram topic and posts nothing. The user
+//! reaches it through Mini App deep links (`?startapp=<worker_id>`) on the
+//! orchestrator's reply, pinned card, and completion notice.
 //!
-//! - `Created` opens a **mirror topic** in the owner's forum chat, aliased to
-//!   the worker thread and marked `worker_topic`, so the user can follow the
-//!   worker in Telegram. Messages typed there are queued into the worker FIFO
-//!   by the message handler (never run as in-process turns). The topic link
-//!   is registered on the manager so `create_thread` can hand it back.
-//! - `Activity` keeps one live status line per running turn (`🔧 Running
-//!   `bash`...`, same shape as a normal turn's status) up to date with
-//!   debounced edits; it is deleted when the result posts.
-//! - `Completed` posts the worker's final text into its mirror topic and
-//!   wakes the owning orchestrator topic with a synthetic queued turn,
-//!   reusing the same dispatch path as `/goal` continuations. Updates that
-//!   arrive while the orchestrator is busy are merged by the topic queue into
-//!   one turn (see `bot::queue::drain_worker_updates`), so a burst of
-//!   completions is reviewed once with all of them in context.
+//! - `Created` refreshes the owner's pinned card.
+//! - `Completed` posts a one-line notice in the orchestrator topic and wakes
+//!   it with a synthetic queued turn, reusing the same dispatch path as
+//!   `/goal` continuations. Updates that arrive while the orchestrator is busy
+//!   are merged by the topic queue into one turn (see
+//!   `bot::queue::drain_worker_updates`), so a burst of completions is
+//!   reviewed once with all of them in context.
 //!
-//! Only the live status message carries buttons (`⏹ Cancel worker` = `wk:c`,
-//! `💬 Open Thread`), like a normal turn's status; the cancel callback resolves
-//! the worker from the topic's persisted alias, so it works after a restart too.
-//!
-//! Routes are process-lifetime; the worker→topic map is rebuilt at startup
-//! from the persisted `worker_topic` + `alias_to` metadata, so results keep
-//! landing in their mirrors across restarts without anyone poking the topic.
+//! **Legacy mirror topics.** Workers created before silent workers may still
+//! have a mirror topic (aliased to the worker and marked `worker_topic`). The
+//! worker→topic map is rebuilt at startup from that persisted metadata, and
+//! for those workers only the bridge keeps the old feed: orchestrator prompts
+//! (`Prompted`), one debounced live status line per running turn (`Activity`,
+//! carrying `⏹ Cancel worker` = `wk:c` and `💬 Open Thread`), and the final
+//! result. Messages typed in such a topic are still queued into the worker
+//! FIFO by the message handler. No new mirror topics are ever opened.
 
 use std::collections::HashMap;
-use std::fmt::Write as _;
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::time::Instant;
-use zdx_engine::core::thread_persistence::{self, Thread};
+use zdx_engine::core::thread_persistence;
 use zdx_engine::core::workers::{CompletionEvent, WorkerActivity, WorkerEvent, WorkerStatus};
 
 use crate::agent::{STATUS_WAITING, tool_running_status};
@@ -41,8 +36,8 @@ use crate::bot::context::BotContext;
 use crate::bot::queue::ChatQueueMap;
 use crate::bot::synthetic::{SyntheticKind, dispatch_synthetic_prompt};
 use crate::handlers::message::{
-    append_thread_link, escape_html, mini_app_base_url, parse_topic_thread_id, post_thread_header,
-    refresh_thread_header, resolve_effective_thread_id, thread_id_for_chat,
+    append_thread_link, escape_html, mini_app_base_url, parse_topic_thread_id,
+    refresh_thread_header, resolve_effective_thread_id, thread_id_for_chat, worker_link,
 };
 use crate::telegram::markdown::{to_telegram_html, truncate_telegram_html};
 use crate::telegram::{
@@ -177,9 +172,11 @@ impl Bridge {
                 continue;
             };
             let mirror = MirrorTopic { chat, topic };
-            self.context
-                .worker_manager()
-                .set_mirror_url(&worker_thread_id, topic_link(chat, topic));
+            if let Some(link) = topic_link(chat, topic) {
+                self.context
+                    .worker_manager()
+                    .set_mirror_url(&worker_thread_id, link);
+            }
             self.mirrors.insert(worker_thread_id, mirror);
         }
         if !self.mirrors.is_empty() {
@@ -190,30 +187,10 @@ impl Bridge {
     async fn handle(&mut self, event: WorkerEvent) {
         match event {
             WorkerEvent::Created {
-                owner_thread_id,
-                worker_thread_id,
-                root,
-                title,
-                prompt,
+                owner_thread_id, ..
             } => {
-                let mirror = create_mirror_topic(
-                    &self.context,
-                    &owner_thread_id,
-                    &worker_thread_id,
-                    &root,
-                    title.as_deref(),
-                    &prompt,
-                )
-                .await;
-                // Always resolve the link, even to `None`, so a `create_thread`
-                // waiting on it returns immediately instead of timing out.
-                self.context.worker_manager().set_mirror_url(
-                    &worker_thread_id,
-                    mirror.and_then(|mirror| topic_link(mirror.chat, mirror.topic)),
-                );
-                if let Some(mirror) = mirror {
-                    self.mirrors.insert(worker_thread_id, mirror);
-                }
+                // Workers are silent: no Telegram topic is opened for them.
+                // Only the owner's pinned card changes.
                 refresh_thread_header(&self.context, &owner_thread_id).await;
             }
             WorkerEvent::Prompted {
@@ -431,239 +408,9 @@ pub(crate) async fn handle_callback(
     }
 }
 
-/// Opens the worker's mirror topic.
-///
-/// Host resolution, in order:
-/// 1. the routable workspace whose `cwd` contains the worker's root (deepest);
-/// 2. the workspace covering the owning orchestrator group's configured default
-///    worker root;
-/// 3. a Threaded Mode DM home — private chats only, where the DM is the sole
-///    possible host and no workspace group exists.
-///
-/// A configured orchestrator group is **never** a host: keeping the management
-/// space free of worker topics is the point of the split. When no chat can host
-/// the mirror, or every resolved host rejects the topic, the worker still runs
-/// and the owner is warned — with the two cases distinguished — instead of the
-/// topic being dropped into the management group.
-async fn create_mirror_topic(
-    context: &Arc<BotContext>,
-    owner_thread_id: &str,
-    worker_thread_id: &str,
-    root: &Path,
-    title: Option<&str>,
-    prompt: &str,
-) -> Option<MirrorTopic> {
-    let owner_chat = context
-        .orchestrator_route(owner_thread_id)
-        .map(|route| route.chat);
-
-    let mut candidates: Vec<i64> = Vec::new();
-    if let Some(chat) = context.mirror_chat_for_root(root) {
-        candidates.push(chat);
-    }
-    if let Some(chat) =
-        owner_chat.and_then(|chat| context.mirror_chat_for_default_worker_root(chat))
-        && !candidates.contains(&chat)
-    {
-        candidates.push(chat);
-    }
-    // Legacy Threaded Mode DM behavior, unchanged: bots may create topics in
-    // private chats, and a DM home has no workspace group backing it. Scoped to
-    // private chats so it cannot become a general escape hatch back into a
-    // group.
-    if let Some(chat) = owner_chat
-        && chat > 0
-        && !candidates.contains(&chat)
-    {
-        candidates.push(chat);
-    }
-    // Defense in depth: the filters above already exclude orchestrator groups.
-    candidates.retain(|chat| !context.is_orchestrator_group(*chat));
-
-    if candidates.is_empty() {
-        tracing::info!(
-            worker = %worker_thread_id,
-            root = %root.display(),
-            "No workspace can host a mirror topic; worker runs without one"
-        );
-        warn_no_mirror(
-            context,
-            owner_thread_id,
-            title,
-            &MirrorFailure::NoRoute { root },
-        )
-        .await;
-        return None;
-    }
-
-    let short_id: String = worker_thread_id.chars().take(8).collect();
-    let name = match title {
-        Some(title) => format!("🛠 {title}"),
-        None => format!("🛠 Worker {short_id}"),
-    };
-
-    let mut created: Option<(i64, i64)> = None;
-    let mut attempts: Vec<(i64, String)> = Vec::new();
-    for chat in candidates {
-        match context.client().create_forum_topic(chat, &name).await {
-            Ok(topic_id) => {
-                created = Some((chat, topic_id));
-                break;
-            }
-            Err(err) => {
-                let err = format!("{err:#}");
-                tracing::warn!(worker = %worker_thread_id, chat, err = %err, "Failed to create mirror topic");
-                attempts.push((chat, err));
-            }
-        }
-    }
-    let Some((chat, topic_id)) = created else {
-        // Routing worked; Telegram refused the topic. Saying the root is
-        // unroutable here would send the user to fix the wrong thing.
-        warn_no_mirror(
-            context,
-            owner_thread_id,
-            title,
-            &MirrorFailure::CreateFailed { attempts },
-        )
-        .await;
-        return None;
-    };
-
-    let topic_thread_id = thread_id_for_chat(chat, Some(topic_id));
-    let marked = Thread::with_id(topic_thread_id.clone()).and_then(|mut thread| {
-        thread.set_worker_topic();
-        thread.set_alias(Some(worker_thread_id.to_string()))
-    });
-    if let Err(err) = marked {
-        tracing::error!(
-            thread_id = %topic_thread_id,
-            err = %format!("{err:#}"),
-            "Failed to bind mirror topic to worker; leaving topic unbound"
-        );
-        return None;
-    }
-
-    // Same pinned status card as every other topic (model, thinking, root,
-    // usage, Open Thread + Refresh), computed for the worker thread itself.
-    if let Err(err) = post_thread_header(context, chat, topic_id, worker_thread_id).await {
-        tracing::warn!(worker = %worker_thread_id, err = %format!("{err:#}"), "Failed to post mirror topic header");
-    }
-    let mirror = MirrorTopic {
-        chat,
-        topic: topic_id,
-    };
-    post_prompt_message(
-        context,
-        &mirror,
-        worker_thread_id,
-        "📤 First prompt",
-        prompt,
-    )
-    .await;
-    Some(mirror)
-}
-
-/// Why a worker ended up without a mirror topic. The two cases need different
-/// remedies, so they must not share one message.
-enum MirrorFailure<'a> {
-    /// No chat was eligible to host the topic: a routing/config gap.
-    NoRoute { root: &'a Path },
-    /// Routing resolved hosts, but every `create_forum_topic` call failed.
-    CreateFailed { attempts: Vec<(i64, String)> },
-}
-
-/// Longest per-attempt Telegram error excerpt embedded in a warning.
-const MAX_MIRROR_ERROR_CHARS: usize = 300;
-
-/// Posts an unroutable-worker warning into the orchestrator topic. The worker
-/// runs either way; this keeps the failure visible and actionable instead of
-/// resolving it by putting a worker topic in the management group.
-async fn warn_no_mirror(
-    context: &Arc<BotContext>,
-    owner_thread_id: &str,
-    title: Option<&str>,
-    failure: &MirrorFailure<'_>,
-) {
-    let Some(route) = context.orchestrator_route(owner_thread_id) else {
-        return;
-    };
-    let label = title.map_or_else(
-        || "the worker".to_string(),
-        |title| format!("🛠 {}", escape_html(title)),
-    );
-    let text = match failure {
-        MirrorFailure::NoRoute { root } => {
-            no_mirror_warning_text(&label, &WarningKind::NoRoute(&root.display().to_string()))
-        }
-        MirrorFailure::CreateFailed { attempts } => {
-            let described: Vec<(String, String)> = attempts
-                .iter()
-                .map(|(chat, err)| (describe_chat(context, *chat), err.clone()))
-                .collect();
-            no_mirror_warning_text(&label, &WarningKind::CreateFailed(&described))
-        }
-    };
-
-    if let Err(err) = context
-        .client()
-        .send_message_without_preview(route.chat, &text, None, route.topic)
-        .await
-    {
-        tracing::warn!(err = %format!("{err:#}"), "Failed to post no-mirror warning");
-    }
-}
-
-/// Text-level shape of [`MirrorFailure`], with destinations already rendered.
-enum WarningKind<'a> {
-    NoRoute(&'a str),
-    /// `(described destination, Telegram error)` per failed attempt.
-    CreateFailed(&'a [(String, String)]),
-}
-
-/// Builds the warning body. A routing gap and a rejected topic need different
-/// remedies, so they never share wording: telling the user to add a workspace
-/// profile when routing already worked sends them to fix the wrong thing.
-fn no_mirror_warning_text(label: &str, kind: &WarningKind<'_>) -> String {
-    let still_running =
-        format!("{label} has no mirror topic. It is running and will still report back here.");
-    match kind {
-        WarningKind::NoRoute(root) => format!(
-            "⚠️ No workspace group covers <code>{}</code>, so {still_running} \
-             Add a Telegram workspace profile for that root, or point this orchestrator's \
-             <code>worker_root</code> at a workspace that covers it.",
-            escape_html(root)
-        ),
-        WarningKind::CreateFailed(attempts) => {
-            let mut detail = String::new();
-            for (destination, err) in *attempts {
-                let _ = write!(
-                    detail,
-                    "\n• {destination}: <code>{}</code>",
-                    escape_html(&truncate_chars(err, MAX_MIRROR_ERROR_CHARS))
-                );
-            }
-            format!(
-                "⚠️ Routing resolved, but Telegram refused to create the topic, so \
-                 {still_running}{detail}\n\nThe error above is the actual cause. Check that \
-                 the destination has forum topics enabled and that the bot may manage them; \
-                 a transient Telegram error is also possible. Routing is fine — this is not \
-                 fixed by adding a workspace profile."
-            )
-        }
-    }
-}
-
-/// Human-readable destination for a warning: profile name when the chat is
-/// bound to one, always with the chat id so it can be matched to config.
-fn describe_chat(context: &Arc<BotContext>, chat_id: i64) -> String {
-    match context.root_for_chat(chat_id).profile_name {
-        Some(name) => format!("{} (chat {chat_id})", escape_html(&name)),
-        None => format!("chat {chat_id}"),
-    }
-}
-
-/// Posts an orchestrator-sent follow-up prompt into the worker's mirror topic.
+/// Posts an orchestrator-sent follow-up prompt into the worker's legacy mirror
+/// topic (Markdown → Telegram HTML, entity-safe truncation). New workers have
+/// no mirror, so this is a no-op for them.
 async fn post_mirror_prompt(
     context: &Arc<BotContext>,
     mirror: Option<&MirrorTopic>,
@@ -673,27 +420,8 @@ async fn post_mirror_prompt(
     let Some(mirror) = mirror else {
         return;
     };
-    post_prompt_message(
-        context,
-        mirror,
-        worker_thread_id,
-        "📤 Prompt from the orchestrator",
-        prompt,
-    )
-    .await;
-}
-
-/// Renders a prompt (Markdown → Telegram HTML, entity-safe truncation) under
-/// `label`, with the worker action buttons.
-async fn post_prompt_message(
-    context: &Arc<BotContext>,
-    mirror: &MirrorTopic,
-    worker_thread_id: &str,
-    label: &str,
-    prompt: &str,
-) {
     let body = truncate_telegram_html(&to_telegram_html(prompt), MAX_MIRROR_TEXT_CHARS);
-    let text = format!("<b>{label}</b>\n\n{body}");
+    let text = format!("<b>📤 Prompt from the orchestrator</b>\n\n{body}");
     if let Err(err) = context
         .client()
         .send_message(mirror.chat, &text, None, Some(mirror.topic))
@@ -764,8 +492,13 @@ async fn dispatch_owner_callback(
 
     // The synthetic prompt itself is invisible in chat, so post a one-line
     // notice first: the user sees which worker woke the orchestrator and can
-    // jump to its topic.
-    let notice = worker_update_notice(event);
+    // open it.
+    let link = worker_link(
+        event.mirror_url.clone(),
+        mini_app_base_url(context, route.chat).as_deref(),
+        &event.worker_thread_id,
+    );
+    let notice = worker_update_notice(event, link.as_deref());
     if let Err(err) = context
         .client()
         .send_message_without_preview(route.chat, &notice, None, route.topic)
@@ -805,14 +538,14 @@ async fn dispatch_owner_callback(
 }
 
 /// One-line notice posted in the orchestrator topic when a worker turn ends:
-/// status glyph, worker title linked to its mirror topic when it has one.
-fn worker_update_notice(event: &CompletionEvent) -> String {
+/// status glyph, worker title linked per [`worker_link`] when a link exists.
+fn worker_update_notice(event: &CompletionEvent, link: Option<&str>) -> String {
     let title = thread_persistence::read_thread_title(&event.worker_thread_id)
         .ok()
         .flatten()
         .unwrap_or_else(|| event.worker_thread_id.chars().take(8).collect());
     let title = escape_html(&title);
-    let worker = match event.mirror_url.as_deref() {
+    let worker = match link {
         Some(url) => format!("<a href=\"{url}\">{title}</a>"),
         None => title,
     };
@@ -840,9 +573,6 @@ fn build_worker_update_prompt(
     let mut prompt = format!(
         "[worker update] Worker thread `{worker}` finished a turn with status: {status}.\n"
     );
-    if let Some(url) = event.mirror_url.as_deref() {
-        let _ = writeln!(prompt, "Mirror topic: {url}");
-    }
     match event.status {
         WorkerStatus::Completed => {
             let text = event.final_text.as_deref().unwrap_or_default();
@@ -989,7 +719,7 @@ mod tests {
     }
 
     #[test]
-    fn completed_prompt_carries_final_text_and_link() {
+    fn completed_prompt_carries_final_text_without_topic_link() {
         let prompt = build_worker_update_prompt(
             &CompletionEvent {
                 final_text: Some("all done".to_string()),
@@ -1001,7 +731,7 @@ mod tests {
         assert!(prompt.starts_with("[worker update]"));
         assert!(prompt.contains("`worker-1`"));
         assert!(prompt.contains("status: completed"));
-        assert!(prompt.contains("Mirror topic: https://t.me/c/1/2"));
+        assert!(!prompt.contains("https://t.me/c/1/2"));
         assert!(prompt.contains("all done"));
         assert!(prompt.contains("Worker context: unknown"));
     }
@@ -1016,7 +746,6 @@ mod tests {
             &serde_json::Value::Null,
         );
         assert!(prompt.contains("status: failed"));
-        assert!(!prompt.contains("Mirror topic:"));
         assert!(prompt.contains("[truncated"));
         assert!(prompt.chars().count() < 3100);
     }
@@ -1092,52 +821,18 @@ mod tests {
     }
 
     #[test]
-    fn update_notice_links_the_worker_when_it_has_a_mirror() {
-        let linked = worker_update_notice(&CompletionEvent {
-            mirror_url: Some("https://t.me/c/1/2".to_string()),
-            ..completion(WorkerStatus::Completed)
-        });
+    fn update_notice_links_the_worker_when_a_link_exists() {
+        let linked = worker_update_notice(
+            &completion(WorkerStatus::Completed),
+            Some("https://t.me/zdx_bot/app?startapp=worker-1"),
+        );
         assert_eq!(
             linked,
-            "✅ Worker 🛠 <a href=\"https://t.me/c/1/2\">worker-1</a> finished · reviewing…"
+            "✅ Worker 🛠 <a href=\"https://t.me/zdx_bot/app?startapp=worker-1\">worker-1</a> finished · reviewing…"
         );
-        // No thread on disk → short id; no mirror → plain text.
-        let plain = worker_update_notice(&completion(WorkerStatus::Failed));
+        // No thread on disk → short id; no link → plain text.
+        let plain = worker_update_notice(&completion(WorkerStatus::Failed), None);
         assert_eq!(plain, "❌ Worker 🛠 worker-1 failed · reviewing…");
-    }
-
-    /// A routing gap and a rejected topic get different remedies. Conflating
-    /// them told the user their root was unroutable when routing had worked.
-    #[test]
-    fn no_mirror_warning_separates_routing_gap_from_creation_failure() {
-        let no_route = no_mirror_warning_text("🛠 build", &WarningKind::NoRoute("/tmp/scratch"));
-        assert!(no_route.contains("No workspace group covers <code>/tmp/scratch</code>"));
-        assert!(no_route.contains("Add a Telegram workspace profile"));
-        assert!(no_route.contains("still report back here"));
-
-        let attempts = vec![(
-            "commons (chat -100002)".to_string(),
-            "Telegram API error: CHAT_NOT_MODIFIED".to_string(),
-        )];
-        let failed = no_mirror_warning_text("🛠 build", &WarningKind::CreateFailed(&attempts));
-        // Names the destination that was actually tried and the real error.
-        assert!(failed.contains("commons (chat -100002)"));
-        assert!(failed.contains("CHAT_NOT_MODIFIED"));
-        assert!(failed.contains("Routing resolved"));
-        assert!(failed.contains("still report back here"));
-        // Must not send the user to fix routing, and must not diagnose a cause
-        // the API error did not establish.
-        assert!(!failed.contains("No workspace group covers"));
-        assert!(!failed.contains("Add a Telegram workspace profile"));
-        assert!(failed.contains("actual cause"));
-        assert!(failed.contains("also possible"));
-
-        // Error text is escaped and bounded.
-        let long = vec![("chat 7".to_string(), format!("<b>{}", "x".repeat(400)))];
-        let bounded = no_mirror_warning_text("the worker", &WarningKind::CreateFailed(&long));
-        assert!(bounded.contains("&lt;b&gt;"));
-        assert!(!bounded.contains("<b>"));
-        assert!(bounded.contains('…'));
     }
 
     #[test]
