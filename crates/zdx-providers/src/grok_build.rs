@@ -1,9 +1,14 @@
 //! Grok Build (xAI Grok subscription OAuth) provider using the Responses API.
 //!
 //! Authenticates with a `SuperGrok` / X Premium+ subscription via the Grok CLI
-//! OAuth flow and sends requests to the same xAI Responses endpoint
-//! (`https://api.x.ai/v1/responses`) as the API-key `xai` provider, swapping the
-//! API key for a short-lived OAuth bearer that is refreshed on demand.
+//! OAuth flow and sends Responses requests to the Grok CLI chat proxy
+//! (`https://cli-chat-proxy.grok.com/v1/responses`) with a short-lived OAuth
+//! bearer that is refreshed on demand.
+//!
+//! `api.x.ai` bills OAuth tokens against API-team credits (HTTP 402
+//! `personal-team-blocked:spending-limit`); only the proxy bills the
+//! subscription. The proxy rejects requests without Grok CLI client headers, or
+//! with a client version below its minimum, with HTTP 426.
 
 use anyhow::{Context, Result};
 use reqwest::header::{HeaderMap, HeaderValue};
@@ -16,6 +21,8 @@ use crate::shared::merge_system_prompt;
 use crate::{ChatMessage, ProviderKind, ProviderStream};
 
 const RESPONSES_PATH: &str = "/responses";
+/// Grok CLI version reported to the proxy. Bump it when the proxy answers 426.
+const GROK_CLI_VERSION: &str = "1.0.46";
 
 fn reasoning_effort_from_thinking_level(level: ThinkingLevel) -> &'static str {
     match level {
@@ -54,6 +61,15 @@ fn build_headers(access_token: &str) -> Result<HeaderMap> {
     headers.insert(
         "Authorization",
         crate::shared::header_value("Grok Build access token", &format!("Bearer {access_token}"))?,
+    );
+    headers.insert("X-XAI-Token-Auth", HeaderValue::from_static("xai-grok-cli"));
+    headers.insert(
+        "x-grok-client-version",
+        HeaderValue::from_static(GROK_CLI_VERSION),
+    );
+    headers.insert(
+        "x-grok-client-identifier",
+        HeaderValue::from_static("grok-shell"),
     );
     headers.insert("accept", HeaderValue::from_static("text/event-stream"));
     headers.insert("content-type", HeaderValue::from_static("application/json"));
@@ -150,12 +166,34 @@ pub fn build(
 mod tests {
     use zdx_types::config::ThinkingLevel;
 
-    use super::{GrokBuildClient, RESPONSES_PATH, reasoning_effort_from_thinking_level};
+    use super::{
+        GROK_CLI_VERSION, GrokBuildClient, RESPONSES_PATH, build_headers,
+        reasoning_effort_from_thinking_level,
+    };
+    use crate::ProviderKind;
+
+    #[test]
+    fn grok_build_routes_to_cli_chat_proxy_and_xai_stays_on_api() {
+        assert_eq!(
+            ProviderKind::GrokBuild.resolve_base_url(None).unwrap(),
+            "https://cli-chat-proxy.grok.com/v1"
+        );
+        assert_eq!(ProviderKind::Xai.meta().base_url, "https://api.x.ai/v1");
+    }
+
+    #[test]
+    fn grok_build_sends_grok_cli_client_headers() {
+        let headers = build_headers("token-123").unwrap();
+        assert_eq!(headers["Authorization"], "Bearer token-123");
+        assert_eq!(headers["X-XAI-Token-Auth"], "xai-grok-cli");
+        assert_eq!(headers["x-grok-client-version"], GROK_CLI_VERSION);
+        assert_eq!(headers["x-grok-client-identifier"], "grok-shell");
+    }
 
     #[test]
     fn grok_build_uses_responses_path_and_encrypted_reasoning() {
         let client = GrokBuildClient::new(
-            "https://api.x.ai/v1".to_string(),
+            "https://cli-chat-proxy.grok.com/v1".to_string(),
             "grok-4.5".to_string(),
             Some(1024),
             Some("thread-123".to_string()),

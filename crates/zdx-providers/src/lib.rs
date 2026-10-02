@@ -406,7 +406,7 @@ impl ProviderKind {
                 aliases: &["grokbuild"],
                 label: "Grok Build",
                 api_key_env: None,
-                base_url: "https://api.x.ai/v1",
+                base_url: "https://cli-chat-proxy.grok.com/v1",
                 base_url_env: None,
                 supports_oauth: true,
                 is_subscription: true,

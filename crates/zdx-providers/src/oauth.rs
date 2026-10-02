@@ -1269,7 +1269,7 @@ pub mod google_antigravity {
 ///
 /// Uses the public Grok CLI desktop OAuth client to authenticate against a
 /// `SuperGrok` / X Premium+ subscription. The resulting access token is a bearer
-/// against the standard xAI Responses API (`https://api.x.ai/v1`).
+/// for the Grok CLI chat proxy (`https://cli-chat-proxy.grok.com/v1`).
 pub mod grok_build {
     use base64::Engine;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
