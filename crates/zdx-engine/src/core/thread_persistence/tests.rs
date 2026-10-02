@@ -2747,6 +2747,72 @@ fn test_thread_lineage_roundtrip_and_list_filtering() {
     assert!(all_ids.contains(&child_id));
 }
 
+/// The canonical worker rule (top-level + parent) must agree between the
+/// indexed SQL filter, the file-scan summary, and the browse filter, and must
+/// exclude normal threads, orchestrators, subagent children, and mirror topics.
+#[test]
+fn worker_filter_matches_only_worker_lineage() {
+    let _temp = setup_temp_zdx_home();
+    crate::core::thread_index::reset_cache_for_test();
+
+    let orchestrator_id = unique_thread_id("orch");
+    let mut orchestrator = Thread::with_id(orchestrator_id.clone()).unwrap();
+    orchestrator.set_persistent_profile("orchestrator").unwrap();
+    orchestrator
+        .append(&ThreadEvent::user_message("plan"))
+        .unwrap();
+
+    let worker_id = unique_thread_id("worker");
+    let mut worker = Thread::with_id(worker_id.clone()).unwrap();
+    worker.set_origin(None, Some(orchestrator_id.clone()), None);
+    worker.append(&ThreadEvent::user_message("work")).unwrap();
+
+    let child_id = unique_thread_id("child");
+    let mut child = Thread::with_id(child_id).unwrap();
+    child.set_origin(
+        Some("subagent".to_string()),
+        Some(orchestrator_id.clone()),
+        Some("explorer".to_string()),
+    );
+    child.append(&ThreadEvent::user_message("look")).unwrap();
+
+    let mirror_id = unique_thread_id("mirror");
+    let mut mirror = Thread::with_id(mirror_id).unwrap();
+    mirror.set_worker_topic();
+    mirror.set_alias(Some(worker_id.clone())).unwrap();
+
+    let normal_id = unique_thread_id("normal");
+    let mut normal = Thread::with_id(normal_id).unwrap();
+    normal.append(&ThreadEvent::user_message("hi")).unwrap();
+
+    let indexed: Vec<String> = list_recent_workers(50)
+        .unwrap()
+        .into_iter()
+        .map(|s| s.id)
+        .collect();
+    assert_eq!(indexed, vec![worker_id.clone()]);
+
+    let scanned: Vec<String> = list_all_threads()
+        .unwrap()
+        .into_iter()
+        .filter(ThreadSummary::is_worker)
+        .map(|s| s.id)
+        .collect();
+    assert_eq!(scanned, indexed);
+
+    let browsed: Vec<String> = crate::core::thread_index::browse_threads(
+        &crate::core::thread_index::ThreadBrowseOptions {
+            kind: crate::core::thread_index::ThreadKindFilter::Worker,
+            ..Default::default()
+        },
+    )
+    .unwrap()
+    .into_iter()
+    .map(|row| row.id)
+    .collect();
+    assert_eq!(browsed, indexed);
+}
+
 #[test]
 fn test_usage_struct_operations() {
     let u1 = Usage::new(100, 50, 200, 25);

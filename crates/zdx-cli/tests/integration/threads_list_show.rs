@@ -900,3 +900,60 @@ fn test_threads_search_drops_stale_text_and_deleted_threads() {
     assert!(!String::from_utf8_lossy(&search("zebra-marker")).contains("rewrite-thread"));
     assert!(!String::from_utf8_lossy(&search("walrus-marker")).contains("doomed-thread"));
 }
+
+#[test]
+fn test_threads_list_workers_filters_to_worker_lineage() {
+    let temp_dir = TempDir::new().unwrap();
+    let threads_dir = temp_dir.path().join("threads");
+    fs::create_dir_all(&threads_dir).unwrap();
+    let write = |id: &str, meta: serde_json::Value| {
+        let mut meta = meta;
+        meta["type"] = json!("meta");
+        meta["schema_version"] = json!(1);
+        meta["ts"] = json!("2024-01-01T00:00:00Z");
+        fs::write(
+            threads_dir.join(format!("{id}.jsonl")),
+            format!("{}\n", serde_json::to_string(&meta).unwrap()),
+        )
+        .unwrap();
+    };
+    write(
+        "orch-home",
+        json!({ "title": "Home base", "subagent_name": "orchestrator" }),
+    );
+    write(
+        "worker-one",
+        json!({ "title": "Build the thing", "parent_thread_id": "orch-home" }),
+    );
+    write(
+        "child-run",
+        json!({
+            "title": "Explore",
+            "origin_kind": "subagent",
+            "parent_thread_id": "orch-home",
+            "subagent_name": "explorer"
+        }),
+    );
+
+    let output = crate::fixtures::zdx_cmd()
+        .env("ZDX_HOME", temp_dir.path())
+        .args(["threads", "list", "--workers"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let output = String::from_utf8_lossy(&output);
+    assert!(output.contains("worker-one"), "{output}");
+    assert!(output.contains("[worker ← orch-hom"), "{output}");
+    assert!(!output.contains("Home base"), "{output}");
+    assert!(!output.contains("child-run"), "{output}");
+
+    // The default list keeps the worker and labels it.
+    crate::fixtures::zdx_cmd()
+        .env("ZDX_HOME", temp_dir.path())
+        .args(["threads", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("worker-one").and(predicate::str::contains("[worker ←")));
+}

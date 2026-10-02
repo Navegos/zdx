@@ -282,6 +282,11 @@ pub fn sync_and_export(
 const SUMMARY_COLUMNS: &str = "thread_id, mtime_ns, title, root_path, handoff_from, \
      origin_kind, parent_thread_id, subagent_name, alias_to, worker_topic";
 
+/// SQL form of the canonical worker rule
+/// ([`crate::core::thread_persistence::is_worker_lineage`]): top-level thread
+/// with a recorded parent.
+pub(crate) const WORKER_SQL: &str = "origin_kind IS NULL AND parent_thread_id IS NOT NULL";
+
 /// Maps a [`SUMMARY_COLUMNS`] row onto a [`ThreadSummary`].
 fn summary_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ThreadSummary> {
     Ok(ThreadSummary {
@@ -381,7 +386,7 @@ pub fn worker_counts_for_parents(parent_ids: &[&str]) -> Result<HashMap<String, 
             .join(",");
         let mut stmt = conn.prepare(&format!(
             "SELECT parent_thread_id, COUNT(*) FROM thread_meta
-             WHERE origin_kind IS NULL AND parent_thread_id IN ({placeholders})
+             WHERE {WORKER_SQL} AND parent_thread_id IN ({placeholders})
              GROUP BY parent_thread_id"
         ))?;
         let rows = stmt.query_map(rusqlite::params_from_iter(parent_ids), |row| {
@@ -494,6 +499,28 @@ pub fn list_recent_threads_cached(limit: usize) -> Result<Vec<ThreadSummary>> {
     })
 }
 
+/// Returns at most `limit` orchestrator worker threads, newest first.
+///
+/// Workers are identified by [`WORKER_SQL`], the SQL form of
+/// [`ThreadSummary::is_worker`]; filtering, ordering, and the limit all run in
+/// SQL.
+///
+/// # Errors
+/// Returns an error when the cache cannot be opened, synced, or read.
+pub fn list_recent_workers_cached(limit: usize) -> Result<Vec<ThreadSummary>> {
+    let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    with_conn(|conn| {
+        sync_if_stale(conn, SyncScope::Meta)?;
+        let mut stmt = conn.prepare_cached(&format!(
+            "SELECT {SUMMARY_COLUMNS} FROM thread_meta WHERE {WORKER_SQL}
+             ORDER BY mtime_ns DESC, thread_id ASC LIMIT ?1"
+        ))?;
+        let rows = stmt.query_map([limit], summary_from_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    })
+}
+
 /// Returns the most recently modified thread whose ID starts with `prefix`.
 ///
 /// Ordering and the limit are applied in SQL, so this stays a single indexed
@@ -528,6 +555,8 @@ pub enum ThreadKindFilter {
     Subagent,
     /// Internal helper runs (title, tldr, handoff, `read_thread`, ...).
     Helper,
+    /// Orchestrator worker threads ([`WORKER_SQL`]).
+    Worker,
 }
 
 impl ThreadKindFilter {
@@ -536,7 +565,8 @@ impl ThreadKindFilter {
     pub fn next(self) -> Self {
         match self {
             Self::All => Self::TopLevel,
-            Self::TopLevel => Self::Subagent,
+            Self::TopLevel => Self::Worker,
+            Self::Worker => Self::Subagent,
             Self::Subagent => Self::Helper,
             Self::Helper => Self::All,
         }
@@ -548,6 +578,7 @@ impl ThreadKindFilter {
         match self {
             Self::All => "all",
             Self::TopLevel => "top-level",
+            Self::Worker => "workers",
             Self::Subagent => "subagents",
             Self::Helper => "helpers",
         }
@@ -614,6 +645,10 @@ pub fn browse_threads(options: &ThreadBrowseOptions) -> Result<Vec<ThreadBrowseR
             ThreadKindFilter::TopLevel => sql.push_str(" AND origin_kind IS NULL"),
             ThreadKindFilter::Subagent => sql.push_str(" AND origin_kind = 'subagent'"),
             ThreadKindFilter::Helper => sql.push_str(" AND origin_kind LIKE 'helper:%'"),
+            ThreadKindFilter::Worker => {
+                sql.push_str(" AND ");
+                sql.push_str(WORKER_SQL);
+            }
         }
         if let Some(project) = options
             .project

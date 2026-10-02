@@ -172,6 +172,9 @@ pub struct ThreadListItem {
     /// Worker counts when this thread is an orchestrator, else `None`. Drives
     /// the `orch` badge and the roll-up line on the row.
     pub workers: Option<WorkerRollup>,
+    /// Whether this thread is an orchestrator worker (the canonical
+    /// `ThreadSummary::is_worker` rule). Drives the `worker` badge.
+    pub is_worker: bool,
 }
 
 #[derive(Serialize)]
@@ -302,6 +305,23 @@ struct ThreadQuery {
     /// Return only activity at or after this cursor. Live polling sends the
     /// `cursor` from its previous response; a first load omits it.
     after: Option<usize>,
+}
+
+/// Which threads `/api/threads` lists.
+#[derive(Deserialize, Default, Clone, Copy)]
+#[serde(rename_all = "snake_case")]
+enum ThreadListKind {
+    /// Every top-level thread, workers included.
+    #[default]
+    All,
+    /// Only orchestrator workers.
+    Workers,
+}
+
+#[derive(Deserialize, Default)]
+struct ThreadListQuery {
+    #[serde(default)]
+    kind: ThreadListKind,
 }
 
 #[derive(Deserialize)]
@@ -738,18 +758,23 @@ fn resolve_telegram_link(thread_id: &str) -> Option<String> {
     telegram_topic_link(&mirror_id)
 }
 
-/// Lists the most recently active top-level threads for the Mini App browser.
+/// Lists the most recently active top-level threads for the Mini App browser,
+/// or only orchestrator workers with `?kind=workers`.
 async fn get_threads(
     State(state): State<Arc<ServerState>>,
+    Query(query): Query<ThreadListQuery>,
 ) -> Result<Json<ThreadListResponse>, ApiError> {
     let manager = Arc::clone(&state.workers);
     tokio::task::spawn_blocking(move || {
         let now = SystemTime::now();
-        let summaries =
-            thread_persistence::list_recent_threads(THREAD_LIST_LIMIT).map_err(|error| {
-                tracing::warn!(error = %format!("{error:#}"), "Failed to list Mini App threads");
-                (StatusCode::INTERNAL_SERVER_ERROR, "Thread list failed")
-            })?;
+        let summaries = match query.kind {
+            ThreadListKind::All => thread_persistence::list_recent_threads(THREAD_LIST_LIMIT),
+            ThreadListKind::Workers => thread_persistence::list_recent_workers(THREAD_LIST_LIMIT),
+        }
+        .map_err(|error| {
+            tracing::warn!(error = %format!("{error:#}"), "Failed to list Mini App threads");
+            (StatusCode::INTERNAL_SERVER_ERROR, "Thread list failed")
+        })?;
 
         // One indexed lookup for the page being rendered, not a corpus scan:
         // the id list is bounded by THREAD_LIST_LIMIT.
@@ -767,6 +792,7 @@ async fn get_threads(
         let threads = summaries
             .into_iter()
             .map(|summary| ThreadListItem {
+                is_worker: summary.is_worker(),
                 workers: worker_rollup(
                     live_statuses.get(&summary.id).map(Vec::as_slice),
                     persisted_counts.get(&summary.id).copied().unwrap_or(0),
@@ -1010,9 +1036,9 @@ fn status_rank(status: &str) -> u8 {
 /// - `thread_meta.parent_thread_id` survives restarts, but records only that a
 ///   worker existed. It restores *discovery*, never status.
 ///
-/// Persisted children are filtered to `origin_kind IS NULL`, because the same
-/// parent link is used by subagent and helper runs, which are not workers and
-/// must not show up here.
+/// Persisted children are filtered by the canonical worker rule
+/// (`ThreadSummary::is_worker`), because the same parent link is used by
+/// subagent and helper runs, which are not workers and must not show up here.
 fn collect_workers(workers: &WorkerManager, owner_thread_id: &str) -> Vec<WorkerItem> {
     let now = SystemTime::now();
     let live = workers.list_for_owner(owner_thread_id);
@@ -1029,7 +1055,7 @@ fn collect_workers(workers: &WorkerManager, owner_thread_id: &str) -> Vec<Worker
         Vec::new()
     });
     for summary in persisted {
-        if summary.origin_kind.is_some() || live_ids.contains(&summary.id) {
+        if !summary.is_worker() || live_ids.contains(&summary.id) {
             continue;
         }
         items.push(WorkerItem {
@@ -2993,6 +3019,85 @@ mod tests {
             .await
             .expect("request foreign path");
         assert_eq!(foreign.status(), StatusCode::NOT_FOUND);
+
+        server.abort();
+        drop(home);
+    }
+
+    /// `/api/threads?kind=workers` lists only workers and flags them; the
+    /// default list keeps every top-level thread with the same flag.
+    #[tokio::test]
+    async fn thread_list_filters_and_flags_workers() {
+        let home = zdx_engine::test_support::temp_zdx_home();
+        let orchestrator_id = format!("orch-{}", uuid::Uuid::new_v4());
+        let mut orchestrator =
+            thread_persistence::Thread::with_id(orchestrator_id.clone()).expect("thread");
+        orchestrator
+            .append(&ThreadEvent::user_message("plan"))
+            .expect("append");
+        let worker_id = format!("worker-{}", uuid::Uuid::new_v4());
+        let mut worker = thread_persistence::Thread::with_id(worker_id.clone()).expect("thread");
+        worker.set_origin(None, Some(orchestrator_id.clone()), None);
+        worker
+            .append(&ThreadEvent::user_message("work"))
+            .expect("append");
+
+        let app = create_router(Arc::new(ServerState::new(
+            SAMPLE_BOT_TOKEN.to_string(),
+            sample_allowlist(),
+            PathBuf::from("."),
+            WorkerManager::new().0,
+        )));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("read test server address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve test app");
+        });
+        let client = reqwest::Client::new();
+        let auth = format!("tma {}", fresh_init_data(279_058_397));
+        let fetch = |query: &'static str| {
+            let client = client.clone();
+            let auth = auth.clone();
+            async move {
+                let response = client
+                    .get(format!("http://{addr}/api/threads{query}"))
+                    .header(AUTHORIZATION, &auth)
+                    .send()
+                    .await
+                    .expect("request thread list");
+                let status = response.status();
+                let body: serde_json::Value = response.json().await.unwrap_or_default();
+                (status, body)
+            }
+        };
+        let flags = |body: &serde_json::Value| -> Vec<(String, bool)> {
+            body["threads"]
+                .as_array()
+                .expect("threads array")
+                .iter()
+                .map(|t| {
+                    (
+                        t["id"].as_str().unwrap().to_string(),
+                        t["is_worker"].as_bool().unwrap(),
+                    )
+                })
+                .collect()
+        };
+
+        let (status, all) = fetch("").await;
+        assert_eq!(status, StatusCode::OK);
+        let all = flags(&all);
+        assert!(all.contains(&(worker_id.clone(), true)), "{all:?}");
+        assert!(all.contains(&(orchestrator_id.clone(), false)), "{all:?}");
+
+        let (status, workers) = fetch("?kind=workers").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(flags(&workers), vec![(worker_id, true)]);
+
+        let (status, _) = fetch("?kind=bogus").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
 
         server.abort();
         drop(home);

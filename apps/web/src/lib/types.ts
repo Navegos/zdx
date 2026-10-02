@@ -86,7 +86,12 @@ export interface ThreadListItem {
   telegram_link: string | null;
   /** Worker counts when this thread is an orchestrator, else null. */
   workers: WorkerRollup | null;
+  /** Whether this thread is an orchestrator worker. Drives the `worker` badge. */
+  is_worker: boolean;
 }
+
+/** `/api/threads?kind=` filter: every top-level thread, or workers only. */
+export type ThreadListKind = "all" | "workers";
 
 /** Worker counts for one orchestrator. `failed` is its own bucket on purpose:
  *  it is the state the reader has to act on, so it is never folded into

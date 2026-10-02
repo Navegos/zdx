@@ -463,8 +463,11 @@ enum ThreadCommands {
     /// Lists saved threads
     List {
         /// Include child runs (subagents/helpers) normally hidden from the list
-        #[arg(long)]
+        #[arg(long, conflicts_with = "workers")]
         all: bool,
+        /// List only orchestrator worker threads
+        #[arg(long)]
+        workers: bool,
     },
     /// Shows a specific thread
     Show {
@@ -1425,7 +1428,7 @@ fn dispatch_service(command: ServiceCommands, context: &DispatchContext<'_>) -> 
 
 async fn dispatch_threads(command: ThreadCommands, context: &DispatchContext<'_>) -> Result<()> {
     match command {
-        ThreadCommands::List { all } => commands::threads::list(all),
+        ThreadCommands::List { all, workers } => commands::threads::list(all, workers),
         ThreadCommands::Show { id } => commands::threads::show(&id, context.config),
         ThreadCommands::Inspect { id, json } => commands::threads::inspect(&id, json),
         ThreadCommands::Resume { id } => commands::threads::resume(id, context.config).await,

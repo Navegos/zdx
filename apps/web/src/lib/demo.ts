@@ -50,6 +50,17 @@ export const demoThreads: ThreadListResponse = {
       age: "4m",
       telegram_link: "https://t.me/c/1234567890/18012",
       workers: { total: 5, running: 1, queued: 1, failed: 1, settled: 1, unknown: 1 },
+      is_worker: false,
+    },
+    {
+      id: "6a1c0b52-2f4e-4c55-9a7e-0e3b6f1d9c21",
+      title: "Fix flaky retry test",
+      root_path: "/home/dev/projects/service-api",
+      project: "service-api",
+      age: "6m",
+      telegram_link: null,
+      workers: null,
+      is_worker: true,
     },
     {
       id: "telegram--1002345678901-topic-412",
@@ -59,6 +70,7 @@ export const demoThreads: ThreadListResponse = {
       age: "3h",
       telegram_link: "https://t.me/c/2345678901/412",
       workers: null,
+      is_worker: false,
     },
     {
       id: "3d6f20e3-78d4-4d1f-9f8e-4d442f3bba31",
@@ -68,6 +80,7 @@ export const demoThreads: ThreadListResponse = {
       age: "2d",
       telegram_link: null,
       workers: null,
+      is_worker: false,
     },
   ],
 };

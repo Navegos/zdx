@@ -290,7 +290,11 @@ fn load_threads(options: &ThreadBrowseOptions) -> Vec<ThreadInfo> {
                 .map(Path::new)
                 .and_then(Path::file_name)
                 .map(|name| name.to_string_lossy().to_string()),
-            badge: thread_badge(row.origin_kind.as_deref(), row.subagent_name.as_deref()),
+            badge: thread_badge(
+                row.origin_kind.as_deref(),
+                row.subagent_name.as_deref(),
+                row.parent_thread_id.as_deref(),
+            ),
             modified: row
                 .modified
                 .map(|t| {
@@ -303,9 +307,17 @@ fn load_threads(options: &ThreadBrowseOptions) -> Vec<ThreadInfo> {
         .collect()
 }
 
-/// Short label for a thread's run kind: the named subagent for `subagent`
-/// runs, the suffix for `helper:*` runs, `None` for top-level threads.
-fn thread_badge(origin_kind: Option<&str>, subagent_name: Option<&str>) -> Option<String> {
+/// Short label for a thread's run kind: `worker` for orchestrator workers,
+/// the named subagent for `subagent` runs, the suffix for `helper:*` runs,
+/// `None` for other top-level threads.
+fn thread_badge(
+    origin_kind: Option<&str>,
+    subagent_name: Option<&str>,
+    parent_thread_id: Option<&str>,
+) -> Option<String> {
+    if thread_persistence::is_worker_lineage(origin_kind, parent_thread_id) {
+        return Some("worker".to_string());
+    }
     match origin_kind? {
         "subagent" => Some(subagent_name.unwrap_or("subagent").to_string()),
         kind => Some(kind.strip_prefix("helper:").unwrap_or(kind).to_string()),

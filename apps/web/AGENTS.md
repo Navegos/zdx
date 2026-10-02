@@ -73,7 +73,10 @@ has been removed.
   threads and plain DMs have no linkable topic, so they show the in-app open only. A row whose
   `workers` roll-up is non-null is an orchestrator: it gets an `orch` badge and a counts line. Keep
   that line in normal block flow — it is long enough to need two lines on a phone, and `truncate`
-  (or a single flex child, which cannot break) clips it mid-word.
+  (or a single flex child, which cannot break) clips it mid-word. An `All` / `Workers` chip row
+  filters server-side (`api.threads("workers")` → `/api/threads?kind=workers`); rows with
+  `is_worker` get a `worker` badge. The worker rule lives in the engine — never re-derive it here
+  from `parent`/`origin` fields.
 
 ## Transcript rendering
 

@@ -58,14 +58,23 @@ pub struct ToolsCommandOptions {
     pub json: bool,
 }
 
-pub fn list(include_children: bool) -> Result<()> {
-    let threads = if include_children {
+pub fn list(include_children: bool, workers_only: bool) -> Result<()> {
+    let threads = if workers_only {
+        thread_persistence::list_recent_workers(usize::MAX).context("list worker threads")?
+    } else if include_children {
         thread_persistence::list_all_threads_cached().context("list threads")?
     } else {
         thread_persistence::list_threads().context("list threads")?
     };
     if threads.is_empty() {
-        println!("No threads found.");
+        println!(
+            "{}",
+            if workers_only {
+                "No worker threads found."
+            } else {
+                "No threads found."
+            }
+        );
     } else {
         for info in threads {
             let modified_str = info
@@ -73,18 +82,28 @@ pub fn list(include_children: bool) -> Result<()> {
                 .and_then(thread_persistence::format_timestamp)
                 .unwrap_or_else(|| "unknown".to_string());
             let display_title = info.display_title();
-            let origin = info
-                .origin_kind
-                .as_deref()
-                .map_or_else(String::new, |kind| match info.parent_thread_id.as_deref() {
-                    Some(parent) => {
+            let origin = if info.is_worker() {
+                info.parent_thread_id
+                    .as_deref()
+                    .map_or_else(String::new, |parent| {
                         format!(
-                            "  [{kind} ← {}]",
+                            "  [worker ← {}]",
                             thread_persistence::short_thread_id(parent)
                         )
-                    }
-                    None => format!("  [{kind}]"),
-                });
+                    })
+            } else {
+                info.origin_kind
+                    .as_deref()
+                    .map_or_else(String::new, |kind| match info.parent_thread_id.as_deref() {
+                        Some(parent) => {
+                            format!(
+                                "  [{kind} ← {}]",
+                                thread_persistence::short_thread_id(parent)
+                            )
+                        }
+                        None => format!("  [{kind}]"),
+                    })
+            };
             println!("{display_title}  {}  {modified_str}{origin}", info.id);
         }
     }

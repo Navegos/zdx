@@ -6,6 +6,7 @@ import type {
   GitResponse,
   GitScopeResponse,
   MonitorResponse,
+  ThreadListKind,
   ThreadListResponse,
   ThreadResponse,
   ThreadTrajectoryReport,
@@ -111,12 +112,16 @@ export function formatBytes(bytes: number): string {
 }
 
 export const api = {
-  threads: async () => {
+  threads: async (kind: ThreadListKind = "all") => {
     if (import.meta.env.DEV) {
       const demo = await import("./demo");
-      if (demo.demoEnabled()) return demo.demoThreads;
+      if (demo.demoEnabled()) {
+        return kind === "workers"
+          ? { threads: demo.demoThreads.threads.filter((t) => t.is_worker) }
+          : demo.demoThreads;
+      }
     }
-    return get<ThreadListResponse>("/api/threads");
+    return get<ThreadListResponse>("/api/threads", kind === "all" ? {} : { kind });
   },
 
   thread: async (id: string, after?: number) => {

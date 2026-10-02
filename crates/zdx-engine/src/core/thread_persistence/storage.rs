@@ -797,6 +797,23 @@ impl ThreadSummary {
     pub fn is_child_run(&self) -> bool {
         self.origin_kind.is_some()
     }
+
+    /// Whether this thread is an orchestrator worker. Must match
+    /// `thread_index::WORKER_SQL`.
+    pub fn is_worker(&self) -> bool {
+        is_worker_lineage(
+            self.origin_kind.as_deref(),
+            self.parent_thread_id.as_deref(),
+        )
+    }
+}
+
+/// The canonical worker rule: a top-level thread (no `origin_kind`) that
+/// records a parent. Only `WorkerManager::create_worker` writes that shape;
+/// subagent and helper runs set `origin_kind` alongside their parent.
+#[must_use]
+pub fn is_worker_lineage(origin_kind: Option<&str>, parent_thread_id: Option<&str>) -> bool {
+    origin_kind.is_none() && parent_thread_id.is_some()
 }
 
 /// One thread `.jsonl` file with its filesystem metadata. This is a cheap
@@ -939,6 +956,27 @@ pub fn list_recent_threads(limit: usize) -> Result<Vec<ThreadSummary>> {
             let mut threads = list_threads_scan()?;
             threads.truncate(limit);
             Ok(threads)
+        }
+    }
+}
+
+/// Lists at most `limit` orchestrator worker threads, newest first.
+///
+/// Prefers the derived cache, where the worker rule, ordering, and limit run
+/// in SQL; the file-scan fallback applies [`ThreadSummary::is_worker`].
+///
+/// # Errors
+/// Returns an error if the threads directory cannot be read.
+pub fn list_recent_workers(limit: usize) -> Result<Vec<ThreadSummary>> {
+    match crate::core::thread_index::list_recent_workers_cached(limit) {
+        Ok(threads) => Ok(threads),
+        Err(err) => {
+            tracing::debug!(error = %format!("{err:#}"), "thread index unavailable; using file scan");
+            Ok(list_all_threads()?
+                .into_iter()
+                .filter(ThreadSummary::is_worker)
+                .take(limit)
+                .collect())
         }
     }
 }

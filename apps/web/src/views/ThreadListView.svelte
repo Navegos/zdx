@@ -1,6 +1,6 @@
 <script lang="ts">
   import { api, ApiError } from "$lib/api";
-  import type { ThreadListItem } from "$lib/types";
+  import type { ThreadListItem, ThreadListKind } from "$lib/types";
   import { router } from "$lib/router.svelte";
   import { haptic, openTelegramLink, selectionChanged } from "$lib/telegram";
   import { formatRollup } from "$lib/workers";
@@ -11,25 +11,41 @@
 
   let { onmenu }: Props = $props();
 
+  const FILTERS: { kind: ThreadListKind; label: string }[] = [
+    { kind: "all", label: "All" },
+    { kind: "workers", label: "Workers" },
+  ];
+
   let threads = $state<ThreadListItem[]>([]);
   let error = $state("");
   let loading = $state(true);
+  let kind = $state<ThreadListKind>("all");
 
   async function load(showSpinner = true) {
     if (showSpinner) loading = true;
     error = "";
+    const requested = kind;
     try {
-      threads = (await api.threads()).threads;
+      const list = (await api.threads(requested)).threads;
+      // A slower response for a filter the reader already left must not
+      // overwrite the current one.
+      if (requested === kind) threads = list;
     } catch (e) {
-      error = e instanceof ApiError ? e.message : String(e);
+      if (requested === kind) error = e instanceof ApiError ? e.message : String(e);
     } finally {
-      loading = false;
+      if (requested === kind) loading = false;
     }
   }
 
   $effect(() => {
     load();
   });
+
+  function selectKind(next: ThreadListKind) {
+    if (next === kind) return;
+    selectionChanged();
+    kind = next;
+  }
 
   function open(thread: ThreadListItem) {
     selectionChanged();
@@ -92,6 +108,20 @@
   </button>
 </header>
 
+<div class="flex shrink-0 gap-1.5 border-b border-border px-3 py-2" role="group" aria-label="Filter threads">
+  {#each FILTERS as filter (filter.kind)}
+    <button
+      type="button"
+      onclick={() => selectKind(filter.kind)}
+      aria-pressed={kind === filter.kind}
+      class="chip"
+      class:chip-active={kind === filter.kind}
+    >
+      {filter.label}
+    </button>
+  {/each}
+</div>
+
 <div class="scroll-area flex-1 px-3 py-3">
   {#if loading}
     <p class="py-8 text-center text-xs text-muted-foreground">Loading…</p>
@@ -99,7 +129,7 @@
     <p class="rounded-md border border-destructive px-3 py-2 text-xs text-destructive">{error}</p>
   {:else if threads.length === 0}
     <p class="rounded-md border border-border bg-card px-2.5 py-2 text-xs text-muted-foreground">
-      No saved threads yet.
+      {kind === "workers" ? "No worker threads yet." : "No saved threads yet."}
     </p>
   {:else}
     <div class="mx-auto flex max-w-3xl flex-col gap-1.5 pb-6">
@@ -114,6 +144,9 @@
               <span class="min-w-0 flex-1 truncate text-xs font-medium">{thread.title}</span>
               {#if thread.workers}
                 <span class="badge shrink-0">orch</span>
+              {/if}
+              {#if thread.is_worker}
+                <span class="badge shrink-0">worker</span>
               {/if}
               {#if thread.age}
                 <span class="shrink-0 font-mono text-xxs text-muted-foreground">{thread.age}</span>
@@ -175,5 +208,20 @@
     font-size: 0.5625rem;
     letter-spacing: 0.06em;
     text-transform: uppercase;
+  }
+
+  .chip {
+    padding: 0.125rem 0.625rem;
+    border-radius: 999px;
+    border: 1px solid var(--color-border);
+    background: var(--color-card);
+    color: var(--color-muted-foreground);
+    font-size: 0.6875rem;
+  }
+
+  .chip-active {
+    border-color: color-mix(in srgb, var(--color-brand) 40%, transparent);
+    background: color-mix(in srgb, var(--color-brand) 8%, transparent);
+    color: var(--color-brand);
   }
 </style>
