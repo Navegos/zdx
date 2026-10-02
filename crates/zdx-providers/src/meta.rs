@@ -171,7 +171,7 @@ impl MetaClient {
                 config.reasoning_effort,
                 config.reasoning_summary,
             ),
-            http: reqwest::Client::new(),
+            http: crate::shared::streaming_http_client(),
         }
     }
 

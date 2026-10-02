@@ -102,7 +102,7 @@ impl ClaudeCliClient {
     pub fn new(config: ClaudeCliConfig) -> Self {
         Self {
             config,
-            http: reqwest::Client::new(),
+            http: crate::shared::streaming_http_client(),
         }
     }
 

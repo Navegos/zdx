@@ -1245,6 +1245,7 @@ async fn run_turn_inner(
     let mut model_turn: u32 = 0;
     let model_reads_images =
         crate::models::model_reads_images(&config.providers, &setup.provider, &setup.model);
+    let stream_idle_timeout = config.stream_idle_timeout();
 
     loop {
         ensure_not_interrupted(None, cancel).map_err(|e| (e, messages.clone()))?;
@@ -1297,6 +1298,7 @@ async fn run_turn_inner(
                         &setup.tools,
                         system_prompt,
                         cancel,
+                        stream_idle_timeout,
                     )
                     .await
                     {
@@ -1309,6 +1311,7 @@ async fn run_turn_inner(
                                 &setup.model,
                                 &setup.provider,
                                 request_start,
+                                stream_idle_timeout,
                             )
                             .await
                             {
@@ -2107,6 +2110,7 @@ async fn request_stream(
     tools: &[ToolDefinition],
     system_prompt: Option<&str>,
     cancel: Option<&CancellationToken>,
+    idle_timeout: Option<Duration>,
 ) -> TurnResult<ProviderStream> {
     let stream_result = tokio::select! {
         biased;
@@ -2116,12 +2120,34 @@ async fn request_stream(
         () = wait_for_cancel(cancel) => {
             return Err(TurnError::interrupted(None));
         }
+        () = sleep_or_pending(idle_timeout) => {
+            let limit = idle_timeout.unwrap_or_default();
+            tracing::warn!(idle_secs = limit.as_secs(), "Provider request stalled before the stream opened");
+            return Err(TurnError::Provider(stream_idle_error(limit)));
+        }
         result = client.stream_messages(messages, tools, system_prompt) => result,
     };
     match stream_result {
         Ok(stream) => Ok(stream),
         Err(err) => Err(TurnError::from_anyhow(err)),
     }
+}
+
+/// Sleeps for `limit`, or never when there is no limit.
+async fn sleep_or_pending(limit: Option<Duration>) {
+    match limit {
+        Some(limit) => tokio::time::sleep(limit).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Retryable timeout for a provider request that made no content progress
+/// within `limit`.
+fn stream_idle_error(limit: Duration) -> crate::providers::ProviderError {
+    crate::providers::ProviderError::timeout(format!(
+        "Provider stream stalled: no output for {}s",
+        limit.as_secs()
+    ))
 }
 
 async fn wait_for_retry_delay(
@@ -2139,6 +2165,7 @@ async fn wait_for_retry_delay(
 /// Consumes a provider stream. On error, returns the accumulated `StreamState`
 /// alongside the error so the caller can decide whether a transparent retry is
 /// safe (i.e. nothing externally visible or persisted has been emitted yet).
+#[allow(clippy::too_many_arguments)]
 async fn consume_stream_with_start(
     mut stream: ProviderStream,
     prior_messages: &[ChatMessage],
@@ -2147,6 +2174,7 @@ async fn consume_stream_with_start(
     model: &str,
     provider: &str,
     request_start: RequestSpanStart,
+    idle_timeout: Option<Duration>,
 ) -> std::result::Result<StreamState, (TurnError, StreamState)> {
     let RequestSpanStart {
         instant: request_started_at,
@@ -2156,6 +2184,10 @@ async fn consume_stream_with_start(
     state.provider = provider.to_string();
     state.request_started_at = request_started_at;
     state.request_started_at_wall = request_started_at_wall;
+    // One no-progress budget per request: the wait for the stream to open
+    // counts against it. Tokio's clock, so paused-time tests can drive it.
+    let now = tokio::time::Instant::now();
+    let mut last_progress = now.checked_sub(request_started_at.elapsed()).unwrap_or(now);
 
     loop {
         if interrupt::is_interrupted() || cancel.is_some_and(CancellationToken::is_cancelled) {
@@ -2165,8 +2197,26 @@ async fn consume_stream_with_start(
             let turn = std::mem::take(&mut state.turn);
             return Err((interrupted_turn_from_stream(prior_messages, turn), state));
         }
+        // Checked on every pass, not only on a quiet poll, so a stream that
+        // pings faster than the poll interval still trips it.
+        if let Some(limit) = idle_timeout
+            && last_progress.elapsed() >= limit
+        {
+            tracing::warn!(
+                elapsed_ms = request_started_at.elapsed().as_millis(),
+                idle_secs = limit.as_secs(),
+                visible = state.emitted_visible_content,
+                "Provider stream stalled"
+            );
+            return Err((TurnError::Provider(stream_idle_error(limit)), state));
+        }
         let event = match timeout(STREAM_POLL_TIMEOUT, stream.next()).await {
-            Ok(Some(Ok(event))) => event,
+            Ok(Some(Ok(event))) => {
+                if !matches!(event, StreamEvent::Ping) {
+                    last_progress = tokio::time::Instant::now();
+                }
+                event
+            }
             Ok(Some(Err(err))) => {
                 tracing::warn!(
                     elapsed_ms = request_started_at.elapsed().as_millis(),
@@ -2233,6 +2283,7 @@ async fn consume_stream(
             instant: request_started_at,
             wall: crate::core::thread_persistence::chrono_timestamp(),
         },
+        None,
     )
     .await
 }
@@ -4660,6 +4711,210 @@ mod tests {
             can_transparently_retry_stream(&state),
             "transport error before any emitted events must remain retry-safe"
         );
+    }
+
+    /// Runs `consume_stream_with_start` with a no-progress limit.
+    async fn consume_with_idle(
+        stream: ProviderStream,
+        cancel: Option<&CancellationToken>,
+        idle: Duration,
+    ) -> std::result::Result<StreamState, (TurnError, StreamState)> {
+        let (tx, _rx) = create_event_channel();
+        let sender = EventSender::new(tx);
+        consume_stream_with_start(
+            stream,
+            &[],
+            &sender,
+            cancel,
+            "",
+            "",
+            RequestSpanStart {
+                instant: Instant::now(),
+                wall: crate::core::thread_persistence::chrono_timestamp(),
+            },
+            Some(idle),
+        )
+        .await
+    }
+
+    fn reasoning_events() -> Vec<crate::providers::ProviderResult<StreamEvent>> {
+        vec![
+            Ok(StreamEvent::ContentBlockStart {
+                index: 0,
+                block_type: ContentBlockType::Reasoning,
+                id: None,
+                name: None,
+                data: None,
+                id_origin: None,
+            }),
+            Ok(StreamEvent::ReasoningDelta {
+                index: 0,
+                reasoning: "thinking".to_string(),
+            }),
+        ]
+    }
+
+    fn assert_stall_error(err: &TurnError) {
+        assert!(
+            matches!(
+                err,
+                TurnError::Provider(p)
+                    if p.kind == crate::providers::ProviderErrorKind::Timeout
+                        && p.is_retryable()
+                        && p.message.contains("stalled")
+            ),
+            "expected a retryable stall timeout, got {err:?}"
+        );
+    }
+
+    /// The 2026-10 incident shape: output arrives, then the stream goes
+    /// silent without closing. The turn must end with a stall error instead of
+    /// waiting forever, and because output was already shown it must not be
+    /// retried transparently.
+    #[tokio::test(start_paused = true)]
+    async fn stream_idle_timeout_ends_a_stream_that_stalls_after_output() {
+        use futures_util::stream;
+
+        let started = tokio::time::Instant::now();
+        let provider_stream: ProviderStream =
+            Box::pin(stream::iter(reasoning_events()).chain(stream::pending()));
+
+        let result = consume_with_idle(provider_stream, None, Duration::from_mins(5)).await;
+
+        let Err((err, state)) = result else {
+            panic!("a stalled stream must fail");
+        };
+        assert_stall_error(&err);
+        assert!(started.elapsed() >= Duration::from_mins(5));
+        assert!(started.elapsed() < Duration::from_secs(301));
+        assert!(
+            !can_transparently_retry_stream(&state),
+            "output was already emitted, so the stall must not be retried transparently"
+        );
+    }
+
+    /// Keepalive pings are not progress: a stream that only pings (faster
+    /// than the poll interval) still trips the limit, and since nothing was
+    /// shown it stays eligible for the transparent retry.
+    #[tokio::test(start_paused = true)]
+    async fn stream_idle_timeout_ignores_keepalive_pings() {
+        use futures_util::stream;
+
+        let started = tokio::time::Instant::now();
+        let pings = stream::unfold((), |()| async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            Some((Ok(StreamEvent::Ping), ()))
+        });
+        let provider_stream: ProviderStream = Box::pin(pings);
+
+        let result = consume_with_idle(provider_stream, None, Duration::from_mins(1)).await;
+
+        let Err((err, state)) = result else {
+            panic!("a ping-only stream must fail");
+        };
+        assert_stall_error(&err);
+        assert!(started.elapsed() >= Duration::from_mins(1));
+        assert!(started.elapsed() < Duration::from_secs(61));
+        assert!(can_transparently_retry_stream(&state));
+    }
+
+    /// A healthy stream that keeps producing content runs far past the limit:
+    /// the limit bounds silence between progress, not total duration.
+    #[tokio::test(start_paused = true)]
+    async fn stream_idle_timeout_allows_long_streams_that_keep_progressing() {
+        use futures_util::stream;
+
+        let started = tokio::time::Instant::now();
+        let deltas = stream::unfold(0u32, |n| async move {
+            if n == 40 {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_secs(50)).await;
+            let event = if n == 0 {
+                StreamEvent::ContentBlockStart {
+                    index: 0,
+                    block_type: ContentBlockType::Text,
+                    id: None,
+                    name: None,
+                    data: None,
+                    id_origin: None,
+                }
+            } else {
+                StreamEvent::TextDelta {
+                    index: 0,
+                    text: format!("part {n}\n"),
+                }
+            };
+            Some((Ok(event), n + 1))
+        });
+        let provider_stream: ProviderStream = Box::pin(deltas);
+
+        let result = consume_with_idle(provider_stream, None, Duration::from_mins(1)).await;
+
+        assert!(result.is_ok(), "healthy stream must not time out");
+        assert!(started.elapsed() >= Duration::from_secs(2000));
+    }
+
+    /// Cancelling during a stall ends the turn as interrupted right away, not
+    /// as a stall timeout after the limit.
+    #[tokio::test(start_paused = true)]
+    async fn stream_idle_timeout_yields_to_cancellation() {
+        use futures_util::stream;
+
+        let cancel = CancellationToken::new();
+        let trigger = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            trigger.cancel();
+        });
+        let started = tokio::time::Instant::now();
+        let provider_stream: ProviderStream =
+            Box::pin(stream::iter(reasoning_events()).chain(stream::pending()));
+
+        let result =
+            consume_with_idle(provider_stream, Some(&cancel), Duration::from_mins(5)).await;
+
+        let Err((err, _)) = result else {
+            panic!("cancelled stream must fail");
+        };
+        assert!(matches!(err, TurnError::Interrupted { .. }), "got {err:?}");
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    struct NeverOpens;
+
+    impl crate::providers::StreamingProvider for NeverOpens {
+        fn stream_messages<'a>(
+            &'a self,
+            _messages: &'a [ChatMessage],
+            _tools: &'a [ToolDefinition],
+            _system: Option<&'a str>,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = anyhow::Result<ProviderStream>> + Send + 'a>,
+        > {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    /// A request that never opens its stream (no response headers) fails with
+    /// the same retryable stall error instead of waiting forever.
+    #[tokio::test(start_paused = true)]
+    async fn stream_idle_timeout_bounds_a_request_that_never_opens() {
+        let started = tokio::time::Instant::now();
+        let Err(err) = request_stream(
+            &NeverOpens,
+            &[],
+            &[],
+            None,
+            None,
+            Some(Duration::from_mins(5)),
+        )
+        .await
+        else {
+            panic!("a request that never opens must fail");
+        };
+        assert_stall_error(&err);
+        assert!(started.elapsed() >= Duration::from_mins(5));
     }
 
     /// `MessageStart` only emits a usage tick, which is metadata-only: the UI

@@ -16,6 +16,7 @@ mod memory_relevance;
 mod opencode_go_headers;
 mod quota;
 mod service;
+mod stream_stall;
 mod thread_schema;
 mod threads_export;
 mod threads_list_show;

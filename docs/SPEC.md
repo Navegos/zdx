@@ -144,6 +144,13 @@ ZDX solves this with a boring, reliable core:
 - Structured transport kind, HTTP status, and provider code/type take precedence. Text matching is used only for unknown or unstructured provider/gateway errors.
 - Once visible output or tool activity begins, provider failures stop the turn instead of transparently retrying and risking duplicate output or tool execution.
 
+### Stalled streams
+
+- A provider request that makes no content progress for `stream_idle_timeout_secs` (default 300; `0` disables) fails with a `timeout` provider error: "Provider stream stalled: no output for Ns". The budget starts when the request is sent, so a stream that never opens counts too.
+- Any stream event except a keepalive ping is progress and resets the budget. Pings do not, so a proxy that keeps pinging cannot hide a silent generation. The limit bounds silence, not total duration: a long answer that keeps streaming is never cut off.
+- The stall error follows the retry rules above: before visible output it is retried transparently (each attempt gets a fresh budget, at most three retries); after visible output it ends the turn.
+- Streaming HTTP clients also set a 30s connect timeout and a 20-minute per-read timeout as a transport backstop. There is no total request timeout.
+
 ---
 
 ## 8) Threads

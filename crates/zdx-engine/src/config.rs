@@ -980,6 +980,11 @@ pub struct Config {
     /// frontmatter kills, and it suppresses the handoff entirely.
     pub bash_foreground_bound_secs: u32,
 
+    /// Seconds a provider request may go without content progress before it
+    /// fails with a retryable timeout (0 disables). Keepalive pings do not
+    /// count as progress, so a stream that only pings still trips it.
+    pub stream_idle_timeout_secs: u32,
+
     /// Provider configuration (base URLs, etc.).
     #[serde(default)]
     pub providers: ProvidersConfig,
@@ -1095,6 +1100,9 @@ impl Config {
     /// Foreground commands are relocated, not killed, so this can be a short
     /// bound: it only decides how long the model waits inline.
     const DEFAULT_BASH_FOREGROUND_BOUND_SECS: u32 = 120;
+    /// Five minutes of silence: above nearly every healthy first token in
+    /// real threads, far below the 2h hang it exists to stop.
+    const DEFAULT_STREAM_IDLE_TIMEOUT_SECS: u32 = 300;
     const DEFAULT_HANDOFF_MODEL: &str = "gemini:gemini-3-flash-preview";
     const DEFAULT_TITLE_MODEL: &str = "gemini:gemini-3.1-flash-lite-preview";
     const DEFAULT_READ_THREAD_MODEL: &str = "gemini:gemini-3.1-flash-lite-preview";
@@ -1792,6 +1800,14 @@ impl Config {
         }
     }
 
+    /// How long a provider request may go without content progress. `None`
+    /// disables the limit.
+    #[must_use]
+    pub fn stream_idle_timeout(&self) -> Option<Duration> {
+        (self.stream_idle_timeout_secs > 0)
+            .then(|| Duration::from_secs(u64::from(self.stream_idle_timeout_secs)))
+    }
+
     /// Returns the path to the models file.
     /// Defaults to `<base>/models.toml`.
     pub fn models_path(&self) -> std::path::PathBuf {
@@ -1996,6 +2012,7 @@ impl Default for Config {
             system_prompt: None,
             system_prompt_file: None,
             bash_foreground_bound_secs: Self::DEFAULT_BASH_FOREGROUND_BOUND_SECS,
+            stream_idle_timeout_secs: Self::DEFAULT_STREAM_IDLE_TIMEOUT_SECS,
             providers: ProvidersConfig::default(),
             goals: GoalsConfig::default(),
             handoff_model: Self::DEFAULT_HANDOFF_MODEL.to_string(),

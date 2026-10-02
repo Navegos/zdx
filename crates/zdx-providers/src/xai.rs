@@ -109,7 +109,7 @@ impl XaiClient {
                 truncation: None,
                 service_tier: None,
             },
-            http: reqwest::Client::new(),
+            http: crate::shared::streaming_http_client(),
         }
     }
 

@@ -90,7 +90,7 @@ impl MuseCodeClient {
                 reasoning_summary,
             ),
             account,
-            http: reqwest::Client::new(),
+            http: crate::shared::streaming_http_client(),
         }
     }
 

@@ -1,5 +1,7 @@
 //! Provider-agnostic shared helpers. Pure value types live in `zdx_types`.
 
+use std::time::Duration;
+
 use anyhow::{Context, Result};
 use eventsource_stream::EventStreamError;
 use reqwest::header::HeaderValue;
@@ -16,6 +18,30 @@ pub use zdx_types::{
 /// Used by all API-key providers for identification. OAuth providers
 /// use mimicked User-Agents for compatibility.
 pub const USER_AGENT: &str = concat!("zdx/", env!("CARGO_PKG_VERSION"));
+
+/// Connect ceiling for streaming model requests.
+const STREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Per-read ceiling for streaming model requests, reset by every byte that
+/// arrives (keepalive pings included). A backstop for a socket that goes
+/// silent, also when the engine's no-progress limit is disabled; it sits
+/// above that limit's 5-minute default so the clearer stall error fires first. There is deliberately no total timeout:
+/// healthy streams can run longer than any fixed bound.
+const STREAM_READ_TIMEOUT: Duration = Duration::from_mins(20);
+
+/// HTTP client for streaming model requests, with connect and per-read
+/// timeouts but no total request timeout.
+#[must_use]
+pub fn streaming_http_client() -> reqwest::Client {
+    build_streaming_http_client(STREAM_CONNECT_TIMEOUT, STREAM_READ_TIMEOUT)
+}
+
+fn build_streaming_http_client(connect: Duration, read: Duration) -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(connect)
+        .read_timeout(read)
+        .build()
+        .expect("TLS backend must initialize, as for reqwest::Client::new")
+}
 
 /// Parses a string into an HTTP header value, returning a contextual error
 /// instead of silently substituting an empty value when the input contains
@@ -275,6 +301,62 @@ mod request_log_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A socket that delivers the headers and one chunk, then goes silent,
+    /// must end in a retryable error once the per-read timeout elapses, not
+    /// hang. A total request timeout would also stop it, but would cut off
+    /// healthy long streams, so this pins the per-read backstop instead.
+    #[tokio::test]
+    async fn streaming_client_read_timeout_ends_a_silent_body() {
+        use eventsource_stream::Eventsource as _;
+        use futures_util::StreamExt as _;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = socket.read(&mut buf).await.unwrap();
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                      transfer-encoding: chunked\r\n\r\n\
+                      16\r\nevent: ping\ndata: {}\n\n\r\n",
+                )
+                .await
+                .unwrap();
+            // Hold the connection open without writing anything else.
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            drop(socket);
+        });
+
+        let client =
+            build_streaming_http_client(Duration::from_secs(5), Duration::from_millis(300));
+        let response = client
+            .get(format!("http://{address}/v1/messages"))
+            .send()
+            .await
+            .unwrap();
+        // Same shape as the providers: SSE parsed over the byte stream.
+        let mut events = response.bytes_stream().eventsource();
+        let first = events.next().await.unwrap().unwrap();
+        assert_eq!(first.event, "ping");
+
+        let started = std::time::Instant::now();
+        let err = tokio::time::timeout(Duration::from_secs(5), events.next())
+            .await
+            .expect("silent body must not hang past the read timeout")
+            .expect("stream should yield an error, not end")
+            .unwrap_err();
+        assert!(started.elapsed() >= Duration::from_millis(250));
+        let EventStreamError::Transport(raw) = &err else {
+            panic!("expected a transport error: {err:?}");
+        };
+        assert!(raw.is_timeout(), "expected a read timeout: {raw:?}");
+        assert!(map_event_stream_error(err).is_retryable());
+        server.abort();
+    }
 
     #[test]
     fn test_merge_system_prompt_passthrough() {

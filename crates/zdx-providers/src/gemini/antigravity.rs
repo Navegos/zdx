@@ -94,7 +94,7 @@ impl AntigravityClient {
     pub fn new(config: AntigravityConfig) -> Self {
         Self {
             config,
-            http: reqwest::Client::new(),
+            http: crate::shared::streaming_http_client(),
             prompt_seq: AtomicU32::new(0),
         }
     }

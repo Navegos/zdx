@@ -24,7 +24,7 @@ Scope: CLI argument parsing/router, subcommands, and interactive/exec mode entry
 - `src/cli/commands/worktree.rs`: worktree command handler
 - `src/modes/exec.rs`: non-interactive streaming mode
 - `src/modes/mod.rs`: mode exports (exec + feature-gated TUI)
-- `tests/integration/`: CLI integration tests (`assert_cmd`, fixtures), aggregated into a single test binary via `tests/integration/main.rs`. Add new test files as `tests/integration/<name>.rs` and register them with `mod <name>;` in `main.rs` (for example `threads_export.rs` covers `zdx threads export`, `exec_subagent.rs` covers `zdx exec --subagent`, `service.rs` covers `zdx service status`/target validation without mutating launchd).
+- `tests/integration/`: CLI integration tests (`assert_cmd`, fixtures), aggregated into a single test binary via `tests/integration/main.rs`. Add new test files as `tests/integration/<name>.rs` and register them with `mod <name>;` in `main.rs` (for example `threads_export.rs` covers `zdx threads export`, `exec_subagent.rs` covers `zdx exec --subagent`, `service.rs` covers `zdx service status`/target validation without mutating launchd, `stream_stall.rs` covers stalled-stream timeouts, including a stalled `invoke_subagent` child, against a raw TCP mock that can hold a socket open).
 
 ## Conventions
 

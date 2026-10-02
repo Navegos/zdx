@@ -92,7 +92,7 @@ impl OpenAIClient {
         });
         Self {
             config,
-            http: reqwest::Client::new(),
+            http: crate::shared::streaming_http_client(),
             ws,
         }
     }

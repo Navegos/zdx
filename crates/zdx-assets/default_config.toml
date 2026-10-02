@@ -22,6 +22,11 @@ tldr_model = "gemini:gemini-3.1-flash-lite-preview"
 prompt_builder_model = "openai:gpt-5.6-terra@low"
 bash_foreground_bound_secs = 120
 
+# Seconds a model request may go without content progress (keepalive pings do
+# not count) before it fails as stalled and follows the normal retry rules.
+# 0 disables the limit.
+stream_idle_timeout_secs = 300
+
 # System prompt (inline)
 # system_prompt = "You are a helpful coding assistant."
 
