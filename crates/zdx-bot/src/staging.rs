@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use serde_json::json;
+use zdx_engine::config::{Config, ThinkingLevel};
 use zdx_engine::core::handoff_generation::{build_side_thread_seed, generate_handoff};
 use zdx_engine::core::prompt_builder_generation::generate_prompt_builder;
 use zdx_engine::core::thread_persistence;
@@ -819,10 +820,6 @@ async fn seed_new_topic(
     profile: Option<&str>,
     model_override: Option<String>,
 ) -> Result<()> {
-    let source_profile = thread_persistence::read_persistent_profile(source_thread_id)
-        .ok()
-        .flatten();
-
     let topic_name = chrono::Utc::now()
         .format(&format!("{topic_prefix} %Y-%m-%d %H:%M"))
         .to_string();
@@ -836,24 +833,13 @@ async fn seed_new_topic(
         .create_forum_topic(chat_id, &topic_name)
         .await?;
 
-    let inherited_model = thread_persistence::read_thread_model_override(source_thread_id)
-        .ok()
-        .flatten();
-    let inherited_thinking = thread_persistence::read_thread_thinking_override(source_thread_id)
-        .ok()
-        .flatten();
-    let new_model = if let Some(picked) = model_override {
-        Some(picked)
-    } else if inherited_model.is_some() || inherited_thinking.is_some() {
-        let mut config = context.config_for_chat(chat_id);
-        if source_profile.as_deref() == Some(zdx_engine::subagents::ORCHESTRATOR_SUBAGENT_NAME) {
-            zdx_engine::subagents::apply_orchestrator_override(&mut config);
-        }
-        config.apply_thread_model_override(inherited_model.as_deref(), inherited_thinking);
-        Some(config.model)
-    } else {
-        None
-    };
+    // Without a pick, a model is pinned only when the source pinned one; an
+    // unpinned topic resolves its role's default on every turn, which is the
+    // same model `new_topic_model` reports.
+    let new_model = model_override.or_else(|| {
+        let start = new_topic_model(context, chat_id, source_thread_id, profile);
+        start.source_pinned.then_some(start.config.model)
+    });
     let new_thread_id = thread_id_for_chat(chat_id, Some(new_topic_id));
     let created = record_seeded_thread(&new_thread_id, source_thread_id, profile, new_model);
     if let Err(err) = created {
@@ -920,6 +906,81 @@ fn record_seeded_thread(
         thread.set_model_override(Some(model))?;
     }
     thread.set_pending_topic_title(true)
+}
+
+/// The model a staged topic starts with when nothing is picked on its card.
+struct NewTopicModel {
+    config: Config,
+    /// Whether the source thread pinned a model or thinking level (`/model`).
+    source_pinned: bool,
+}
+
+/// Resolves the starting model of a topic opened from `source_thread_id` as
+/// `profile`, before any pick. One rule feeds the card's model picker and the
+/// thread that is created, so the picker never shows a different model.
+fn new_topic_model(
+    context: &BotContext,
+    chat_id: i64,
+    source_thread_id: &str,
+    profile: Option<&str>,
+) -> NewTopicModel {
+    let source_profile = thread_persistence::read_persistent_profile(source_thread_id)
+        .ok()
+        .flatten();
+    let model = thread_persistence::read_thread_model_override(source_thread_id)
+        .ok()
+        .flatten();
+    let thinking = thread_persistence::read_thread_thinking_override(source_thread_id)
+        .ok()
+        .flatten();
+    layer_new_topic_model(
+        context.config_for_chat(chat_id),
+        HandoffRole::of_profile(source_profile.as_deref()),
+        HandoffRole::of_profile(profile),
+        model.as_deref(),
+        thinking,
+    )
+}
+
+/// A source that pinned its model hands on its own effective model, resolved
+/// in the source's role. An unpinned source hands on nothing, so the new topic
+/// starts on the default for its *own* role, which differs from the source's
+/// model when the handoff changes the role.
+fn layer_new_topic_model(
+    mut config: Config,
+    source_role: HandoffRole,
+    new_role: HandoffRole,
+    model_override: Option<&str>,
+    thinking_override: Option<ThinkingLevel>,
+) -> NewTopicModel {
+    let source_pinned = model_override.is_some() || thinking_override.is_some();
+    let role = if source_pinned { source_role } else { new_role };
+    if role == HandoffRole::Orchestrator {
+        zdx_engine::subagents::apply_orchestrator_override(&mut config);
+    }
+    config.apply_thread_model_override(model_override, thinking_override);
+    NewTopicModel {
+        config,
+        source_pinned,
+    }
+}
+
+/// The config a live staged command's new topic starts with before any pick:
+/// what its model picker shows as the starting model and resolves a pick
+/// against. Follows the `/handoff` card's current `Continue as:` role.
+pub(crate) fn staged_topic_config(
+    context: &BotContext,
+    chat_id: i64,
+    topic_id: Option<i64>,
+) -> Config {
+    let thread_id = session_thread_id(chat_id, topic_id);
+    let profile = {
+        let map = context.staging_map().lock().expect("staging lock poisoned");
+        map.get(&thread_id)
+            .and_then(|session| session.handoff_role)
+            .and_then(HandoffRole::profile)
+    };
+    new_topic_model(context, chat_id, &thread_id, profile).config
 }
 
 /// Generates the handoff context and opens the new topic immediately — no
@@ -1340,8 +1401,8 @@ mod tests {
 
     use super::{
         HandoffRole, STAGING_TTL, SessionInput, StagingCommand, StagingSession, ask_text,
-        btw_awaits_input, btw_record, classify_session_input, handoff_record, record_seeded_thread,
-        staging_keyboard, suggestion_preview,
+        btw_awaits_input, btw_record, classify_session_input, handoff_record,
+        layer_new_topic_model, record_seeded_thread, staging_keyboard, suggestion_preview,
     };
 
     fn session_created_at(created_at: Instant) -> StagingSession {
@@ -1615,6 +1676,61 @@ mod tests {
         assert!(
             !ask_text(StagingCommand::Goal, Some("openai:gpt-6@high")).contains("New topic model")
         );
+    }
+
+    /// The starting model shown by the staged picker follows the new role when
+    /// the source pinned nothing, and stays the source's pinned model when it did.
+    #[test]
+    fn new_topic_model_follows_the_new_role_unless_the_source_pinned_one() {
+        use zdx_engine::config::{Config, SubagentOverride, ThinkingLevel};
+
+        let mut base = Config {
+            model: "openai:agent-model@high".to_string(),
+            thinking_level: ThinkingLevel::High,
+            ..Default::default()
+        };
+        base.subagents.overrides.insert(
+            zdx_engine::subagents::ORCHESTRATOR_SUBAGENT_NAME.to_string(),
+            SubagentOverride {
+                model: Some("openai:orchestrator-model@low".to_string()),
+                thinking_level: Some(ThinkingLevel::Low),
+            },
+        );
+        let start = |source, new, model: Option<&str>, thinking| {
+            layer_new_topic_model(base.clone(), source, new, model, thinking)
+        };
+
+        let to_orchestrator = start(HandoffRole::Agent, HandoffRole::Orchestrator, None, None);
+        assert_eq!(
+            to_orchestrator.config.model,
+            "openai:orchestrator-model@low"
+        );
+        assert!(!to_orchestrator.source_pinned);
+
+        let to_agent = start(HandoffRole::Orchestrator, HandoffRole::Agent, None, None);
+        assert_eq!(to_agent.config.model, "openai:agent-model@high");
+        assert!(!to_agent.source_pinned);
+
+        let pinned = start(
+            HandoffRole::Agent,
+            HandoffRole::Orchestrator,
+            Some("openai:pinned-model@medium"),
+            None,
+        );
+        assert_eq!(pinned.config.model, "openai:pinned-model@medium");
+        assert!(pinned.source_pinned);
+
+        let thinking_only = start(
+            HandoffRole::Orchestrator,
+            HandoffRole::Agent,
+            None,
+            Some(ThinkingLevel::Medium),
+        );
+        assert_eq!(
+            thinking_only.config.model,
+            "openai:orchestrator-model@medium"
+        );
+        assert!(thinking_only.source_pinned);
     }
 
     #[test]

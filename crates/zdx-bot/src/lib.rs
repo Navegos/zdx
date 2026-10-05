@@ -587,8 +587,8 @@ pub(crate) fn model_picker_header(
             let picked = crate::staging::session_model_override(context, chat_id, thread_id)
                 .map_or_else(String::new, |m| format!("\nPicked: <code>{m}</code>"));
             format!(
-                "Pick the model for the new topic (this thread keeps its own). Inherited: <code>{}</code>{picked}",
-                current_topic_model(context, chat_id, thread_id)
+                "Pick the model for the new topic (this thread keeps its own). Starts on: <code>{}</code>{picked}",
+                crate::staging::staged_topic_config(context, chat_id, thread_id).model
             )
         }
         ModelPickerScope::Topic => {
@@ -668,10 +668,14 @@ async fn handle_model_pick(
         return;
     };
 
-    let current = if matches!(scope, ModelPickerScope::Topic | ModelPickerScope::Staging) {
-        current_topic_thinking(context, chat_id, msg.thread_id)
-    } else {
-        context.config_for_chat(chat_id).thinking_level
+    let current = match scope {
+        ModelPickerScope::Topic => current_topic_thinking(context, chat_id, msg.thread_id),
+        ModelPickerScope::Staging => {
+            staging::staged_topic_config(context, chat_id, msg.effective_thread_id()).thinking_level
+        }
+        ModelPickerScope::General | ModelPickerScope::NewThread => {
+            context.config_for_chat(chat_id).thinking_level
+        }
     };
     let keyboard = build_model_thinking_keyboard(provider, index, scope, current);
     let reply = format!(
@@ -741,10 +745,10 @@ async fn handle_model_thinking_pick(
 
     if scope == ModelPickerScope::Staging {
         // A staged `/handoff` / `/btw` pick applies to the topic that command
-        // will create, so it is resolved against the source thread's effective
-        // config and kept on the staging session — never written to this thread.
+        // will create, so it is resolved against the config that topic starts
+        // with and kept on the staging session — never written to this thread.
         let topic_id = msg.effective_thread_id();
-        let mut config = current_topic_config(context, msg.chat.id, topic_id);
+        let mut config = staging::staged_topic_config(context, msg.chat.id, topic_id);
         config.apply_model_spec(&model);
         let resolved = config.model;
         if staging::finish_model_pick(
