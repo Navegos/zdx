@@ -61,6 +61,9 @@ impl WorkerStatus {
 /// Emitted after every finished worker prompt (one event per worker turn).
 #[derive(Debug, Clone)]
 pub struct CompletionEvent {
+    /// The orchestrator that queued this turn's prompt, which is where the
+    /// result belongs. It can differ from the worker's current owner when
+    /// another orchestrator messaged the worker while the turn was running.
     pub owner_thread_id: String,
     pub worker_thread_id: String,
     pub status: WorkerStatus,
@@ -135,6 +138,10 @@ pub enum WorkerEvent {
 pub struct QueuedPrompt {
     pub id: u64,
     pub text: String,
+    /// Orchestrator that queued the prompt: its turn runs on that thread's
+    /// behalf and its completion is routed there, whoever owns the worker by
+    /// the time it finishes.
+    pub requester_thread_id: String,
 }
 
 /// Point-in-time view of a managed worker.
@@ -174,6 +181,7 @@ impl WorkerSnapshot {
 /// One prompt execution request handed to the worker runner.
 pub struct WorkerRunRequest {
     pub worker_thread_id: String,
+    /// The orchestrator that queued this prompt (`QueuedPrompt::requester_thread_id`).
     pub owner_thread_id: String,
     pub root: PathBuf,
     pub prompt: String,
@@ -503,13 +511,13 @@ impl WorkerManager {
         owner: Option<&str>,
         message: &str,
     ) -> Option<WorkerSnapshot> {
-        let prompt = self.queued_prompt(message);
         let snapshot = {
             let mut map = self.state.lock().expect("worker state lock poisoned");
             let state = map.get_mut(worker_thread_id)?;
             if let Some(owner) = owner {
                 state.owner_thread_id = owner.to_string();
             }
+            let prompt = self.queued_prompt(message, &state.owner_thread_id);
             state.queue.push_back(prompt);
             if state.status != WorkerStatus::Running {
                 state.status = WorkerStatus::Queued;
@@ -536,7 +544,6 @@ impl WorkerManager {
         thinking_level: Option<ThinkingLevel>,
         prompt: &str,
     ) -> WorkerSnapshot {
-        let prompt = self.queued_prompt(prompt);
         let (snapshot, spawn_wake) = {
             let mirror_url = self.mirror_url(worker_thread_id);
             let mut map = self.state.lock().expect("worker state lock poisoned");
@@ -546,6 +553,7 @@ impl WorkerManager {
                     if let Some(owner) = owner {
                         state.owner_thread_id = owner.to_string();
                     }
+                    let prompt = self.queued_prompt(prompt, &state.owner_thread_id);
                     state.queue.push_back(prompt);
                     state.touched_at = Instant::now();
                     if state.status != WorkerStatus::Running {
@@ -556,10 +564,11 @@ impl WorkerManager {
                 }
                 Entry::Vacant(vacant) => {
                     let wake = Arc::new(Notify::new());
+                    let owner_thread_id = owner.unwrap_or(worker_thread_id).to_string();
                     let mut queue = VecDeque::new();
-                    queue.push_back(prompt);
+                    queue.push_back(self.queued_prompt(prompt, &owner_thread_id));
                     let state = vacant.insert(WorkerState {
-                        owner_thread_id: owner.unwrap_or(worker_thread_id).to_string(),
+                        owner_thread_id,
                         root,
                         model,
                         thinking_level,
@@ -713,12 +722,13 @@ impl WorkerManager {
         Ok(removed)
     }
 
-    fn queued_prompt(&self, text: &str) -> QueuedPrompt {
+    fn queued_prompt(&self, text: &str, requester_thread_id: &str) -> QueuedPrompt {
         QueuedPrompt {
             id: self
                 .next_prompt_id
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             text: text.to_string(),
+            requester_thread_id: requester_thread_id.to_string(),
         }
     }
 
@@ -877,7 +887,7 @@ fn spawn_worker_task(manager: Arc<WorkerManager>, worker_thread_id: String, wake
                     state.current_tools.clear();
                     WorkerRunRequest {
                         worker_thread_id: worker_thread_id.clone(),
-                        owner_thread_id: state.owner_thread_id.clone(),
+                        owner_thread_id: prompt.requester_thread_id,
                         root: state.root.clone(),
                         prompt: prompt.text,
                         model: state.model.clone(),
@@ -894,6 +904,7 @@ fn spawn_worker_task(manager: Arc<WorkerManager>, worker_thread_id: String, wake
             };
 
             let cancel = request.cancel.clone();
+            let requester_thread_id = request.owner_thread_id.clone();
             let result = (manager.runner)(request).await;
 
             // The event is sent under the same lock that settles the status, so
@@ -923,8 +934,11 @@ fn spawn_worker_task(manager: Arc<WorkerManager>, worker_thread_id: String, wake
                     state.last_error = Some(format!("{err:#}"));
                 }
             }
+            // Route to the orchestrator that asked for this turn, not to the
+            // current owner: another orchestrator may have messaged the worker
+            // (taking ownership) while this turn was running.
             let event = CompletionEvent {
-                owner_thread_id: state.owner_thread_id.clone(),
+                owner_thread_id: requester_thread_id,
                 worker_thread_id: worker_thread_id.clone(),
                 status: state.status,
                 final_text: result.as_ref().ok().cloned(),
@@ -1087,6 +1101,55 @@ mod tests {
             MAX_SEEN.load(Ordering::SeqCst),
             1,
             "one worker's prompts must never overlap"
+        );
+    }
+
+    /// Regression: orchestrator A's turn is running when orchestrator B
+    /// messages the worker (taking ownership). A's turn must still report to
+    /// A, B's queued turn to B, and each runs on behalf of its own requester.
+    #[tokio::test]
+    async fn each_turn_reports_to_the_orchestrator_that_queued_it() {
+        let _home = temp_zdx_home();
+        let project = tempfile::tempdir().unwrap();
+        let release = Arc::new(Notify::new());
+        let gate = Arc::clone(&release);
+        let runner: WorkerRunner = Arc::new(move |request: WorkerRunRequest| {
+            let gate = Arc::clone(&gate);
+            Box::pin(async move {
+                if request.prompt == "a-task" {
+                    gate.notified().await;
+                }
+                Ok(format!("{}:{}", request.owner_thread_id, request.prompt))
+            })
+        });
+        let (manager, mut completion_rx) = WorkerManager::with_runner(runner);
+
+        let worker_id = manager
+            .create_worker("orchestrator-a", project.path(), "a-task", None, None, None)
+            .unwrap();
+        for _ in 0..500 {
+            if manager.snapshot(&worker_id).unwrap().status == WorkerStatus::Running {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let snapshot = manager
+            .send_message("orchestrator-b", &worker_id, "b-task")
+            .unwrap();
+        assert_eq!(snapshot.owner_thread_id, "orchestrator-b");
+        assert_eq!(snapshot.queue[0].requester_thread_id, "orchestrator-b");
+        release.notify_one();
+
+        let first = next_completion(&mut completion_rx).await;
+        assert_eq!(first.owner_thread_id, "orchestrator-a");
+        assert_eq!(first.final_text.as_deref(), Some("orchestrator-a:a-task"));
+        let second = next_completion(&mut completion_rx).await;
+        assert_eq!(second.owner_thread_id, "orchestrator-b");
+        assert_eq!(second.final_text.as_deref(), Some("orchestrator-b:b-task"));
+        assert_eq!(
+            manager.snapshot(&worker_id).unwrap().owner_thread_id,
+            "orchestrator-b",
+            "the latest orchestrator to message the worker still owns it"
         );
     }
 
