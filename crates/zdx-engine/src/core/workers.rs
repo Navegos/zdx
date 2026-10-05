@@ -61,9 +61,7 @@ impl WorkerStatus {
 /// Emitted after every finished worker prompt (one event per worker turn).
 #[derive(Debug, Clone)]
 pub struct CompletionEvent {
-    /// The orchestrator that queued this turn's prompt, which is where the
-    /// result belongs. It can differ from the worker's current owner when
-    /// another orchestrator messaged the worker while the turn was running.
+    /// Orchestrator that queued this turn; may differ from the current owner.
     pub owner_thread_id: String,
     pub worker_thread_id: String,
     pub status: WorkerStatus,
@@ -138,9 +136,7 @@ pub enum WorkerEvent {
 pub struct QueuedPrompt {
     pub id: u64,
     pub text: String,
-    /// Orchestrator that queued the prompt: its turn runs on that thread's
-    /// behalf and its completion is routed there, whoever owns the worker by
-    /// the time it finishes.
+    /// Orchestrator that queued the prompt; its completion is routed there.
     pub requester_thread_id: String,
 }
 
@@ -934,9 +930,7 @@ fn spawn_worker_task(manager: Arc<WorkerManager>, worker_thread_id: String, wake
                     state.last_error = Some(format!("{err:#}"));
                 }
             }
-            // Route to the orchestrator that asked for this turn, not to the
-            // current owner: another orchestrator may have messaged the worker
-            // (taking ownership) while this turn was running.
+            // Not the current owner: ownership can move mid-turn.
             let event = CompletionEvent {
                 owner_thread_id: requester_thread_id,
                 worker_thread_id: worker_thread_id.clone(),
@@ -1104,9 +1098,7 @@ mod tests {
         );
     }
 
-    /// Regression: orchestrator A's turn is running when orchestrator B
-    /// messages the worker (taking ownership). A's turn must still report to
-    /// A, B's queued turn to B, and each runs on behalf of its own requester.
+    /// Regression: B messages the worker during A's turn; each gets its own result.
     #[tokio::test]
     async fn each_turn_reports_to_the_orchestrator_that_queued_it() {
         let _home = temp_zdx_home();
