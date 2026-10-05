@@ -59,6 +59,58 @@ impl StagingCommand {
     }
 }
 
+/// What the topic opened by `/handoff` continues as. It defaults to the source
+/// thread's role and is changed with the card's `Continue as:` button.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HandoffRole {
+    Agent,
+    /// The reserved `orchestrator` persistent profile.
+    Orchestrator,
+}
+
+impl HandoffRole {
+    fn of_profile(profile: Option<&str>) -> Self {
+        if profile == Some(zdx_engine::subagents::ORCHESTRATOR_SUBAGENT_NAME) {
+            HandoffRole::Orchestrator
+        } else {
+            HandoffRole::Agent
+        }
+    }
+
+    /// The role of `thread_id`, which a handoff from it continues by default.
+    fn of_thread(thread_id: &str) -> Self {
+        match thread_persistence::read_persistent_profile(thread_id) {
+            Ok(profile) => Self::of_profile(profile.as_deref()),
+            Err(err) => {
+                tracing::warn!(thread_id, err = %format!("{err:#}"), "Failed to read the source thread's profile");
+                HandoffRole::Agent
+            }
+        }
+    }
+
+    fn toggled(self) -> Self {
+        match self {
+            HandoffRole::Agent => HandoffRole::Orchestrator,
+            HandoffRole::Orchestrator => HandoffRole::Agent,
+        }
+    }
+
+    /// The persistent profile the new thread is created with.
+    fn profile(self) -> Option<&'static str> {
+        match self {
+            HandoffRole::Agent => None,
+            HandoffRole::Orchestrator => Some(zdx_engine::subagents::ORCHESTRATOR_SUBAGENT_NAME),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            HandoffRole::Agent => "Agent",
+            HandoffRole::Orchestrator => "Orchestrator",
+        }
+    }
+}
+
 pub(crate) struct StagingSession {
     command: StagingCommand,
     /// `message_id` of the slash command that opened the session. Messages that
@@ -67,6 +119,8 @@ pub(crate) struct StagingSession {
     /// Fully resolved model the new topic starts with, picked from the card's
     /// `🎛 Model` button. `None` means it inherits the source thread's model.
     model_override: Option<String>,
+    /// Role the `/handoff` topic continues as; `None` for every other command.
+    handoff_role: Option<HandoffRole>,
     /// Full generated suggestion (the preview message may be truncated).
     suggestion_text: Option<String>,
     /// The bot's current suggestion message (deleted/replaced on regenerate).
@@ -270,6 +324,8 @@ async fn start_staging(
         cleanup_session_messages(context, incoming.chat_id, &previous).await;
     }
 
+    let handoff_role =
+        (command == StagingCommand::Handoff).then(|| HandoffRole::of_thread(thread_id));
     let ask = context
         .client()
         .send_message_with_markup(
@@ -277,7 +333,7 @@ async fn start_staging(
             &ask_text(command, None),
             reply_to_message_id,
             topic_id,
-            &staging_keyboard(command),
+            &staging_keyboard(command, handoff_role),
         )
         .await?;
 
@@ -285,6 +341,7 @@ async fn start_staging(
         command,
         command_message_id: incoming.message_id,
         model_override: None,
+        handoff_role,
         suggestion_text: None,
         suggestion_message_id: None,
         bot_message_ids: vec![ask.id],
@@ -304,14 +361,18 @@ async fn process_staged_input(
     thread_id: &str,
 ) -> Result<()> {
     // Track the input message and take the previous suggestion (regenerate).
-    let (command, previous_suggestion) = {
+    let (command, handoff_role, previous_suggestion) = {
         let mut map = context.staging_map().lock().expect("staging lock poisoned");
         let Some(session) = map.get_mut(thread_id) else {
             return Ok(());
         };
         session.user_message_ids.push(incoming.message_id);
         session.suggestion_text = None;
-        (session.command, session.suggestion_message_id.take())
+        (
+            session.command,
+            session.handoff_role,
+            session.suggestion_message_id.take(),
+        )
     };
     if let Some(message_id) = previous_suggestion
         && let Err(err) = context
@@ -344,7 +405,7 @@ async fn process_staged_input(
                 hint_text,
                 Some(incoming.message_id),
                 topic_id,
-                &staging_keyboard(command),
+                &staging_keyboard(command, handoff_role),
             )
             .await?;
         track_bot_message(context, thread_id, hint.id);
@@ -482,8 +543,9 @@ async fn run_prompt_builder_generation(
 }
 
 /// Handles `stg:{action}` callbacks: `a` accepts the staged suggestion, `m`
-/// opens the model picker for the topic the command will create, `d` discards
-/// the session and deletes its messages.
+/// opens the model picker for the topic the command will create, `r` switches
+/// the role a `/handoff` topic continues as, `d` discards the session and
+/// deletes its messages.
 pub(crate) async fn handle_callback(
     context: &Arc<BotContext>,
     queues: &ChatQueueMap,
@@ -501,10 +563,14 @@ pub(crate) async fn handle_callback(
     let topic_id = message.effective_thread_id();
     let thread_id = session_thread_id(chat_id, topic_id);
 
-    // The model picker keeps the session alive, so it is handled before the
-    // session is taken below.
+    // The model picker and the role switch keep the session alive, so they are
+    // handled before the session is taken below.
     if data == "m" {
         open_model_picker(context, client, callback, chat_id, topic_id, &thread_id).await;
+        return;
+    }
+    if data == "r" {
+        toggle_handoff_role(context, client, callback, chat_id, &thread_id).await;
         return;
     }
 
@@ -686,7 +752,7 @@ async fn start_btw_topic(
         "Btw",
         seed,
         Some(btw_record(input)),
-        false,
+        None,
         model_override,
     )
     .await
@@ -712,7 +778,7 @@ async fn start_btw_topic(
                     &text,
                     Some(incoming.message_id),
                     topic_id,
-                    &staging_keyboard(StagingCommand::Btw),
+                    &staging_keyboard(StagingCommand::Btw, None),
                 )
                 .await?;
             track_bot_message(context, thread_id, sent.id);
@@ -733,12 +799,13 @@ async fn start_btw_topic(
 /// `🎛 Model` button) replaces that inheritance for this new thread only.
 /// Shared by `/handoff` and `/btw`.
 ///
-/// `inherit_profile` continues the source thread's *mode*: `/handoff` copies a
-/// persistent profile (the reserved `orchestrator` home base) onto the
-/// successor, so an orchestrated thread hands off to another orchestrator. The
-/// source thread is left completely alone — it keeps its own workers and stays
-/// usable, so both conversations can run on. `/btw` never inherits, since a
-/// side question is an ordinary read-only thread.
+/// `profile` is the persistent profile the new thread starts with: `/handoff`
+/// passes the reserved `orchestrator` profile when the topic continues as an
+/// orchestrator (the source's role by default, or the card's `Continue as:`
+/// pick), and `None` for an ordinary agent. The source thread is left
+/// completely alone — it keeps its own workers and stays usable, so both
+/// conversations can run on. `/btw` always passes `None`, since a side
+/// question is an ordinary read-only thread.
 #[allow(clippy::too_many_arguments)]
 async fn seed_new_topic(
     context: &Arc<BotContext>,
@@ -749,22 +816,17 @@ async fn seed_new_topic(
     topic_prefix: &str,
     seed_text: String,
     record: Option<String>,
-    inherit_profile: bool,
+    profile: Option<&str>,
     model_override: Option<String>,
 ) -> Result<()> {
-    // Resolve the inherited profile first: a successor that continues an
-    // orchestrator home base is marked as one in the topic list too.
     let source_profile = thread_persistence::read_persistent_profile(source_thread_id)
         .ok()
         .flatten();
-    let inherited_profile = inherit_profile.then(|| source_profile.clone()).flatten();
 
     let topic_name = chrono::Utc::now()
         .format(&format!("{topic_prefix} %Y-%m-%d %H:%M"))
         .to_string();
-    let topic_name = if inherited_profile.as_deref()
-        == Some(zdx_engine::subagents::ORCHESTRATOR_SUBAGENT_NAME)
-    {
+    let topic_name = if profile == Some(zdx_engine::subagents::ORCHESTRATOR_SUBAGENT_NAME) {
         orchestrator_topic_name(&topic_name)
     } else {
         topic_name
@@ -793,24 +855,14 @@ async fn seed_new_topic(
         None
     };
     let new_thread_id = thread_id_for_chat(chat_id, Some(new_topic_id));
-    let created =
-        thread_persistence::Thread::with_id(new_thread_id.clone()).and_then(|mut thread| {
-            thread.set_handoff_from(Some(source_thread_id.to_string()));
-            if let Some(profile) = inherited_profile.as_deref() {
-                thread.set_persistent_profile(profile)?;
-            }
-            if let Some(model) = new_model {
-                thread.set_model_override(Some(model))?;
-            }
-            thread.set_pending_topic_title(true)
-        });
+    let created = record_seeded_thread(&new_thread_id, source_thread_id, profile, new_model);
     if let Err(err) = created {
-        // Fail closed when a mode was supposed to be inherited: running the
-        // default coding agent in the orchestrator's root is exactly what the
+        // Fail closed when a role was requested: running the default coding
+        // agent where an orchestrator was asked for is exactly what the
         // handoff is meant to avoid, so surface the failure and let the user
         // retry instead.
-        if inherited_profile.is_some() {
-            return Err(err.context("record the inherited profile on the handoff thread"));
+        if profile.is_some() {
+            return Err(err.context("record the profile on the handoff thread"));
         }
         tracing::warn!(chat_id, new_topic_id, err = %format!("{err:#}"), "Failed to record lineage on new thread");
     }
@@ -850,6 +902,26 @@ async fn seed_new_topic(
     Ok(())
 }
 
+/// Pre-creates a seeded topic's thread: `handoff_from` lineage, the persistent
+/// `profile` it runs as, its starting model, and a pending auto-title. Only the
+/// new thread is written; the source thread is never touched.
+fn record_seeded_thread(
+    new_thread_id: &str,
+    source_thread_id: &str,
+    profile: Option<&str>,
+    model: Option<String>,
+) -> Result<()> {
+    let mut thread = thread_persistence::Thread::with_id(new_thread_id.to_string())?;
+    thread.set_handoff_from(Some(source_thread_id.to_string()));
+    if let Some(profile) = profile {
+        thread.set_persistent_profile(profile)?;
+    }
+    if let Some(model) = model {
+        thread.set_model_override(Some(model))?;
+    }
+    thread.set_pending_topic_title(true)
+}
+
 /// Generates the handoff context and opens the new topic immediately — no
 /// preview, no Accept tap.
 ///
@@ -878,11 +950,15 @@ async fn start_handoff_topic(
         .await?;
     track_bot_message(context, thread_id, generating.id);
 
-    let model_override = {
+    let (model_override, role) = {
         let map = context.staging_map().lock().expect("staging lock poisoned");
-        map.get(thread_id)
-            .and_then(|session| session.model_override.clone())
+        let session = map.get(thread_id);
+        (
+            session.and_then(|session| session.model_override.clone()),
+            session.and_then(|session| session.handoff_role),
+        )
     };
+    let role = role.unwrap_or_else(|| HandoffRole::of_thread(thread_id));
 
     let seeded = match run_handoff_generation(context, incoming, thread_id, input).await {
         Ok(suggestion) => {
@@ -896,7 +972,7 @@ async fn start_handoff_topic(
                 "Handoff",
                 suggestion,
                 Some(record),
-                true,
+                role.profile(),
                 model_override,
             )
             .await
@@ -915,6 +991,12 @@ async fn start_handoff_topic(
             }
         }
         Err(err) => {
+            let role = {
+                let map = context.staging_map().lock().expect("staging lock poisoned");
+                map.get(thread_id)
+                    .and_then(|session| session.handoff_role)
+                    .unwrap_or(role)
+            };
             let text = format!(
                 "⚠️ Handoff failed:\n<pre>{}</pre>\nSend another message to retry, or /cancel.",
                 escape_html(&format!("{err:#}"))
@@ -925,7 +1007,7 @@ async fn start_handoff_topic(
                     incoming.chat_id,
                     generating.id,
                     &text,
-                    Some(&staging_keyboard(StagingCommand::Handoff)),
+                    Some(&staging_keyboard(StagingCommand::Handoff, Some(role))),
                 )
                 .await
             {
@@ -1059,16 +1141,30 @@ fn accept_discard_keyboard() -> InlineKeyboardMarkup {
 
 /// The staged command's own card. Commands that open a new topic also offer the
 /// model that topic will start with; the others only run in the current thread,
-/// where `/model` already applies.
-fn staging_keyboard(command: StagingCommand) -> InlineKeyboardMarkup {
-    let mut row = Vec::new();
-    if command.opens_new_topic() {
-        row.push(InlineKeyboardButton::callback("🎛 Model", "stg:m"));
+/// where `/model` already applies. `/handoff` (the only command with a
+/// `handoff_role`) also offers the role its topic continues as, next to Model.
+fn staging_keyboard(
+    command: StagingCommand,
+    handoff_role: Option<HandoffRole>,
+) -> InlineKeyboardMarkup {
+    let discard = InlineKeyboardButton::callback("🗑 Discard", "stg:d");
+    if !command.opens_new_topic() {
+        return InlineKeyboardMarkup {
+            inline_keyboard: vec![vec![discard]],
+        };
     }
-    row.push(InlineKeyboardButton::callback("🗑 Discard", "stg:d"));
-    InlineKeyboardMarkup {
-        inline_keyboard: vec![row],
-    }
+    let model = InlineKeyboardButton::callback("🎛 Model", "stg:m");
+    let inline_keyboard = match handoff_role {
+        Some(role) => vec![
+            vec![
+                model,
+                InlineKeyboardButton::callback(format!("Continue as: {}", role.label()), "stg:r"),
+            ],
+            vec![discard],
+        ],
+        None => vec![vec![model, discard]],
+    };
+    InlineKeyboardMarkup { inline_keyboard }
 }
 
 /// The prompt asking for the command's input, including the picked model when
@@ -1138,6 +1234,49 @@ async fn open_model_picker(
     let _ = client.answer_callback_query(&callback.id, None).await;
 }
 
+/// Switches the role a live `/handoff` topic continues as (`Continue as:`) and
+/// updates the tapped card's buttons in place, keeping its text.
+async fn toggle_handoff_role(
+    context: &BotContext,
+    client: &TelegramClient,
+    callback: &CallbackQuery,
+    chat_id: i64,
+    thread_id: &str,
+) {
+    let Some(message) = callback.message.as_ref() else {
+        return;
+    };
+    let role = {
+        let mut map = context.staging_map().lock().expect("staging lock poisoned");
+        map.get_mut(thread_id).and_then(|session| {
+            let role = session.handoff_role?.toggled();
+            session.handoff_role = Some(role);
+            Some(role)
+        })
+    };
+    let Some(role) = role else {
+        let _ = client
+            .answer_callback_query(&callback.id, Some("Session expired — re-run the command"))
+            .await;
+        return;
+    };
+
+    if let Err(err) = client
+        .edit_message_reply_markup(
+            chat_id,
+            message.id,
+            &staging_keyboard(StagingCommand::Handoff, Some(role)),
+        )
+        .await
+    {
+        tracing::warn!(err = %format!("{err:#}"), "Failed to update the handoff role button");
+    }
+    let notice = format!("The new topic continues as {}", role.label());
+    let _ = client
+        .answer_callback_query(&callback.id, Some(&notice))
+        .await;
+}
+
 /// The model a live staged command will give its new topic, if one was picked.
 pub(crate) fn session_model_override(
     context: &BotContext,
@@ -1168,10 +1307,14 @@ pub(crate) async fn finish_model_pick(
             if model.is_some() {
                 session.model_override = model;
             }
-            (session.command, session.model_override.clone())
+            (
+                session.command,
+                session.handoff_role,
+                session.model_override.clone(),
+            )
         })
     };
-    let Some((command, model_override)) = card else {
+    let Some((command, handoff_role, model_override)) = card else {
         return false;
     };
     if let Err(err) = client
@@ -1179,7 +1322,7 @@ pub(crate) async fn finish_model_pick(
             chat_id,
             message_id,
             &ask_text(command, model_override.as_deref()),
-            Some(&staging_keyboard(command)),
+            Some(&staging_keyboard(command, handoff_role)),
         )
         .await
     {
@@ -1193,9 +1336,12 @@ mod tests {
     use std::collections::HashMap;
     use std::time::{Duration, Instant};
 
+    use zdx_engine::core::thread_persistence;
+
     use super::{
-        STAGING_TTL, SessionInput, StagingCommand, StagingSession, ask_text, btw_awaits_input,
-        btw_record, classify_session_input, handoff_record, staging_keyboard, suggestion_preview,
+        HandoffRole, STAGING_TTL, SessionInput, StagingCommand, StagingSession, ask_text,
+        btw_awaits_input, btw_record, classify_session_input, handoff_record, record_seeded_thread,
+        staging_keyboard, suggestion_preview,
     };
 
     fn session_created_at(created_at: Instant) -> StagingSession {
@@ -1211,6 +1357,7 @@ mod tests {
             command,
             command_message_id,
             model_override: None,
+            handoff_role: None,
             suggestion_text: None,
             suggestion_message_id: None,
             bot_message_ids: vec![],
@@ -1338,20 +1485,124 @@ mod tests {
     /// run in the current thread, where `/model` already applies.
     #[test]
     fn model_button_is_offered_only_by_topic_seeding_commands() {
-        let labels = |command| {
-            staging_keyboard(command)
+        let labels = |command, role| {
+            staging_keyboard(command, role)
                 .inline_keyboard
                 .into_iter()
                 .flatten()
                 .map(|button| button.text)
                 .collect::<Vec<_>>()
         };
-        for command in [StagingCommand::Handoff, StagingCommand::Btw] {
-            assert!(labels(command).iter().any(|text| text.contains("Model")));
-        }
+        assert!(
+            labels(StagingCommand::Btw, None)
+                .iter()
+                .any(|text| text.contains("Model"))
+        );
+        assert!(
+            labels(StagingCommand::Handoff, Some(HandoffRole::Agent))
+                .iter()
+                .any(|text| text.contains("Model"))
+        );
         for command in [StagingCommand::PromptBuilder, StagingCommand::Goal] {
-            assert_eq!(labels(command), vec!["🗑 Discard".to_string()]);
+            assert_eq!(labels(command, None), vec!["🗑 Discard".to_string()]);
         }
+    }
+
+    /// `/handoff` offers the role its topic continues as right beside Model,
+    /// labelled with the current choice; `/btw` never offers a role.
+    #[test]
+    fn handoff_card_offers_the_role_beside_model() {
+        for (role, label) in [
+            (HandoffRole::Agent, "Continue as: Agent"),
+            (HandoffRole::Orchestrator, "Continue as: Orchestrator"),
+        ] {
+            let keyboard = staging_keyboard(StagingCommand::Handoff, Some(role));
+            let first_row = &keyboard.inline_keyboard[0];
+            assert_eq!(first_row[0].callback_data.as_deref(), Some("stg:m"));
+            assert_eq!(first_row[1].text, label);
+            assert_eq!(first_row[1].callback_data.as_deref(), Some("stg:r"));
+        }
+        let btw = staging_keyboard(StagingCommand::Btw, None);
+        assert!(
+            btw.inline_keyboard
+                .iter()
+                .flatten()
+                .all(|button| button.callback_data.as_deref() != Some("stg:r"))
+        );
+    }
+
+    /// The role defaults to the source thread's, toggles between the two, and
+    /// only Orchestrator records a persistent profile on the new thread.
+    #[test]
+    fn handoff_role_defaults_to_the_source_and_maps_to_the_profile() {
+        let _home = zdx_engine::test_support::temp_zdx_home();
+        let orchestrator = format!("orchestrator-{}", uuid::Uuid::new_v4());
+        let mut thread = thread_persistence::Thread::with_id(orchestrator.clone()).unwrap();
+        thread
+            .set_persistent_profile(zdx_engine::subagents::ORCHESTRATOR_SUBAGENT_NAME)
+            .unwrap();
+        let ordinary = format!("ordinary-{}", uuid::Uuid::new_v4());
+        thread_persistence::Thread::with_id(ordinary.clone())
+            .unwrap()
+            .set_root_path(std::path::Path::new("/tmp"))
+            .unwrap();
+
+        assert_eq!(
+            HandoffRole::of_thread(&orchestrator),
+            HandoffRole::Orchestrator
+        );
+        assert_eq!(HandoffRole::of_thread(&ordinary), HandoffRole::Agent);
+        assert_eq!(HandoffRole::Agent.toggled(), HandoffRole::Orchestrator);
+        assert_eq!(HandoffRole::Orchestrator.toggled(), HandoffRole::Agent);
+        assert_eq!(HandoffRole::Agent.profile(), None);
+        assert_eq!(
+            HandoffRole::Orchestrator.profile(),
+            Some(zdx_engine::subagents::ORCHESTRATOR_SUBAGENT_NAME)
+        );
+    }
+
+    /// Continuing an ordinary thread as an orchestrator writes the reserved
+    /// profile and lineage onto the new thread only; the source stays as it was.
+    #[test]
+    fn seeded_thread_records_the_role_without_touching_the_source() {
+        let _home = zdx_engine::test_support::temp_zdx_home();
+        let source = format!("source-{}", uuid::Uuid::new_v4());
+        thread_persistence::Thread::with_id(source.clone())
+            .unwrap()
+            .set_root_path(std::path::Path::new("/tmp"))
+            .unwrap();
+        let successor = format!("successor-{}", uuid::Uuid::new_v4());
+        let agent = format!("agent-{}", uuid::Uuid::new_v4());
+
+        record_seeded_thread(
+            &successor,
+            &source,
+            HandoffRole::Orchestrator.profile(),
+            None,
+        )
+        .unwrap();
+        record_seeded_thread(&agent, &source, HandoffRole::Agent.profile(), None).unwrap();
+
+        assert_eq!(
+            thread_persistence::read_persistent_profile(&successor)
+                .unwrap()
+                .as_deref(),
+            Some(zdx_engine::subagents::ORCHESTRATOR_SUBAGENT_NAME)
+        );
+        assert_eq!(
+            thread_persistence::read_thread_summary(&successor)
+                .unwrap()
+                .and_then(|summary| summary.handoff_from),
+            Some(source.clone())
+        );
+        assert_eq!(
+            thread_persistence::read_persistent_profile(&agent).unwrap(),
+            None
+        );
+        assert_eq!(
+            thread_persistence::read_persistent_profile(&source).unwrap(),
+            None
+        );
     }
 
     /// A picked model is shown on the card it was picked from, so the user can

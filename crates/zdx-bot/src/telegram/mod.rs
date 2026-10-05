@@ -783,6 +783,25 @@ impl TelegramClient {
         Ok(())
     }
 
+    /// Replace only the inline keyboard of a bot message, keeping its text.
+    ///
+    /// # Errors
+    /// Returns an error if the operation fails.
+    pub async fn edit_message_reply_markup(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        reply_markup: &InlineKeyboardMarkup,
+    ) -> Result<()> {
+        let request = EditMessageReplyMarkupRequest {
+            chat_id,
+            message_id,
+            reply_markup,
+        };
+        let _: Value = self.post("editMessageReplyMarkup", &request).await?;
+        Ok(())
+    }
+
     /// Delete a message. Bot can delete its own messages anytime, and other
     /// users' messages if it has `can_delete_messages` admin right.
     ///
@@ -1316,6 +1335,13 @@ struct EditMessageTextRequest<'a> {
     parse_mode: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reply_markup: Option<&'a InlineKeyboardMarkup>,
+}
+
+#[derive(Debug, Serialize)]
+struct EditMessageReplyMarkupRequest<'a> {
+    chat_id: i64,
+    message_id: i64,
+    reply_markup: &'a InlineKeyboardMarkup,
 }
 
 #[derive(Debug, Serialize)]
