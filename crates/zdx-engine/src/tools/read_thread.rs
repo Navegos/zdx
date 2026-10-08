@@ -119,7 +119,7 @@ async fn run_subagent(prompt: String, ctx: &ToolContext) -> Result<String, Strin
     let model_spec = ctx
         .read_thread_model
         .clone()
-        .unwrap_or_else(|| "gemini:gemini-3.1-flash-lite-preview".to_string());
+        .unwrap_or_else(|| "gemini:gemini-3.5-flash-lite".to_string());
     let spec = crate::models::ModelSpec::parse(&model_spec);
     let options = ExecSubagentOptions {
         model: Some(spec.without_thinking()),

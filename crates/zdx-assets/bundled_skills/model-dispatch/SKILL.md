@@ -19,10 +19,10 @@ Dispatch one prompt to one or more explicit models through `zdx exec`. This skil
 Each run is an explicit `MODEL[@LEVEL][+SUBAGENT]` spec passed with `--run`. The level is optional and defaults to `medium`; the subagent role is optional and defaults to none.
 
 ```text
---run claude-cli:claude-opus-4-8
---run claude-cli:claude-opus-4-8@low
---run openai:gpt-5.5@high
---run openai:gpt-5.5@high+oracle
+--run claude-cli:claude-opus-5-5
+--run claude-cli:claude-opus-5-5@low
+--run openai:gpt-6.1-sol@high
+--run openai:gpt-6.1-sol@high+oracle
 ```
 
 Supported levels are `off`, `low`, `medium`, `high`, `xhigh`, and `max`. Providers may map or clamp levels their models do not support exactly; mention this caveat when benchmarking reasoning levels.
@@ -37,7 +37,7 @@ Use `--no-system-prompt` only for an intentionally isolated comparison. Use `--n
 
 To run the comparison in a specialist role instead of the default one, name a subagent (for example `oracle` or `explorer`). The role supplies its prompt, tools, and defaults, while the dispatched model and thinking level still win. Two ways to set it:
 
-- `+SUBAGENT` on a run — per-run, so one dispatch can vary the role: `--run openai:gpt-5.5+oracle --run openai:gpt-5.5+explorer`.
+- `+SUBAGENT` on a run — per-run, so one dispatch can vary the role: `--run openai:gpt-6.1-sol+oracle --run openai:gpt-6.1-sol+explorer`.
 - `--subagent NAME` — the default role for every run that has no `+` suffix.
 
 Roles cannot be combined with `--no-system-prompt`.
@@ -48,8 +48,8 @@ Use the bundled script rather than reconstructing parallel calls:
 
 ```text
 python3 scripts/dispatch.py --prompt-file "$ZDX_ARTIFACT_DIR/tmp/dispatch-prompt.txt" \
-  --run claude-cli:claude-opus-4-8@low \
-  --run openai:gpt-5.5@high+oracle
+  --run claude-cli:claude-opus-5-5@low \
+  --run openai:gpt-6.1-sol@high+oracle
 ```
 
 Options:

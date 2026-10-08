@@ -4,7 +4,7 @@
 # Documentation: https://github.com/tallesborges/zdx#configuration
 
 # The Claude model to use
-model = "claude-haiku-4-5"
+model = "claude-haiku-5-5"
 
 # Maximum tokens for responses (optional)
 # When unset, providers that support it omit the token limit and use provider defaults.
@@ -15,10 +15,10 @@ model = "claude-haiku-4-5"
 # string, e.g. model = "provider:id@high".
 # Options: off, low, medium, high, xhigh, max
 # Note: when max_tokens is set, it is auto-adjusted to ensure room for both thinking and response.
-handoff_model = "gemini:gemini-3-flash-preview"
-title_model = "gemini:gemini-3.1-flash-lite-preview"
-read_thread_model = "gemini:gemini-3.1-flash-lite-preview"
-tldr_model = "gemini:gemini-3.1-flash-lite-preview"
+handoff_model = "gemini:gemini-3.8-flash"
+title_model = "gemini:gemini-3.5-flash-lite"
+read_thread_model = "gemini:gemini-3.5-flash-lite"
+tldr_model = "gemini:gemini-3.5-flash-lite"
 prompt_builder_model = "openai:gpt-5.6-terra@low"
 bash_foreground_bound_secs = 120
 
@@ -163,7 +163,7 @@ websocket = false
 enabled = true
 # api_key = "sk-ant-..."  # Overrides ANTHROPIC_API_KEY env var
 # base_url = "https://api.anthropic.com"
-models = ["claude-fable-5-1", "claude-fable-5", "claude-opus-5-5", "claude-opus-5", "claude-opus-4-8", "claude-sonnet-5-5", "claude-sonnet-5", "claude-haiku-5-5", "claude-haiku-4-5"]
+models = ["claude-fable-5-1", "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"]
 websocket = false
 
 [providers.lmstudio]
@@ -174,7 +174,7 @@ websocket = false
 [providers.claude_cli]
 enabled = true
 # base_url = "https://api.anthropic.com"
-models = ["claude-fable-5-1", "claude-fable-5", "claude-opus-5-5", "claude-opus-5", "claude-opus-4-8", "claude-sonnet-5-5", "claude-sonnet-5", "claude-haiku-5-5", "claude-haiku-4-5"]
+models = ["claude-fable-5-1", "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"]
 websocket = false
 
 [providers.openai]
@@ -182,13 +182,13 @@ enabled = true
 # api_key = "sk-..."  # Overrides OPENAI_API_KEY env var
 # base_url = "https://api.openai.com/v1"
 # text_verbosity = "medium"  # Options: low, medium, high
-models = ["gpt-6-astra", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "gpt-5.4-nano"]
+models = ["gpt-6-astra", "gpt-6.1-sol", "gpt-6-luna", "gpt-5.6-terra", "gpt-5.4-nano"]
 websocket = false
 
 [providers.openai_codex]
 enabled = true
 # text_verbosity = "medium"  # Options: low, medium, high
-models = ["gpt-6-astra", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5"]
+models = ["gpt-6-astra", "gpt-6.1-sol", "gpt-6-luna", "gpt-5.6-terra"]
 websocket = false
 # Codex models have built-in apply_patch instructions
 
@@ -201,28 +201,28 @@ websocket = false
 
 [providers.google_antigravity]
 enabled = true
-models = ["gemini-3.8-flash-high", "gemini-3.8-flash-medium", "gemini-3.8-flash-low", "gemini-3.7-flash-high", "gemini-3.7-flash-medium", "gemini-3.7-flash-low", "gemini-3.7-flash-tiered", "gemini-pro-agent", "gemini-3.1-pro-low", "claude-sonnet-4-6", "claude-opus-4-6-thinking", "gpt-oss-120b-medium"]
+models = ["gemini-3.8-flash-high", "gemini-3.8-flash-medium", "gemini-3.8-flash-low", "gemini-pro-agent", "gemini-3.1-pro-low", "claude-sonnet-4-6", "claude-opus-4-6-thinking", "gpt-oss-120b-medium"]
 websocket = false
 
 [providers.moonshot]
 enabled = true
 # api_key = "sk-..."  # Overrides MOONSHOT_API_KEY env var
 # base_url = "https://api.moonshot.ai/v1"
-models = ["kimi-k3", "kimi-k2.6"]
+models = ["kimi-k3"]
 websocket = false
 
 [providers.opencode_go]
 enabled = true
 # api_key = "..."  # Overrides OPENCODE_API_KEY env var
 # base_url = "https://opencode.ai/zen/go"
-models = ["gpt-5.6-luna", "grok-4.5", "glm-5.3", "glm-5.3-flash", "glm-5.2", "kimi-k3", "kimi-k2.6", "kimi-k2.7-code", "mimo-v2.6-pro", "mimo-v2.6-flash", "minimax-m3", "qwen3.8-max", "qwen3.7-max", "qwen3.7-plus", "deepseek-v4-pro", "deepseek-v4-flash", "hy3"]
+models = ["gpt-5.6-luna", "grok-4.5", "glm-5.3", "glm-5.3-flash", "kimi-k3", "kimi-k2.7-code", "mimo-v2.6-pro", "mimo-v2.6-flash", "minimax-m3", "qwen3.8-max", "qwen3.7-plus", "deepseek-v4-pro", "deepseek-v4-flash", "hy3"]
 websocket = false
 
 [providers.stepfun]
 enabled = true
 # api_key = "sk-..."  # Overrides STEPFUN_API_KEY env var
 # base_url = "https://api.stepfun.ai/v1"
-models = ["step-3.7-flash", "step-3.5-flash"]
+models = ["step-3.7-flash"]
 websocket = false
 
 [providers.xiaomi]
@@ -234,7 +234,7 @@ websocket = false
 
 [providers.grok_build]
 enabled = true
-models = ["grok-4.6", "grok-4.5"]
+models = ["grok-4.7"]
 websocket = false
 
 [providers.muse_code]
@@ -249,7 +249,7 @@ websocket = false
 
 [providers.alibaba]
 enabled = true
-models = ["qwen3.8-max", "qwen3.8-flash", "qwen3.7-max", "qwen3.7-plus", "qwen3.7-flash"]
+models = ["qwen3.8-max", "qwen3.8-flash", "qwen3.7-plus"]
 websocket = false
 
 [providers.qwen_code]
@@ -278,7 +278,7 @@ websocket = false
 enabled = true
 # api_key = "..."  # Overrides GEMINI_API_KEY env var
 # base_url = "https://generativelanguage.googleapis.com/v1beta"
-models = ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3.1-pro-preview", "gemini-3.1-flash-lite-preview"]
+models = ["gemini-3.8-flash", "gemini-3.5-flash-lite", "gemini-3.1-pro-preview"]
 websocket = false
 
 [providers.minimax]
@@ -292,14 +292,14 @@ websocket = false
 enabled = true
 # api_key = "..."  # Overrides ZAI_API_KEY env var
 # base_url = "https://api.z.ai/api/paas/v4"
-models = ["glm-5.3", "glm-5.3-flash", "glm-5.2"]
+models = ["glm-5.3", "glm-5.3-flash"]
 websocket = false
 
 [providers.xai]
 enabled = true
 # api_key = "..."  # Overrides XAI_API_KEY env var
 # base_url = "https://api.x.ai/v1"
-models = ["grok-4.6", "grok-4.5"]
+models = ["grok-4.6"]
 websocket = false
 
 [providers.mistral]

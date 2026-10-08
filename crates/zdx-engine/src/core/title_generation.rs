@@ -12,7 +12,7 @@ use crate::core::subagent::{ExecSubagentOptions, run_exec_subagent};
 use crate::prompts::THREAD_TITLE_PROMPT_TEMPLATE;
 
 /// Model used when the configured title model fails.
-const FALLBACK_TITLE_MODEL: &str = "openai-codex:gpt-5.6-luna";
+const FALLBACK_TITLE_MODEL: &str = "openai-codex:gpt-6-luna";
 
 /// Generate a title from a message using the LLM subagent. For a `/handoff`
 /// or `/btw` seed, the title comes from the user's message in it.

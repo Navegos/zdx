@@ -8,13 +8,13 @@ answer inline. Continue any run with:
     zdx --thread <id> exec -m <model>@<thinking> [--subagent <name>] -p "<follow-up>"
 
 Usage:
-    dispatch.py -p "PROMPT" --run claude-cli:claude-opus-4-8
-    dispatch.py --prompt-file brief.txt --run claude-cli:claude-opus-4-8@low \
-        --run openai:gpt-5.5@high
-    dispatch.py -p "PROMPT" --subagent oracle --run openai:gpt-5.5 \
-        --run claude-cli:claude-opus-4-8
-    dispatch.py -p "PROMPT" --run openai:gpt-5.5@high+oracle \
-        --run openai:gpt-5.5@high+explorer
+    dispatch.py -p "PROMPT" --run claude-cli:claude-opus-5-5
+    dispatch.py --prompt-file brief.txt --run claude-cli:claude-opus-5-5@low \
+        --run openai:gpt-6.1-sol@high
+    dispatch.py -p "PROMPT" --subagent oracle --run openai:gpt-6.1-sol \
+        --run claude-cli:claude-opus-5-5
+    dispatch.py -p "PROMPT" --run openai:gpt-6.1-sol@high+oracle \
+        --run openai:gpt-6.1-sol@high+explorer
 
 A run is `PROVIDER:MODEL[@LEVEL][+SUBAGENT]`. The thinking level defaults to
 medium when omitted. `+SUBAGENT` runs that model under a named subagent role (its

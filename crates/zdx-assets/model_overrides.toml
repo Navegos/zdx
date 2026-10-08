@@ -74,35 +74,6 @@ context_limit = 1000000
 id = "openrouter:z-ai/glm-4.7"
 output = 1.5
 
-# Claude Sonnet 5 — models.dev reports introductory pricing ($2/$10) and wrong output_limit (128K).
-# Standard pricing from Sep 1, 2026; output_limit sourced from Anthropic docs.
-# https://platform.claude.com/docs/en/about-claude/pricing — verified 2026-07-07
-[[override]]
-id = "claude-sonnet-5"
-input = 3.0
-output = 15.0
-output_limit = 64000
-
-# Claude Sonnet 5 (claude-cli) — same wrong output_limit from models.dev.
-[[override]]
-id = "claude-cli:claude-sonnet-5"
-output_limit = 64000
-
-# qwen3.7-flash: released ~2026-07-15 and NOT yet in models.dev or Alibaba's public
-# pricing page (its "Qwen-Flash" alias still maps to qwen3.5-flash; qwen3.6-flash is
-# the newest priced flash). Values below are a PROXY from qwen3.6-flash pending official
-# qwen3.7-flash pricing. https://www.alibabacloud.com/help/en/model-studio/model-pricing
-# Flash tier = 1M context, thinking-capable. Re-verify when Alibaba publishes 3.7-flash.
-[[override]]
-id = "alibaba:qwen3.7-flash"
-input = 0.19
-output = 1.13
-cache_read = 0.038
-context_limit = 1000000
-output_limit = 65536
-reasoning = true
-input_images = false
-
 # GLM-5.3-Flash: models.dev serves the 50% launch promo (ends 2026-09-09, UTC+8).
 # Pinned to list price. https://docs.z.ai/guides/overview/pricing — verified 2026-08-28
 [[override]]
@@ -129,9 +100,8 @@ input_images = true
 # Antigravity fixed-tier models bake the reasoning effort into the model id
 # (-low/-medium/-high), so a separate user-selectable thinking level is redundant
 # and misleading in the UI. Flag them non-reasoning to hide the thinking picker/
-# indicator. The `-tiered` variant keeps reasoning=true (effort via thinking_level).
-# 3.8 follows the same rule: the live catalog reports supportsThinking=true for
-# every suffixed id, but the tier is already fixed by the id the user picked.
+# indicator. The live catalog reports supportsThinking=true for every suffixed
+# id, but the tier is already fixed by the id the user picked.
 [[override]]
 id = "google-antigravity:gemini-3.8-flash-high"
 reasoning = false
@@ -145,43 +115,7 @@ id = "google-antigravity:gemini-3.8-flash-low"
 reasoning = false
 
 [[override]]
-id = "google-antigravity:gemini-3.7-flash-low"
-reasoning = false
-
-[[override]]
-id = "google-antigravity:gemini-3.7-flash-medium"
-reasoning = false
-
-[[override]]
-id = "google-antigravity:gemini-3.7-flash-high"
-reasoning = false
-
-[[override]]
-id = "google-antigravity:gemini-3.6-flash-low"
-reasoning = false
-
-[[override]]
-id = "google-antigravity:gemini-3.6-flash-medium"
-reasoning = false
-
-[[override]]
-id = "google-antigravity:gemini-3.6-flash-high"
-reasoning = false
-
-[[override]]
-id = "google-antigravity:gemini-3.5-flash-low"
-reasoning = false
-
-[[override]]
-id = "google-antigravity:gemini-3-flash-agent"
-reasoning = false
-
-[[override]]
 id = "google-antigravity:gemini-3.1-pro-low"
-reasoning = false
-
-[[override]]
-id = "google-antigravity:gemini-3.1-pro-high"
 reasoning = false
 
 # GPT-6.1 Sol (released 2026-09-29): not yet in models.dev. The OpenRouter

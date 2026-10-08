@@ -887,7 +887,7 @@ fn lookup_default_model(full_id: &str) -> Option<ModelRecord> {
                 return true;
             }
             // Fall back to provider-based match using record.provider field
-            // This handles cases where record.id has no prefix (e.g., "step-3.5-flash")
+            // This handles cases where record.id has no prefix (e.g., "claude-haiku-5-5")
             // but record.provider specifies the correct provider (e.g., "stepfun")
             if let Some(candidate_kind) = provider_kind_from_id(&record.provider)
                 && candidate_kind == target.kind
@@ -1304,15 +1304,15 @@ mod tests {
     fn test_lookup_default_model_uses_provider_field() {
         // This tests that lookup_default_model correctly matches models where
         // the record.id has no prefix but record.provider specifies the provider.
-        // e.g., default_models.toml has: id = "step-3.5-flash", provider = "stepfun"
-        // and we look up "stepfun:step-3.5-flash"
+        // e.g., default_models.toml has: id = "claude-haiku-5-5", provider = "anthropic"
+        // and we look up "anthropic:claude-haiku-5-5"
 
-        let result = lookup_default_model("stepfun:step-3.5-flash");
-        assert!(result.is_some(), "Should find stepfun model in defaults");
+        let result = lookup_default_model("anthropic:claude-haiku-5-5");
+        assert!(result.is_some(), "Should find anthropic model in defaults");
 
         let model = result.unwrap();
-        assert_eq!(model.provider, "stepfun");
-        assert_eq!(model.display_name, "Step 3.5 Flash");
+        assert_eq!(model.provider, "anthropic");
+        assert_eq!(model.display_name, "Claude Haiku 5.5");
         // Should NOT be "(custom)" since it's in default_models.toml
         assert!(
             !model.display_name.contains("custom"),
@@ -1333,13 +1333,13 @@ mod tests {
 
     #[test]
     fn test_lookup_default_model_meta_provider_uses_underlying_defaults() {
-        let result = lookup_default_model("opencode-go:glm-5.2");
+        let result = lookup_default_model("opencode-go:glm-5.3");
         assert!(result.is_some(), "Should find glm model for opencode-go");
     }
 
     #[test]
     fn test_lookup_default_model_meta_provider_normalizes_thinking_suffix() {
-        let result = lookup_default_model("opencode-go:glm-5.2-thinking");
+        let result = lookup_default_model("opencode-go:glm-5.3-thinking");
         assert!(
             result.is_some(),
             "Should map -thinking variant to base model default"

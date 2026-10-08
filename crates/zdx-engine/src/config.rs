@@ -1083,7 +1083,7 @@ impl Config {
         }
     }
 
-    const DEFAULT_MODEL: &str = "claude-haiku-4-5";
+    const DEFAULT_MODEL: &str = "claude-haiku-5-5";
     const DEFAULT_MAX_TOKENS: u32 = 12288;
     /// Ceiling for the `max_tokens` derived from a model's output limit. The
     /// registry value is a ceiling on one response, not a sensible per-request
@@ -1103,10 +1103,10 @@ impl Config {
     /// Five minutes of silence: above nearly every healthy first token in
     /// real threads, far below the 2h hang it exists to stop.
     const DEFAULT_STREAM_IDLE_TIMEOUT_SECS: u32 = 300;
-    const DEFAULT_HANDOFF_MODEL: &str = "gemini:gemini-3-flash-preview";
-    const DEFAULT_TITLE_MODEL: &str = "gemini:gemini-3.1-flash-lite-preview";
-    const DEFAULT_READ_THREAD_MODEL: &str = "gemini:gemini-3.1-flash-lite-preview";
-    const DEFAULT_TLDR_MODEL: &str = "gemini:gemini-3.1-flash-lite-preview";
+    const DEFAULT_HANDOFF_MODEL: &str = "gemini:gemini-3.8-flash";
+    const DEFAULT_TITLE_MODEL: &str = "gemini:gemini-3.5-flash-lite";
+    const DEFAULT_READ_THREAD_MODEL: &str = "gemini:gemini-3.5-flash-lite";
+    const DEFAULT_TLDR_MODEL: &str = "gemini:gemini-3.5-flash-lite";
     const DEFAULT_PROMPT_BUILDER_MODEL: &str = "openai:gpt-5.6-terra@low";
 
     /// Loads configuration by merging every layer from
@@ -2230,14 +2230,9 @@ fn default_anthropic_provider() -> ProviderConfig {
         enabled: Some(true),
         models: vec![
             "claude-fable-5-1".to_string(),
-            "claude-fable-5".to_string(),
             "claude-opus-5-5".to_string(),
-            "claude-opus-5".to_string(),
-            "claude-opus-4-8".to_string(),
             "claude-sonnet-5-5".to_string(),
-            "claude-sonnet-5".to_string(),
             "claude-haiku-5-5".to_string(),
-            "claude-haiku-4-5".to_string(),
         ],
         ..Default::default()
     }
@@ -2248,14 +2243,9 @@ fn default_claude_cli_provider() -> ProviderConfig {
         enabled: Some(true),
         models: vec![
             "claude-fable-5-1".to_string(),
-            "claude-fable-5".to_string(),
             "claude-opus-5-5".to_string(),
-            "claude-opus-5".to_string(),
-            "claude-opus-4-8".to_string(),
             "claude-sonnet-5-5".to_string(),
-            "claude-sonnet-5".to_string(),
             "claude-haiku-5-5".to_string(),
-            "claude-haiku-4-5".to_string(),
         ],
         ..Default::default()
     }
@@ -2267,12 +2257,8 @@ fn default_openai_provider() -> ProviderConfig {
         models: vec![
             "gpt-6-astra".to_string(),
             "gpt-6.1-sol".to_string(),
-            "gpt-6-sol".to_string(),
             "gpt-6-luna".to_string(),
-            "gpt-5.6-sol".to_string(),
             "gpt-5.6-terra".to_string(),
-            "gpt-5.6-luna".to_string(),
-            "gpt-5.5".to_string(),
             "gpt-5.4-nano".to_string(),
         ],
         ..Default::default()
@@ -2285,12 +2271,8 @@ fn default_openai_codex_provider() -> ProviderConfig {
         models: vec![
             "gpt-6-astra".to_string(),
             "gpt-6.1-sol".to_string(),
-            "gpt-6-sol".to_string(),
             "gpt-6-luna".to_string(),
-            "gpt-5.6-sol".to_string(),
             "gpt-5.6-terra".to_string(),
-            "gpt-5.6-luna".to_string(),
-            "gpt-5.5".to_string(),
         ],
         ..Default::default()
     }
@@ -2320,7 +2302,7 @@ fn default_deepseek_provider() -> ProviderConfig {
 fn default_moonshot_provider() -> ProviderConfig {
     ProviderConfig {
         enabled: Some(true),
-        models: vec!["kimi-k3".to_string(), "kimi-k2.6".to_string()],
+        models: vec!["kimi-k3".to_string()],
         ..Default::default()
     }
 }
@@ -2351,7 +2333,7 @@ fn default_muse_code_provider() -> ProviderConfig {
 fn default_stepfun_provider() -> ProviderConfig {
     ProviderConfig {
         enabled: Some(true),
-        models: vec!["step-3.7-flash".to_string(), "step-3.5-flash".to_string()],
+        models: vec!["step-3.7-flash".to_string()],
         ..Default::default()
     }
 }
@@ -2390,9 +2372,7 @@ fn default_alibaba_provider() -> ProviderConfig {
         models: vec![
             "qwen3.8-max".to_string(),
             "qwen3.8-flash".to_string(),
-            "qwen3.7-max".to_string(),
             "qwen3.7-plus".to_string(),
-            "qwen3.7-flash".to_string(),
         ],
         ..Default::default()
     }
@@ -2414,11 +2394,8 @@ fn default_gemini_provider() -> ProviderConfig {
         enabled: Some(true),
         models: vec![
             "gemini-3.8-flash".to_string(),
-            "gemini-3.6-flash".to_string(),
-            "gemini-3.5-flash".to_string(),
             "gemini-3.5-flash-lite".to_string(),
             "gemini-3.1-pro-preview".to_string(),
-            "gemini-3.1-flash-lite-preview".to_string(),
         ],
         ..Default::default()
     }
@@ -2431,10 +2408,6 @@ fn default_google_antigravity_provider() -> ProviderConfig {
             "gemini-3.8-flash-high".to_string(),
             "gemini-3.8-flash-medium".to_string(),
             "gemini-3.8-flash-low".to_string(),
-            "gemini-3.7-flash-high".to_string(),
-            "gemini-3.7-flash-medium".to_string(),
-            "gemini-3.7-flash-low".to_string(),
-            "gemini-3.7-flash-tiered".to_string(),
             "gemini-pro-agent".to_string(),
             "gemini-3.1-pro-low".to_string(),
             "claude-sonnet-4-6".to_string(),
@@ -2461,15 +2434,12 @@ fn default_opencode_go_provider() -> ProviderConfig {
             "grok-4.5".to_string(),
             "glm-5.3".to_string(),
             "glm-5.3-flash".to_string(),
-            "glm-5.2".to_string(),
             "kimi-k3".to_string(),
-            "kimi-k2.6".to_string(),
             "kimi-k2.7-code".to_string(),
             "mimo-v2.6-pro".to_string(),
             "mimo-v2.6-flash".to_string(),
             "minimax-m3".to_string(),
             "qwen3.8-max".to_string(),
-            "qwen3.7-max".to_string(),
             "qwen3.7-plus".to_string(),
             "deepseek-v4-pro".to_string(),
             "deepseek-v4-flash".to_string(),
@@ -2490,11 +2460,7 @@ fn default_minimax_provider() -> ProviderConfig {
 fn default_zai_provider() -> ProviderConfig {
     ProviderConfig {
         enabled: Some(true),
-        models: vec![
-            "glm-5.3".to_string(),
-            "glm-5.3-flash".to_string(),
-            "glm-5.2".to_string(),
-        ],
+        models: vec!["glm-5.3".to_string(), "glm-5.3-flash".to_string()],
         ..Default::default()
     }
 }
@@ -2502,7 +2468,7 @@ fn default_zai_provider() -> ProviderConfig {
 fn default_xai_provider() -> ProviderConfig {
     ProviderConfig {
         enabled: Some(true),
-        models: vec!["grok-4.6".to_string(), "grok-4.5".to_string()],
+        models: vec!["grok-4.6".to_string()],
         ..Default::default()
     }
 }
@@ -2510,7 +2476,7 @@ fn default_xai_provider() -> ProviderConfig {
 fn default_grok_build_provider() -> ProviderConfig {
     ProviderConfig {
         enabled: Some(true),
-        models: vec!["grok-4.6".to_string(), "grok-4.5".to_string()],
+        models: vec!["grok-4.7".to_string()],
         ..Default::default()
     }
 }
@@ -3305,7 +3271,7 @@ models = ["model-a", "model-b"]
         let config_path = dir.path().join("nonexistent.toml");
 
         let config = Config::load_from(&config_path).unwrap();
-        assert_eq!(config.model, "claude-haiku-4-5");
+        assert_eq!(config.model, "claude-haiku-5-5");
         assert_eq!(config.max_tokens, None);
     }
 
@@ -3500,7 +3466,7 @@ language = "pt"
 
         assert!(config_path.exists());
         let contents = fs::read_to_string(&config_path).unwrap();
-        assert!(contents.contains("claude-haiku-4-5"));
+        assert!(contents.contains("claude-haiku-5-5"));
         assert!(contents.contains("# max_tokens ="));
     }
 
@@ -5076,12 +5042,6 @@ file = "prompts/template.md"
         let providers = ProvidersConfig::default();
 
         assert_eq!(providers.gemini.models.first().unwrap(), "gemini-3.8-flash");
-        assert!(
-            providers
-                .gemini
-                .models
-                .contains(&"gemini-3.6-flash".to_string())
-        );
 
         assert_eq!(
             providers.meta.models,
