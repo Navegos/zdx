@@ -2236,6 +2236,7 @@ fn default_anthropic_provider() -> ProviderConfig {
             "claude-opus-4-8".to_string(),
             "claude-sonnet-5-5".to_string(),
             "claude-sonnet-5".to_string(),
+            "claude-haiku-5-5".to_string(),
             "claude-haiku-4-5".to_string(),
         ],
         ..Default::default()
@@ -2253,6 +2254,7 @@ fn default_claude_cli_provider() -> ProviderConfig {
             "claude-opus-4-8".to_string(),
             "claude-sonnet-5-5".to_string(),
             "claude-sonnet-5".to_string(),
+            "claude-haiku-5-5".to_string(),
             "claude-haiku-4-5".to_string(),
         ],
         ..Default::default()

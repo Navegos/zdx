@@ -121,6 +121,23 @@ input_images = true
 output_limit = 64000
 
 [[model]]
+id = "claude-haiku-5-5"
+provider = "anthropic"
+display_name = "Claude Haiku 5.5"
+context_limit = 1000000
+
+[model.pricing]
+input = 0.1
+output = 0.5
+cache_read = 0.01
+cache_write = 0.125
+
+[model.capabilities]
+reasoning = true
+input_images = true
+output_limit = 128000
+
+[[model]]
 id = "claude-haiku-4-5"
 provider = "anthropic"
 display_name = "Claude Haiku 4.5"
@@ -255,6 +272,23 @@ cache_write = 0.0
 reasoning = true
 input_images = true
 output_limit = 64000
+
+[[model]]
+id = "claude-cli:claude-haiku-5-5"
+provider = "claude-cli"
+display_name = "Claude Haiku 5.5"
+context_limit = 1000000
+
+[model.pricing]
+input = 0.0
+output = 0.0
+cache_read = 0.0
+cache_write = 0.0
+
+[model.capabilities]
+reasoning = true
+input_images = true
+output_limit = 128000
 
 [[model]]
 id = "claude-cli:claude-haiku-4-5"
