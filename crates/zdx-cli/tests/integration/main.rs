@@ -15,6 +15,7 @@ mod memory_embed;
 mod memory_relevance;
 mod opencode_go_headers;
 mod quota;
+mod responses_usage;
 mod service;
 mod stream_stall;
 mod thread_schema;

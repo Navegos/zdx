@@ -442,9 +442,9 @@ mod tests {
             events[2],
             StreamEvent::ContentBlockCompleted { .. }
         ));
-        assert!(matches!(events[3], StreamEvent::MessageDelta { .. }));
-        assert!(matches!(events[4], StreamEvent::MessageCompleted));
-        assert!(matches!(events[5], StreamEvent::MessageStart { .. }));
+        assert!(matches!(events[3], StreamEvent::MessageStart { .. }));
+        assert!(matches!(events[4], StreamEvent::MessageDelta { .. }));
+        assert!(matches!(events[5], StreamEvent::MessageCompleted));
         assert_eq!(events.len(), 6);
         assert_eq!(mapper.last_response_id(), Some("resp_1"));
     }

@@ -358,6 +358,23 @@ impl ResponsesEventMapper {
         self.terminal_outcome
     }
 
+    /// Queues `MessageStart` then `MessageDelta` and returns `MessageCompleted`.
+    /// `push_json` appends the returned event after anything queued here, so
+    /// the returned event must be the last one. The engine dedupes the shared
+    /// usage only when `MessageStart` arrives first; the reverse order counts
+    /// it twice.
+    fn queue_terminal_events(&mut self, usage: Usage, stop_reason: &str) -> StreamEvent {
+        self.pending.push_back(StreamEvent::MessageStart {
+            model: self.model.clone(),
+            usage: usage.clone(),
+        });
+        self.pending.push_back(StreamEvent::MessageDelta {
+            stop_reason: Some(stop_reason.to_string()),
+            usage: Some(usage.into()),
+        });
+        StreamEvent::MessageCompleted
+    }
+
     /// Closes a tool call, reconciling its streamed arguments against the
     /// snapshot on the terminal event.
     ///
@@ -721,20 +738,7 @@ impl ResponsesEventMapper {
                     }
                 };
 
-                self.pending.push_back(StreamEvent::MessageStart {
-                    model: self.model.clone(),
-                    usage: usage.clone(),
-                });
-                self.pending.push_back(StreamEvent::MessageDelta {
-                    stop_reason: Some(stop_reason.to_string()),
-                    usage: Some(usage.into()),
-                });
-                self.pending.push_back(StreamEvent::MessageCompleted);
-
-                Ok(self
-                    .pending
-                    .pop_front()
-                    .expect("pending should contain events"))
+                Ok(self.queue_terminal_events(usage, stop_reason))
             }
             "response.incomplete" => {
                 let response = value.get("response").unwrap_or(&Value::Null);
@@ -747,20 +751,7 @@ impl ResponsesEventMapper {
                     .filter(|reason| !reason.is_empty())
                     .unwrap_or("incomplete");
 
-                self.pending.push_back(StreamEvent::MessageStart {
-                    model: self.model.clone(),
-                    usage: usage.clone(),
-                });
-                self.pending.push_back(StreamEvent::MessageDelta {
-                    stop_reason: Some(stop_reason.to_string()),
-                    usage: Some(usage.into()),
-                });
-                self.pending.push_back(StreamEvent::MessageCompleted);
-
-                Ok(self
-                    .pending
-                    .pop_front()
-                    .expect("pending should contain events"))
+                Ok(self.queue_terminal_events(usage, stop_reason))
             }
             "response.failed" => {
                 let response = value.get("response").unwrap_or(&Value::Null);
@@ -926,11 +917,67 @@ mod tests {
         assert_eq!(usage.cache_creation_input_tokens, 3);
     }
 
+    /// Feeds one payload through `push_json`, the production path, and drains
+    /// every event it produced in emission order.
+    fn push_and_drain(mapper: &mut ResponsesEventMapper, payload: &Value) -> Vec<StreamEvent> {
+        mapper.push_json(&payload.to_string()).unwrap();
+        std::iter::from_fn(|| mapper.pop()).collect()
+    }
+
+    fn terminal_events(usage: &Usage, stop_reason: &str) -> Vec<StreamEvent> {
+        vec![
+            StreamEvent::MessageStart {
+                model: "gpt-5.3-codex-spark".to_string(),
+                usage: usage.clone(),
+            },
+            StreamEvent::MessageDelta {
+                stop_reason: Some(stop_reason.to_string()),
+                usage: Some(usage.clone().into()),
+            },
+            StreamEvent::MessageCompleted,
+        ]
+    }
+
+    /// The engine dedupes the usage shared by `MessageStart` and
+    /// `MessageDelta` only when `MessageStart` comes first. The reverse order
+    /// recorded every Responses request at exactly twice its real usage.
+    #[test]
+    fn response_completed_emits_message_start_before_delta() {
+        for event_type in ["response.completed", "response.done"] {
+            let mut mapper = mapper();
+            let events = push_and_drain(
+                &mut mapper,
+                &json!({
+                    "type": event_type,
+                    "response": {
+                        "id": "resp_1",
+                        "status": "completed",
+                        "usage": {
+                            "input_tokens": 13,
+                            "output_tokens": 262,
+                            "input_tokens_details": { "cached_tokens": 4 }
+                        }
+                    }
+                }),
+            );
+
+            let usage = Usage {
+                input_tokens: 9,
+                output_tokens: 262,
+                cache_read_input_tokens: 4,
+                cache_creation_input_tokens: 0,
+            };
+            assert_eq!(events, terminal_events(&usage, "stop"), "{event_type}");
+            assert_eq!(mapper.terminal_outcome(), Some(TerminalOutcome::Completed));
+        }
+    }
+
     #[test]
     fn response_incomplete_preserves_reason_and_usage() {
         let mut mapper = mapper();
-        let event = mapper
-            .map_event(json!({
+        let events = push_and_drain(
+            &mut mapper,
+            &json!({
                 "type": "response.incomplete",
                 "response": {
                     "status": "incomplete",
@@ -944,28 +991,16 @@ mod tests {
                         }
                     }
                 }
-            }))
-            .unwrap();
+            }),
+        );
 
-        assert!(matches!(
-            event,
-            StreamEvent::MessageStart {
-                usage: Usage {
-                    input_tokens: 15,
-                    output_tokens: 7,
-                    cache_read_input_tokens: 2,
-                    cache_creation_input_tokens: 3,
-                },
-                ..
-            }
-        ));
-        assert!(matches!(
-            mapper.pop(),
-            Some(StreamEvent::MessageDelta {
-                stop_reason: Some(reason),
-                ..
-            }) if reason == "max_tokens"
-        ));
+        let usage = Usage {
+            input_tokens: 15,
+            output_tokens: 7,
+            cache_read_input_tokens: 2,
+            cache_creation_input_tokens: 3,
+        };
+        assert_eq!(events, terminal_events(&usage, "max_tokens"));
         assert_eq!(mapper.terminal_outcome(), Some(TerminalOutcome::Incomplete));
         assert_eq!(mapper.last_response_id(), None);
     }
@@ -973,22 +1008,17 @@ mod tests {
     #[test]
     fn response_incomplete_does_not_assume_token_limit() {
         let mut mapper = mapper();
-        let _ = mapper
-            .map_event(json!({
+        let events = push_and_drain(
+            &mut mapper,
+            &json!({
                 "type": "response.incomplete",
                 "response": {
                     "incomplete_details": { "reason": "content_filter" }
                 }
-            }))
-            .unwrap();
+            }),
+        );
 
-        assert!(matches!(
-            mapper.pop(),
-            Some(StreamEvent::MessageDelta {
-                stop_reason: Some(reason),
-                ..
-            }) if reason == "content_filter"
-        ));
+        assert_eq!(events, terminal_events(&Usage::default(), "content_filter"));
     }
 
     #[test]
@@ -1042,15 +1072,15 @@ mod tests {
 
         assert!(matches!(
             parser.next().await,
+            Some(Ok(StreamEvent::MessageStart { .. }))
+        ));
+        assert!(matches!(
+            parser.next().await,
             Some(Ok(StreamEvent::MessageDelta { .. }))
         ));
         assert!(matches!(
             parser.next().await,
             Some(Ok(StreamEvent::MessageCompleted))
-        ));
-        assert!(matches!(
-            parser.next().await,
-            Some(Ok(StreamEvent::MessageStart { .. }))
         ));
         assert!(parser.next().await.is_none());
     }
@@ -2000,7 +2030,7 @@ mod tests {
             }))
             .unwrap();
 
-        assert!(matches!(event, StreamEvent::MessageStart { .. }));
+        assert!(matches!(event, StreamEvent::MessageCompleted));
         assert_eq!(mapper.last_response_id(), Some("resp_123"));
     }
 
