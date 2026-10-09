@@ -110,7 +110,7 @@ fn image_tool_model(model: &str) -> Option<&str> {
 
 fn responses_model_for_image_generation(model: &str) -> &str {
     if model.eq_ignore_ascii_case("gpt-image-2") || image_tool_model(model).is_some() {
-        "gpt-5.6-sol"
+        "gpt-6.1-sol"
     } else {
         model
     }
@@ -378,7 +378,7 @@ mod tests {
             None,
         );
 
-        assert_eq!(request["model"], serde_json::json!("gpt-5.6-sol"));
+        assert_eq!(request["model"], serde_json::json!("gpt-6.1-sol"));
         assert_eq!(request["stream"], serde_json::json!(true));
         assert_eq!(
             request["instructions"],
@@ -465,7 +465,7 @@ mod tests {
     fn image_generation_model_alias_uses_responses_model() {
         assert_eq!(
             responses_model_for_image_generation("gpt-image-2"),
-            "gpt-5.6-sol"
+            "gpt-6.1-sol"
         );
         assert_eq!(responses_model_for_image_generation("gpt-5.4"), "gpt-5.4");
     }
@@ -486,7 +486,7 @@ mod tests {
                 None,
             );
 
-            assert_eq!(request["model"], serde_json::json!("gpt-5.6-sol"));
+            assert_eq!(request["model"], serde_json::json!("gpt-6.1-sol"));
             assert_eq!(request["tools"][0]["model"], serde_json::json!(model));
         }
 
