@@ -310,3 +310,181 @@ fn test_automations_reject_global_model_flag() {
             "--model is not supported for automations",
         ));
 }
+
+fn write_daemon_config(root: &std::path::Path, model: &str) {
+    fs::create_dir_all(root.join(".zdx")).unwrap();
+    fs::write(
+        root.join(".zdx").join("config.toml"),
+        format!("model = \"{model}\"\n"),
+    )
+    .unwrap();
+}
+
+fn daemon_list(
+    zdx_home: &std::path::Path,
+    home: &std::path::Path,
+    caller_root: &std::path::Path,
+) -> serde_json::Value {
+    let output = crate::fixtures::zdx_cmd()
+        .env("ZDX_HOME", zdx_home)
+        .env("HOME", home)
+        .current_dir(caller_root)
+        .args([
+            "--root",
+            caller_root.to_str().unwrap(),
+            "automations",
+            "list",
+            "--daemon",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    serde_json::from_slice(&output).unwrap()
+}
+
+fn find<'a>(view: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
+    view["automations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["name"] == name)
+        .unwrap()
+}
+
+/// The caller's own root and config never stand in for the daemon's.
+#[test]
+fn test_list_daemon_uses_running_daemon_context_not_caller_root() {
+    let zdx_home = TempDir::new().unwrap();
+    let home = TempDir::new().unwrap();
+    let daemon_root = TempDir::new().unwrap();
+    write_daemon_config(daemon_root.path(), "claude-cli@work:claude-opus-5@high");
+    let caller_root = TempDir::new().unwrap();
+    write_daemon_config(caller_root.path(), "openai-codex:gpt-5.4@low");
+    let scoped_root = TempDir::new().unwrap();
+    write_automation(zdx_home.path(), "inherited", "");
+    write_automation(
+        zdx_home.path(),
+        "scoped",
+        &format!(
+            "root: \"{}\"\nmodel: \"{MOCK_MODEL}@medium\"\n",
+            scoped_root.path().display()
+        ),
+    );
+
+    let run = zdx_home.path().join("run");
+    fs::create_dir_all(&run).unwrap();
+    let pid = std::process::id();
+    fs::write(run.join("daemon.pid"), pid.to_string()).unwrap();
+    fs::write(
+        run.join("daemon.context.json"),
+        serde_json::json!({
+            "pid": pid,
+            "root": daemon_root.path(),
+            "config_dir": daemon_root.path(),
+            "started_at": "2026-10-12T08:00:00Z",
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let view = daemon_list(zdx_home.path(), home.path(), caller_root.path());
+    assert_eq!(view["daemon"]["status"], "available");
+    assert_eq!(view["daemon"]["context"]["source"], "running");
+    assert_eq!(view["daemon"]["context"]["pid"], pid);
+
+    let inherited = &find(&view, "inherited")["settings"];
+    assert_eq!(
+        inherited["root"]["path"],
+        daemon_root.path().to_string_lossy().as_ref()
+    );
+    assert_eq!(inherited["root"]["origin"], "daemon");
+    assert_eq!(
+        inherited["model"]["spec"],
+        "claude-cli@work:claude-opus-5@high"
+    );
+    assert_eq!(inherited["model"]["account"], "work");
+    assert_eq!(inherited["model"]["thinking"], "high");
+    assert_eq!(inherited["model"]["origin"], "config");
+
+    let scoped = &find(&view, "scoped")["settings"];
+    assert_eq!(
+        scoped["root"]["path"],
+        scoped_root.path().to_string_lossy().as_ref()
+    );
+    assert_eq!(scoped["root"]["origin"], "automation");
+    assert_eq!(scoped["model"]["spec"], format!("{MOCK_MODEL}@medium"));
+    assert_eq!(scoped["model"]["origin"], "automation");
+}
+
+#[test]
+fn test_list_daemon_reports_installed_service_when_stopped() {
+    let zdx_home = TempDir::new().unwrap();
+    let home = TempDir::new().unwrap();
+    let daemon_root = TempDir::new().unwrap();
+    write_daemon_config(daemon_root.path(), "claude-cli:claude-sonnet-5@low");
+    let caller_root = TempDir::new().unwrap();
+    write_automation(zdx_home.path(), "inherited", "");
+
+    let agents = home.path().join("Library").join("LaunchAgents");
+    fs::create_dir_all(&agents).unwrap();
+    let root = daemon_root.path().display();
+    fs::write(
+        agents.join("dev.zdx.daemon.plist"),
+        format!(
+            "<plist><dict>\n<key>ProgramArguments</key><array>\n<string>/bin/zsh</string>\n\
+             <string>-c</string>\n<string>exec '/bin/zdx' '--root' '{root}' 'automations' \
+             'daemon'</string>\n</array>\n<key>WorkingDirectory</key>\n<string>{root}</string>\n\
+             <key>EnvironmentVariables</key><dict>\n<key>ZDX_HOME</key>\n<string>{}</string>\n\
+             </dict></dict></plist>\n",
+            zdx_home.path().display()
+        ),
+    )
+    .unwrap();
+
+    let view = daemon_list(zdx_home.path(), home.path(), caller_root.path());
+    let context = &view["daemon"]["context"];
+    assert_eq!(context["source"], "installed");
+    assert!(context["pid"].is_null());
+    assert!(context["note"].as_str().unwrap().contains("not running"));
+    let inherited = &find(&view, "inherited")["settings"];
+    assert_eq!(inherited["root"]["path"], root.to_string());
+    assert_eq!(inherited["model"]["spec"], "claude-cli:claude-sonnet-5@low");
+}
+
+#[test]
+fn test_list_daemon_unavailable_never_falls_back_to_caller_root() {
+    let zdx_home = TempDir::new().unwrap();
+    let home = TempDir::new().unwrap();
+    let caller_root = TempDir::new().unwrap();
+    let scoped_root = TempDir::new().unwrap();
+    write_automation(zdx_home.path(), "inherited", "");
+    write_automation(
+        zdx_home.path(),
+        "scoped",
+        &format!("root: \"{}\"\n", scoped_root.path().display()),
+    );
+
+    let view = daemon_list(zdx_home.path(), home.path(), caller_root.path());
+    assert_eq!(view["daemon"]["status"], "unavailable");
+    assert!(
+        view["daemon"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("not running")
+    );
+    let inherited = find(&view, "inherited");
+    assert!(inherited["settings"].is_null());
+    assert!(
+        inherited["error"]
+            .as_str()
+            .unwrap()
+            .contains("daemon settings unavailable")
+    );
+    assert_eq!(
+        find(&view, "scoped")["settings"]["root"]["path"],
+        scoped_root.path().to_string_lossy().as_ref()
+    );
+}

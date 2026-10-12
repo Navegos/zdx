@@ -2,6 +2,7 @@
 
 pub mod agent_activity;
 pub mod audio;
+pub mod automation_daemon;
 pub mod automations;
 pub mod background_activity;
 pub mod config;

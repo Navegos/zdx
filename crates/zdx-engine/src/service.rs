@@ -228,6 +228,128 @@ pub fn render_plist(service: Service, program: &Path, root: &Path) -> String {
     )
 }
 
+/// How an installed service is configured to start, read back from its plist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstalledLaunch {
+    /// `--root` passed to the service.
+    pub root: PathBuf,
+    /// Working directory, which is where the service loads its config layers.
+    pub working_directory: PathBuf,
+    /// `ZDX_HOME` set for the service, if any.
+    pub zdx_home: Option<PathBuf>,
+}
+
+/// Reads the installed plist of `service`. `None` when it is not installed.
+///
+/// This is the configuration launchd applies at the next start, not proof of
+/// what a running process was started with.
+pub fn installed_launch(service: Service) -> Option<Result<InstalledLaunch>> {
+    let path = service.plist_path();
+    if !path.is_file() {
+        return None;
+    }
+    Some(
+        fs::read_to_string(&path)
+            .with_context(|| format!("read {}", path.display()))
+            .and_then(|text| {
+                parse_launch(&text).with_context(|| format!("parse {}", path.display()))
+            }),
+    )
+}
+
+/// Parses a plist written by [`render_plist`].
+///
+/// # Errors
+/// Returns an error when the plist does not have the rendered shape.
+pub fn parse_launch(plist: &str) -> Result<InstalledLaunch> {
+    let working_directory =
+        plist_string_after_key(plist, "WorkingDirectory").context("missing WorkingDirectory")?;
+    let zdx_home = plist_string_after_key(plist, "ZDX_HOME");
+    let command = plist_strings(plist)
+        .into_iter()
+        .find(|value| value.starts_with("exec "))
+        .context("missing service command")?;
+    let words = shell_unquote_words(command.trim_start_matches("exec "))?;
+    let root = words
+        .iter()
+        .position(|word| word == "--root")
+        .and_then(|index| words.get(index + 1))
+        .context("service command has no --root")?;
+    Ok(InstalledLaunch {
+        root: PathBuf::from(root),
+        working_directory: PathBuf::from(working_directory),
+        zdx_home: zdx_home.map(PathBuf::from),
+    })
+}
+
+fn plist_strings(plist: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = plist;
+    while let Some(start) = rest.find("<string>") {
+        let after = &rest[start + "<string>".len()..];
+        let Some(end) = after.find("</string>") else {
+            break;
+        };
+        out.push(xml_unescape(&after[..end]));
+        rest = &after[end..];
+    }
+    out
+}
+
+fn plist_string_after_key(plist: &str, key: &str) -> Option<String> {
+    let marker = format!("<key>{key}</key>");
+    let after = &plist[plist.find(&marker)? + marker.len()..];
+    let value = after.trim_start().strip_prefix("<string>")?;
+    Some(xml_unescape(&value[..value.find("</string>")?]))
+}
+
+fn xml_unescape(value: &str) -> String {
+    value
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
+/// Splits a command made of [`shell_quote`]d words.
+fn shell_unquote_words(command: &str) -> Result<Vec<String>> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut in_word = false;
+    let mut chars = command.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\'' => {
+                in_word = true;
+                loop {
+                    match chars.next() {
+                        Some('\'') => break,
+                        Some(c) => current.push(c),
+                        None => bail!("unterminated quote in service command"),
+                    }
+                }
+            }
+            '\\' if in_word => match chars.next() {
+                Some(c) => current.push(c),
+                None => bail!("dangling escape in service command"),
+            },
+            ' ' => {
+                if in_word {
+                    words.push(std::mem::take(&mut current));
+                    in_word = false;
+                }
+            }
+            other => {
+                in_word = true;
+                current.push(other);
+            }
+        }
+    }
+    if in_word {
+        words.push(current);
+    }
+    Ok(words)
+}
+
 /// Writes the plist for `service` and bootstraps it into the GUI domain.
 ///
 /// # Errors
@@ -675,6 +797,21 @@ mod tests {
     #[test]
     fn shell_quotes_embedded_single_quote() {
         assert_eq!(shell_quote("/tmp/it's"), r"'/tmp/it'\''s'");
+    }
+
+    #[test]
+    fn parse_launch_reads_back_rendered_plist() {
+        let plist = render_plist(
+            Service::Daemon,
+            Path::new("/Users/x/.local/bin/zdx"),
+            Path::new("/Users/x/it's <work> & co"),
+        );
+        let launch = parse_launch(&plist).unwrap();
+        assert_eq!(launch.root, PathBuf::from("/Users/x/it's <work> & co"));
+        assert_eq!(launch.working_directory, launch.root);
+        assert_eq!(launch.zdx_home, Some(paths::zdx_home()));
+
+        assert!(parse_launch("<plist></plist>").is_err());
     }
 
     #[test]

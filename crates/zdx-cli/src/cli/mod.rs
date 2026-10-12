@@ -651,6 +651,10 @@ enum AutomationCommands {
         /// Output JSON with declared and resolved root/model per automation
         #[arg(long)]
         json: bool,
+        /// Resolve settings the way the scheduled daemon does (its root and
+        /// config), instead of for this process's --root
+        #[arg(long)]
+        daemon: bool,
     },
     /// Validate automation files
     Validate,
@@ -1553,7 +1557,11 @@ async fn dispatch_automations(
         system_prompt_override: context.system_prompt,
     };
     match command {
-        AutomationCommands::List { json } => commands::automations::list(&caller, json),
+        AutomationCommands::List { json, daemon: true } => commands::automations::list_daemon(json),
+        AutomationCommands::List {
+            json,
+            daemon: false,
+        } => commands::automations::list(&caller, json),
         AutomationCommands::Validate => commands::automations::validate(&caller),
         AutomationCommands::Daemon { poll_interval_secs } => {
             let thread_opts: ThreadPersistenceOptions = context.thread_args.into();

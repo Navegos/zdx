@@ -82,9 +82,12 @@ pub enum SettingOrigin {
     /// Inherited from the config layers in effect for the run: the caller's
     /// config, or the declared root's layers when `root` is set.
     Config,
-    /// Inherited from the caller's root: whoever resolved the settings (CLI
-    /// `--root`, the daemon, or a Monitor), not necessarily the daemon.
+    /// Inherited from the caller's root: the process that resolved the
+    /// settings (`zdx automations run|validate|list --root`).
     Caller,
+    /// Inherited from the scheduled daemon's root (see
+    /// [`crate::automation_daemon`]), whichever process asks.
+    Daemon,
 }
 
 impl SettingOrigin {
@@ -97,6 +100,7 @@ impl SettingOrigin {
             Self::SubagentOverride => "subagent_override",
             Self::Config => "config",
             Self::Caller => "caller",
+            Self::Daemon => "daemon",
         }
     }
 
@@ -104,7 +108,7 @@ impl SettingOrigin {
     /// or its subagent.
     #[must_use]
     pub const fn is_inherited(self) -> bool {
-        matches!(self, Self::Config | Self::Caller)
+        matches!(self, Self::Config | Self::Caller | Self::Daemon)
     }
 }
 
@@ -112,7 +116,8 @@ impl SettingOrigin {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ResolvedAutomationRoot {
     pub path: PathBuf,
-    /// `Automation` when set in frontmatter, otherwise `Caller`.
+    /// `Automation` when set in frontmatter, otherwise the inherited context's
+    /// origin (`Caller` or `Daemon`).
     pub origin: SettingOrigin,
 }
 
@@ -170,6 +175,15 @@ pub struct AutomationOverview {
     pub error: Option<String>,
 }
 
+/// The config and root an automation without its own `root` inherits.
+#[derive(Debug, Clone, Copy)]
+pub struct InheritedContext<'a> {
+    pub config: &'a Config,
+    pub root: &'a Path,
+    /// Reported origin of an inherited root: `Caller` or `Daemon`.
+    pub root_origin: SettingOrigin,
+}
+
 /// Resolves the root, config, subagent, and model one automation runs with.
 ///
 /// `base` and `caller_root` are the caller's config and root. Without a
@@ -187,16 +201,47 @@ pub fn resolve_run(
     caller_root: &Path,
     automation: &AutomationDefinition,
 ) -> Result<ResolvedAutomationRun> {
-    let root = resolve_root(
-        automation.root.as_deref(),
-        caller_root,
-        paths::home_dir().as_deref(),
-    )?;
-    let mut config = if root.origin == SettingOrigin::Automation {
-        Config::load_layered(&paths::config_layer_paths_for(&root.path))
-            .with_context(|| format!("load config for root {}", root.path.display()))?
+    resolve_run_from(
+        Ok(InheritedContext {
+            config: base,
+            root: caller_root,
+            root_origin: SettingOrigin::Caller,
+        }),
+        automation,
+    )
+}
+
+/// Like [`resolve_run`], with the inherited context supplied by the caller.
+/// `Err(reason)` means no inherited context is known: an automation that
+/// declares its own `root` still resolves, any other fails with `reason`.
+///
+/// # Errors
+/// As [`resolve_run`], plus `reason` for an automation that needs the
+/// missing inherited context.
+pub fn resolve_run_from(
+    inherited: std::result::Result<InheritedContext<'_>, &str>,
+    automation: &AutomationDefinition,
+) -> Result<ResolvedAutomationRun> {
+    let (root, mut config) = if let Some(raw) = automation.root.as_deref() {
+        let path = resolve_declared_root(raw, paths::home_dir().as_deref())?;
+        let config = Config::load_layered(&paths::config_layer_paths_for(&path))
+            .with_context(|| format!("load config for root {}", path.display()))?;
+        (
+            ResolvedAutomationRoot {
+                path,
+                origin: SettingOrigin::Automation,
+            },
+            config,
+        )
     } else {
-        base.clone()
+        let inherited = inherited.map_err(|reason| anyhow::anyhow!("{reason}"))?;
+        (
+            ResolvedAutomationRoot {
+                path: inherited.root.to_path_buf(),
+                origin: inherited.root_origin,
+            },
+            inherited.config.clone(),
+        )
     };
 
     let mut model_origin = SettingOrigin::Config;
@@ -264,8 +309,25 @@ pub fn overview(
     caller_root: &Path,
     automation: &AutomationDefinition,
 ) -> AutomationOverview {
-    let (settings, error) = match resolve_run_settings(base, caller_root, automation) {
-        Ok(settings) => (Some(settings), None),
+    overview_from(
+        Ok(InheritedContext {
+            config: base,
+            root: caller_root,
+            root_origin: SettingOrigin::Caller,
+        }),
+        automation,
+    )
+}
+
+/// Like [`overview`], with the inherited context supplied by the caller (see
+/// [`resolve_run_from`]).
+#[must_use]
+pub fn overview_from(
+    inherited: std::result::Result<InheritedContext<'_>, &str>,
+    automation: &AutomationDefinition,
+) -> AutomationOverview {
+    let (settings, error) = match resolve_run_from(inherited, automation) {
+        Ok(run) => (Some(run.settings), None),
         Err(error) => (None, Some(format!("{error:#}"))),
     };
     AutomationOverview {
@@ -282,17 +344,7 @@ pub fn overview(
     }
 }
 
-fn resolve_root(
-    declared: Option<&str>,
-    caller_root: &Path,
-    home: Option<&Path>,
-) -> Result<ResolvedAutomationRoot> {
-    let Some(raw) = declared else {
-        return Ok(ResolvedAutomationRoot {
-            path: caller_root.to_path_buf(),
-            origin: SettingOrigin::Caller,
-        });
-    };
+fn resolve_declared_root(raw: &str, home: Option<&Path>) -> Result<PathBuf> {
     let path = expand_root(raw, home)?;
     if !path.is_dir() {
         bail!(
@@ -300,10 +352,7 @@ fn resolve_root(
             path.display()
         );
     }
-    Ok(ResolvedAutomationRoot {
-        path,
-        origin: SettingOrigin::Automation,
-    })
+    Ok(path)
 }
 
 fn expand_root(raw: &str, home: Option<&Path>) -> Result<PathBuf> {
@@ -760,21 +809,37 @@ mod tests {
     }
 
     #[test]
-    fn resolve_root_falls_back_to_caller_only_when_undeclared() {
+    fn declared_root_wins_and_missing_inherited_context_fails_only_undeclared() {
+        let _home = crate::test_support::temp_zdx_home();
         let caller = tempdir().unwrap();
         let declared = tempdir().unwrap();
+        let config = Config::default();
+        let inherited = || {
+            Ok(InheritedContext {
+                config: &config,
+                root: caller.path(),
+                root_origin: SettingOrigin::Daemon,
+            })
+        };
 
-        let inherited = resolve_root(None, caller.path(), None).unwrap();
-        assert_eq!(inherited.path, caller.path());
-        assert_eq!(inherited.origin, SettingOrigin::Caller);
+        let plain = definition(Some("claude-cli:claude-opus-5@low"));
+        let run = resolve_run_from(inherited(), &plain).unwrap();
+        assert_eq!(run.settings.root.path, caller.path());
+        assert_eq!(run.settings.root.origin, SettingOrigin::Daemon);
 
-        let explicit =
-            resolve_root(Some(declared.path().to_str().unwrap()), caller.path(), None).unwrap();
-        assert_eq!(explicit.path, declared.path());
-        assert_eq!(explicit.origin, SettingOrigin::Automation);
+        let mut scoped = definition(Some("claude-cli:claude-opus-5@low"));
+        scoped.root = Some(declared.path().to_string_lossy().to_string());
+        let run = resolve_run_from(inherited(), &scoped).unwrap();
+        assert_eq!(run.settings.root.path, declared.path());
+        assert_eq!(run.settings.root.origin, SettingOrigin::Automation);
 
-        let missing = declared.path().join("gone");
-        assert!(resolve_root(Some(missing.to_str().unwrap()), caller.path(), None).is_err());
+        let unknown = Err("daemon not running");
+        assert!(resolve_run_from(unknown, &scoped).is_ok());
+        let err = resolve_run_from(unknown, &plain).unwrap_err();
+        assert!(format!("{err:#}").contains("daemon not running"));
+
+        scoped.root = Some(declared.path().join("gone").to_string_lossy().to_string());
+        assert!(resolve_run_from(inherited(), &scoped).is_err());
     }
 
     fn definition(model: Option<&str>) -> AutomationDefinition {

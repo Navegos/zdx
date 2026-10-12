@@ -12,6 +12,7 @@ use crossterm::event::{
 use crossterm::execute;
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::prelude::*;
+use zdx_engine::automation_daemon::DaemonContextState;
 use zdx_engine::automations::AutomationOverview;
 use zdx_engine::core::thread_index::{ThreadBrowseOptions, ThreadKindFilter};
 use zdx_engine::core::usage_stats::UsageStats;
@@ -103,10 +104,13 @@ pub struct MonitorApp {
     pub threads_scan_options: Option<ThreadBrowseOptions>,
     /// Raw thread JSONL queued to open after the current key event.
     pub(crate) pending_open_path: Option<PathBuf>,
-    /// Automations with settings resolved for `root`. Loaded on entry to the
-    /// Automations tab (not on the tick): resolution reads config and
-    /// subagent files.
+    /// Automations with settings resolved the way the scheduled daemon
+    /// resolves them, never for the Monitor's own `root`. Loaded on entry to
+    /// the Automations tab (not on the tick): resolution reads the daemon
+    /// record, service plist, config, and subagent files.
     pub automations: Vec<AutomationOverview>,
+    /// Where the daemon's settings came from, or why they are unknown.
+    pub automations_daemon: Option<DaemonContextState>,
     /// Why the Automations list could not be built, if it failed as a whole.
     pub automations_error: Option<String>,
     pub services: Vec<ServiceInfo>,
@@ -379,8 +383,9 @@ fn switch_section(app: &mut MonitorApp, section: Section) {
         app.log_query_editing = false;
     }
     if app.active_section == Section::Automations {
-        let snapshot = load_automations(&app.root);
-        app.automations = snapshot.items;
+        let snapshot = load_automations();
+        app.automations = snapshot.automations;
+        app.automations_daemon = Some(snapshot.daemon);
         app.automations_error = snapshot.error;
     }
     if app.active_section == Section::Threads {
@@ -427,6 +432,7 @@ fn build_app(root: &Path) -> Result<MonitorApp> {
         threads_scan_options: None,
         pending_open_path: None,
         automations: Vec::new(),
+        automations_daemon: None,
         automations_error: None,
         services,
         restart_job: None,

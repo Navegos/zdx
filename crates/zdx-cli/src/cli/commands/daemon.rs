@@ -8,8 +8,9 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use chrono::Local;
 use serde::{Deserialize, Serialize};
+use zdx_engine::automations::AutomationDefinition;
 use zdx_engine::core::thread_persistence::ThreadPersistenceOptions;
-use zdx_engine::{automations, config};
+use zdx_engine::{automation_daemon, automations, config};
 
 use super::automations as automation_commands;
 
@@ -35,6 +36,9 @@ pub async fn run(
     let state_path = daemon_state_path();
     let mut state = load_state(&state_path)?;
     let _pid_guard = zdx_engine::pidfile::write("daemon").context("write daemon PID file")?;
+    let config_dir = std::env::current_dir().context("read daemon working directory")?;
+    let _record_guard = automation_daemon::record_running(root, &config_dir)
+        .context("write daemon context record")?;
 
     tracing::info!(root = %root.display(), poll_secs = poll.as_secs(), "Daemon started");
 
@@ -42,59 +46,98 @@ pub async fn run(
         let now = Local::now();
         let current_bucket = now.timestamp() / 60;
 
-        match automations::discover(root) {
-            Ok(defs) => {
-                for automation in defs {
-                    let Some(schedule) = automation.schedule.as_deref() else {
-                        continue;
+        let due: Vec<_> = match automations::discover(root) {
+            Ok(defs) => defs
+                .into_iter()
+                .filter(|automation| is_due(automation, now, &state, current_bucket))
+                .collect(),
+            Err(err) => {
+                tracing::error!(err = format!("{err:#}"), "Failed to discover automations");
+                Vec::new()
+            }
+        };
+
+        if !due.is_empty() {
+            // Reload config for every due tick, so runs (and every surface that
+            // shows the daemon's settings) use the config files as they are now,
+            // not as they were when the daemon started.
+            match load_config(caller.system_prompt_override) {
+                Ok(config) => {
+                    let tick_caller = automation_commands::Caller {
+                        root,
+                        config: &config,
+                        system_prompt_override: caller.system_prompt_override,
                     };
-
-                    match automations::schedule_matches_local_time(schedule, now) {
-                        Ok(false) => continue,
-                        Err(err) => {
-                            tracing::warn!(name = %automation.name, err = format!("{err:#}"), "Invalid schedule for automation");
-                            continue;
-                        }
-                        Ok(true) => {}
-                    }
-
-                    if state.last_run_minute.get(&automation.name) == Some(&current_bucket) {
-                        continue;
-                    }
-
-                    tracing::info!(name = %automation.name, "Running automation");
-                    match automation_commands::run_definition(
-                        caller,
-                        thread_opts,
-                        &automation,
-                        automation_commands::RunTrigger::Daemon,
-                    )
-                    .await
-                    {
-                        Ok(()) => {
-                            state
-                                .last_run_minute
-                                .insert(automation.name.clone(), current_bucket);
-                            if let Err(err) = save_state(&state_path, &state) {
-                                tracing::error!(
-                                    err = format!("{err:#}"),
-                                    "Failed to persist daemon state"
-                                );
+                    for automation in due {
+                        tracing::info!(name = %automation.name, "Running automation");
+                        match automation_commands::run_definition(
+                            &tick_caller,
+                            thread_opts,
+                            &automation,
+                            automation_commands::RunTrigger::Daemon,
+                        )
+                        .await
+                        {
+                            Ok(()) => {
+                                state
+                                    .last_run_minute
+                                    .insert(automation.name.clone(), current_bucket);
+                                if let Err(err) = save_state(&state_path, &state) {
+                                    tracing::error!(
+                                        err = format!("{err:#}"),
+                                        "Failed to persist daemon state"
+                                    );
+                                }
                             }
-                        }
-                        Err(err) => {
-                            tracing::error!(name = %automation.name, err = format!("{err:#}"), "Automation failed");
+                            Err(err) => {
+                                tracing::error!(name = %automation.name, err = format!("{err:#}"), "Automation failed");
+                            }
                         }
                     }
                 }
-            }
-            Err(err) => {
-                tracing::error!(err = format!("{err:#}"), "Failed to discover automations");
+                Err(err) => {
+                    tracing::error!(
+                        err = format!("{err:#}"),
+                        "Failed to load config for due automations"
+                    );
+                    for automation in &due {
+                        automation_commands::record_failed_start(
+                            automation,
+                            automation_commands::RunTrigger::Daemon,
+                            &err,
+                        );
+                    }
+                }
             }
         }
 
         tokio::time::sleep(poll).await;
     }
+}
+
+fn is_due(
+    automation: &AutomationDefinition,
+    now: chrono::DateTime<Local>,
+    state: &DaemonState,
+    current_bucket: i64,
+) -> bool {
+    let Some(schedule) = automation.schedule.as_deref() else {
+        return false;
+    };
+    match automations::schedule_matches_local_time(schedule, now) {
+        Ok(true) => state.last_run_minute.get(&automation.name) != Some(&current_bucket),
+        Ok(false) => false,
+        Err(err) => {
+            tracing::warn!(name = %automation.name, err = format!("{err:#}"), "Invalid schedule for automation");
+            false
+        }
+    }
+}
+
+fn load_config(system_prompt_override: Option<&str>) -> Result<config::Config> {
+    let mut config = config::Config::load().context("load config")?;
+    crate::cli::apply_system_prompt_override(&mut config, system_prompt_override);
+    Ok(config)
 }
 
 fn daemon_state_path() -> PathBuf {

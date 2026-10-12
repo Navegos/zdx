@@ -2,49 +2,28 @@ use std::path::{Path, PathBuf};
 
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
-use zdx_engine::automations::{self, AutomationOverview, SettingOrigin};
-use zdx_engine::config::{Config, paths};
+use zdx_engine::automation_daemon::{
+    self, DaemonAutomations, DaemonContext, DaemonContextSource, DaemonContextState,
+};
+use zdx_engine::automations::{AutomationOverview, SettingOrigin};
+use zdx_engine::config::paths;
 
 use crate::app::MonitorApp;
 use crate::ui::{SELECTED_BG, truncate_chars};
 
-/// Automations resolved against the monitor root, or why they could not be
-/// listed at all. Per-automation resolution errors stay on each overview.
-pub(crate) struct AutomationsSnapshot {
-    pub items: Vec<AutomationOverview>,
-    pub error: Option<String>,
-}
-
-/// Discovers automations and resolves their settings through the shared
-/// engine contract, as a caller rooted at `root` would. Reads config and
-/// subagent files, so call it on tab entry, not on the refresh tick.
-pub(crate) fn load_automations(root: &Path) -> AutomationsSnapshot {
-    let failed = |error: String| AutomationsSnapshot {
-        items: Vec::new(),
-        error: Some(error),
-    };
-    let config = match Config::load_layered(&paths::config_layer_paths_for(root)) {
-        Ok(config) => config,
-        Err(err) => return failed(format!("load config: {err:#}")),
-    };
-    let definitions = match automations::discover(root) {
-        Ok(definitions) => definitions,
-        Err(err) => return failed(format!("discover automations: {err:#}")),
-    };
-    AutomationsSnapshot {
-        items: definitions
-            .iter()
-            .map(|definition| automations::overview(&config, root, definition))
-            .collect(),
-        error: None,
-    }
+/// Automations resolved the way the scheduled daemon resolves them, through
+/// the shared engine view. Never uses the Monitor's own root. Reads the
+/// daemon record, service plist, config, and subagent files, so call it on
+/// tab entry, not on the refresh tick.
+pub(crate) fn load_automations() -> DaemonAutomations {
+    automation_daemon::automations()
 }
 
 struct AutomationsView<'a> {
     items: &'a [AutomationOverview],
     error: Option<&'a str>,
     selected: usize,
-    monitor_root: &'a Path,
+    daemon: Option<&'a DaemonContextState>,
     home: Option<&'a Path>,
 }
 
@@ -54,10 +33,54 @@ pub(crate) fn render_automations(f: &mut Frame, app: &MonitorApp, area: Rect) {
         items: &app.automations,
         error: app.automations_error.as_deref(),
         selected: app.selected_index,
-        monitor_root: &app.root,
+        daemon: app.automations_daemon.as_ref(),
         home: home.as_deref(),
     };
     render_view(f, &view, area);
+}
+
+/// Short daemon-context label for the list title.
+fn daemon_title(daemon: Option<&DaemonContextState>, home: Option<&Path>) -> String {
+    match daemon {
+        Some(DaemonContextState::Available { context }) => format!(
+            "{} · root {}",
+            source_label(context),
+            display_path(&context.root, home)
+        ),
+        Some(DaemonContextState::Unavailable { .. }) => "daemon settings unavailable".to_string(),
+        None => "daemon not checked".to_string(),
+    }
+}
+
+fn source_label(context: &DaemonContext) -> &'static str {
+    match context.source {
+        DaemonContextSource::Running => "running daemon",
+        DaemonContextSource::Installed => "installed daemon (next start)",
+    }
+}
+
+/// Explains where inherited values come from, for the detail pane.
+fn daemon_note(daemon: Option<&DaemonContextState>, home: Option<&Path>) -> String {
+    match daemon {
+        Some(DaemonContextState::Available { context }) => {
+            let mut text = format!(
+                "Inherited values come from the {} (root {}, config from {}).",
+                source_label(context),
+                display_path(&context.root, home),
+                display_path(&context.config_dir, home)
+            );
+            if let Some(note) = &context.note {
+                text.push(' ');
+                text.push_str(note);
+                text.push('.');
+            }
+            text
+        }
+        Some(DaemonContextState::Unavailable { reason }) => {
+            format!("Daemon settings unavailable: {reason}.")
+        }
+        None => "Daemon settings not checked yet.".to_string(),
+    }
 }
 
 /// Rows below which the detail pane is dropped so the list stays usable.
@@ -78,8 +101,8 @@ fn render_view(f: &mut Frame, view: &AutomationsView, area: Rect) {
 
     let title = if area.width >= 60 {
         format!(
-            " Automations · * inherited · resolved for {} ",
-            display_path(view.monitor_root, view.home)
+            " Automations · * inherited · {} ",
+            daemon_title(view.daemon, view.home)
         )
     } else {
         " Automations · * inherited ".to_string()
@@ -122,7 +145,7 @@ fn render_view(f: &mut Frame, view: &AutomationsView, area: Rect) {
     if detail_height > 0
         && let Some(overview) = view.items.get(view.selected)
     {
-        let detail = Paragraph::new(detail_lines(overview, view.monitor_root, view.home))
+        let detail = Paragraph::new(detail_lines(overview, view.daemon, view.home))
             .wrap(Wrap { trim: false })
             .block(
                 Block::default()
@@ -208,7 +231,7 @@ fn row_line(overview: &AutomationOverview, width: usize, home: Option<&Path>) ->
 /// provenance, or the resolution error.
 fn detail_lines(
     overview: &AutomationOverview,
-    monitor_root: &Path,
+    daemon: Option<&DaemonContextState>,
     home: Option<&Path>,
 ) -> Vec<Line<'static>> {
     let mut lines = vec![
@@ -218,6 +241,9 @@ fn detail_lines(
 
     let Some(settings) = &overview.settings else {
         lines.extend(unresolved_lines(overview));
+        if overview.declared_root.is_none() {
+            lines.push(note_line(daemon_note(daemon, home)));
+        }
         return lines;
     };
 
@@ -271,19 +297,16 @@ fn detail_lines(
         lines.push(labeled("subagent", vec![Span::raw(subagent.clone())]));
     }
     if root.origin.is_inherited() {
-        lines.push(labeled(
-            "note",
-            vec![Span::styled(
-                format!(
-                    "Inherited values are resolved for this Monitor (root {}). The daemon \
-                     resolves them with its own --root, so they can differ.",
-                    display_path(monitor_root, home)
-                ),
-                Style::default().fg(Color::Yellow),
-            )],
-        ));
+        lines.push(note_line(daemon_note(daemon, home)));
     }
     lines
+}
+
+fn note_line(text: String) -> Line<'static> {
+    labeled(
+        "note",
+        vec![Span::styled(text, Style::default().fg(Color::Yellow))],
+    )
 }
 
 fn schedule_text(overview: &AutomationOverview) -> String {
@@ -318,7 +341,7 @@ fn unresolved_lines(overview: &AutomationOverview) -> Vec<Line<'static>> {
             "root",
             vec![Span::raw(declared(
                 overview.declared_root.as_ref(),
-                "not set (inherits caller root)",
+                "not set (inherits daemon root)",
             ))],
         ),
     ];
@@ -419,6 +442,33 @@ mod tests {
 
     const HOME: &str = "/home/user";
 
+    fn daemon(source: DaemonContextSource, note: Option<&str>) -> DaemonContextState {
+        DaemonContextState::Available {
+            context: DaemonContext {
+                source,
+                root: PathBuf::from(format!("{HOME}/workspace")),
+                config_dir: PathBuf::from(format!("{HOME}/workspace")),
+                pid: Some(42),
+                started_at: None,
+                note: note.map(str::to_string),
+            },
+        }
+    }
+
+    fn unavailable() -> DaemonContextState {
+        DaemonContextState::Unavailable {
+            reason: "daemon is not running and no daemon service is installed".to_string(),
+        }
+    }
+
+    fn detail_text(item: &AutomationOverview, state: &DaemonContextState) -> String {
+        detail_lines(item, Some(state), Some(Path::new(HOME)))
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     fn line_text(line: &Line) -> String {
         line.spans
             .iter()
@@ -471,7 +521,7 @@ mod tests {
                 name,
                 SettingOrigin::Config,
                 SettingOrigin::Config,
-                SettingOrigin::Caller,
+                SettingOrigin::Daemon,
             )
         }
     }
@@ -495,7 +545,7 @@ mod tests {
             "daily-report",
             SettingOrigin::Config,
             SettingOrigin::Config,
-            SettingOrigin::Caller,
+            SettingOrigin::Daemon,
         );
         let text = line_text(&row_line(&inherited, 120, Some(home)));
         assert!(text.contains("provider-a@work:model-x@high*"));
@@ -516,7 +566,7 @@ mod tests {
             "a-very-long-automation-name",
             SettingOrigin::Config,
             SettingOrigin::Config,
-            SettingOrigin::Caller,
+            SettingOrigin::Daemon,
         );
         for width in [20, 40, 69] {
             let text = line_text(&row_line(&item, width, Some(Path::new(HOME))));
@@ -527,25 +577,29 @@ mod tests {
     }
 
     #[test]
-    fn detail_shows_provenance_and_caller_note() {
-        let home = Path::new(HOME);
+    fn detail_shows_provenance_and_daemon_source() {
         let item = overview(
             "daily-report",
             SettingOrigin::Automation,
             SettingOrigin::Config,
-            SettingOrigin::Caller,
+            SettingOrigin::Daemon,
         );
-        let text: Vec<String> = detail_lines(&item, Path::new("/srv/monitor"), Some(home))
-            .iter()
-            .map(line_text)
-            .collect();
-        let text = text.join("\n");
+        let text = detail_text(&item, &daemon(DaemonContextSource::Running, None));
         assert!(text.contains("provider-a@work:model-x@high  set by automation"));
         assert!(text.contains("account work"));
         assert!(text.contains("thinking high (inherited from config)"));
-        assert!(text.contains("~/projects/example  inherited from caller"));
-        assert!(text.contains("root /srv/monitor"));
-        assert!(text.contains("own --root"));
+        assert!(text.contains("~/projects/example  inherited from daemon"));
+        assert!(text.contains("from the running daemon (root ~/workspace"));
+
+        let text = detail_text(
+            &item,
+            &daemon(
+                DaemonContextSource::Installed,
+                Some("daemon is not running; showing the installed service"),
+            ),
+        );
+        assert!(text.contains("installed daemon (next start)"));
+        assert!(text.contains("daemon is not running"));
 
         let explicit_root = overview(
             "daily-report",
@@ -553,29 +607,33 @@ mod tests {
             SettingOrigin::SubagentOverride,
             SettingOrigin::Automation,
         );
-        let text: Vec<String> = detail_lines(&explicit_root, Path::new("/srv/monitor"), Some(home))
-            .iter()
-            .map(line_text)
-            .collect();
-        let text = text.join("\n");
+        let text = detail_text(&explicit_root, &daemon(DaemonContextSource::Running, None));
         assert!(text.contains("set by subagent override"));
         assert!(text.contains("thinking high"));
         assert!(!text.contains("thinking high ("));
-        assert!(!text.contains("own --root"));
+        assert!(!text.contains("note"));
     }
 
     #[test]
     fn detail_shows_declared_values_and_error() {
-        let text: Vec<String> =
-            detail_lines(&failed("broken"), Path::new("/srv"), Some(Path::new(HOME)))
-                .iter()
-                .map(line_text)
-                .collect();
-        let text = text.join("\n");
+        let text = detail_text(
+            &failed("broken"),
+            &daemon(DaemonContextSource::Running, None),
+        );
         assert!(text.contains("not set (inherits)"));
         assert!(text.contains("declared ~/missing"));
         assert!(text.contains("error"));
         assert!(text.contains("does not exist"));
+        assert!(!text.contains("note"), "declared root needs no daemon note");
+
+        let inherited = AutomationOverview {
+            declared_root: None,
+            error: Some("daemon settings unavailable: daemon is not running".into()),
+            ..failed("needs-daemon")
+        };
+        let text = detail_text(&inherited, &unavailable());
+        assert!(text.contains("not set (inherits daemon root)"));
+        assert!(text.contains("Daemon settings unavailable: daemon is not running"));
     }
 
     fn render_text(view: &AutomationsView, width: u16, height: u16) -> String {
@@ -596,6 +654,7 @@ mod tests {
 
     #[test]
     fn renders_list_and_detail_at_small_width() {
+        let running = daemon(DaemonContextSource::Running, None);
         let items = vec![
             overview(
                 "daily-report",
@@ -609,7 +668,7 @@ mod tests {
             items: &items,
             error: None,
             selected: 1,
-            monitor_root: Path::new("/srv/monitor"),
+            daemon: Some(&running),
             home: Some(Path::new(HOME)),
         };
         let text = render_text(&view, 40, 20);
@@ -629,10 +688,46 @@ mod tests {
             items: &[],
             error: Some("discover automations: duplicate name"),
             selected: 0,
-            monitor_root: Path::new("/srv/monitor"),
+            daemon: None,
             home: None,
         };
         let text = render_text(&view, 80, 10);
         assert!(text.contains("error: discover automations: duplicate name"));
+    }
+
+    #[test]
+    fn title_names_the_daemon_context_not_the_monitor() {
+        let home = Some(Path::new(HOME));
+        let running = daemon(DaemonContextSource::Running, None);
+        let installed = daemon(DaemonContextSource::Installed, Some("not running"));
+        assert_eq!(
+            daemon_title(Some(&running), home),
+            "running daemon · root ~/workspace"
+        );
+        assert_eq!(
+            daemon_title(Some(&installed), home),
+            "installed daemon (next start) · root ~/workspace"
+        );
+        assert_eq!(
+            daemon_title(Some(&unavailable()), home),
+            "daemon settings unavailable"
+        );
+
+        let items = vec![overview(
+            "daily-report",
+            SettingOrigin::Config,
+            SettingOrigin::Config,
+            SettingOrigin::Daemon,
+        )];
+        let view = AutomationsView {
+            items: &items,
+            error: None,
+            selected: 0,
+            daemon: Some(&running),
+            home,
+        };
+        let text = render_text(&view, 100, 20);
+        assert!(text.contains("running daemon · root ~/workspace"));
+        assert!(text.contains("inherited from daemon"));
     }
 }

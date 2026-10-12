@@ -8,6 +8,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
+use zdx_engine::automation_daemon::{self, DaemonContextSource, DaemonContextState};
 use zdx_engine::automations::{self, AutomationDefinition, AutomationRunSettings};
 use zdx_engine::core::context::{EffectivePrompt, PromptContextInclusion};
 use zdx_engine::core::thread_persistence::ThreadPersistenceOptions;
@@ -209,6 +210,89 @@ pub fn list(caller: &Caller<'_>, json: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Lists automations resolved the way the scheduled daemon resolves them
+/// (see `zdx_engine::automation_daemon`), independent of this process's root.
+pub fn list_daemon(json: bool) -> Result<()> {
+    let view = automation_daemon::automations();
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&view).context("serialize daemon automations")?
+        );
+        return Ok(());
+    }
+
+    match &view.daemon {
+        DaemonContextState::Available { context } => {
+            let source = match context.source {
+                DaemonContextSource::Running => "running daemon",
+                DaemonContextSource::Installed => "installed daemon service",
+            };
+            println!("Daemon: {source}, root {}", context.root.display());
+            if let Some(note) = &context.note {
+                println!("Note: {note}");
+            }
+        }
+        DaemonContextState::Unavailable { reason } => println!("Daemon: unavailable ({reason})"),
+    }
+    if let Some(error) = &view.error {
+        anyhow::bail!("{error}");
+    }
+    if view.automations.is_empty() {
+        println!("No automations found.");
+    }
+    for item in &view.automations {
+        let schedule = item.schedule.as_deref().unwrap_or("manual");
+        match (&item.settings, &item.error) {
+            (Some(settings), _) => println!(
+                "{} - {schedule} - model={} [{}] root={} [{}]",
+                item.name,
+                settings.model.spec,
+                settings.model.origin.as_str(),
+                settings.root.path.display(),
+                settings.root.origin.as_str(),
+            ),
+            (None, error) => println!(
+                "{} - {schedule} - error: {}",
+                item.name,
+                error.as_deref().unwrap_or("unresolved")
+            ),
+        }
+    }
+    Ok(())
+}
+
+/// Records a scheduled run that could not start, without running it.
+pub fn record_failed_start(
+    automation: &AutomationDefinition,
+    trigger: RunTrigger,
+    error: &anyhow::Error,
+) {
+    let now = Utc::now().to_rfc3339();
+    let record = AutomationRunRecord {
+        automation: automation.name.clone(),
+        trigger,
+        thread_id: None,
+        attempt: 1,
+        max_attempts: automation.max_retries.saturating_add(1),
+        started_at: now.clone(),
+        finished_at: now,
+        duration_ms: 0,
+        ok: false,
+        error: Some(summarize_error(error)),
+        schedule: automation.schedule.clone(),
+        model: None,
+        subagent: automation.subagent.clone(),
+        root: None,
+    };
+    if let Err(err) = append_run_record(&record) {
+        tracing::warn!(
+            err = format!("{err:#}"),
+            "Failed to append automation run log"
+        );
+    }
 }
 
 /// Validates all discovered automations.
