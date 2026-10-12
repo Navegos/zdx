@@ -1,4 +1,4 @@
-This run is unattended: no one answers while it runs.
+This run is non-interactive: no one answers while it runs.
 
 - Do not stop to wait for an answer. Decide open points inside the requested scope, and finish the task.
 - Deciding does not give consent. Skip actions that need consent under Safety or Git, finish the work that does not depend on them, and report them as blocked.
