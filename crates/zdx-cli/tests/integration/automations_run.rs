@@ -488,3 +488,43 @@ fn test_list_daemon_unavailable_never_falls_back_to_caller_root() {
         scoped_root.path().to_string_lossy().as_ref()
     );
 }
+
+#[test]
+fn test_set_model_command_edits_only_the_model_line() {
+    let zdx_home = TempDir::new().unwrap();
+    let dir = zdx_home.path().join("automations");
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("paused.md");
+    let original = "---\n# paused: no schedule\ntimeout_secs: 60\n---\nDo the thing.\n";
+    fs::write(&path, original).unwrap();
+
+    let run = |args: &[&str]| {
+        crate::fixtures::zdx_cmd()
+            .env("ZDX_HOME", zdx_home.path())
+            .args(["automations", "set-model"])
+            .args(args)
+            .assert()
+    };
+
+    run(&["paused", "claude-cli@work:claude-opus-5@high"])
+        .success()
+        .stdout(predicate::str::contains(
+            "paused: model = claude-cli@work:claude-opus-5@high",
+        ));
+    assert_eq!(
+        fs::read_to_string(&path).unwrap(),
+        original.replace(
+            "timeout_secs: 60\n---",
+            "timeout_secs: 60\nmodel: \"claude-cli@work:claude-opus-5@high\"\n---"
+        )
+    );
+
+    run(&["paused", "--clear"])
+        .success()
+        .stdout(predicate::str::contains("model cleared"));
+    assert_eq!(fs::read_to_string(&path).unwrap(), original);
+
+    run(&["paused"]).failure();
+    run(&["paused", "bad \"spec"]).failure();
+    assert_eq!(fs::read_to_string(&path).unwrap(), original);
+}

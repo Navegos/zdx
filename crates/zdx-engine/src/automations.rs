@@ -554,7 +554,15 @@ fn collect_markdown_files(
 fn parse_automation_file(path: &Path, source: AutomationSource) -> Result<AutomationDefinition> {
     let content = fs::read_to_string(path)
         .with_context(|| format!("read automation file {}", path.display()))?;
-    let (yaml, body) = split_frontmatter(&content)?;
+    parse_automation_content(path, &content, source)
+}
+
+fn parse_automation_content(
+    path: &Path,
+    content: &str,
+    source: AutomationSource,
+) -> Result<AutomationDefinition> {
+    let (yaml, body) = split_frontmatter(content)?;
 
     let frontmatter: AutomationFrontmatter = if yaml.trim().is_empty() {
         AutomationFrontmatter::default()
@@ -592,6 +600,180 @@ fn parse_automation_file(path: &Path, source: AutomationSource) -> Result<Automa
         max_retries: frontmatter.max_retries.unwrap_or(0),
         prompt,
     })
+}
+
+/// A change to an automation's declared `model`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelEdit<'a> {
+    /// Set `model:` to this spec (`provider[@account]:model[@thinking][@fast]`).
+    Set(&'a str),
+    /// Remove `model:`, so the automation inherits the model again.
+    Clear,
+}
+
+/// Changes the `model` key of the automation file at `path` and returns the
+/// updated definition.
+///
+/// Only the `model:` line in the frontmatter changes (an inline comment on it
+/// is kept); every other key, comment, and the prompt body stay byte for
+/// byte. A new key is added as the last frontmatter line. The result is
+/// parsed before it is written and must differ from the original only in
+/// `model`, so a file this edit cannot handle (for example a multi-line
+/// `model` value) fails without changes.
+///
+/// `expected` guards against concurrent edits: `Some(value)` requires the
+/// declared model on disk to equal `value` (`Some(None)` = not set). The file
+/// is also re-read just before the atomic rename, and the write is abandoned
+/// if it changed in between.
+///
+/// # Errors
+/// Returns an error for an invalid spec, a file that changed or cannot be
+/// edited safely, or an I/O failure. The original file is left intact.
+pub fn set_model(
+    path: &Path,
+    expected: Option<Option<&str>>,
+    edit: ModelEdit<'_>,
+) -> Result<AutomationDefinition> {
+    let source = AutomationSource::User;
+    let original = fs::read_to_string(path)
+        .with_context(|| format!("read automation file {}", path.display()))?;
+    let before = parse_automation_content(path, &original, source)
+        .with_context(|| format!("parse automation {}", path.display()))?;
+    if let Some(expected) = expected
+        && before.model.as_deref() != expected
+    {
+        bail!(
+            "automation '{}' changed on disk (model is now {}); reload and try again",
+            before.name,
+            before.model.as_deref().unwrap_or("not set")
+        );
+    }
+
+    let spec = match edit {
+        ModelEdit::Set(spec) => Some(validate_model_spec(spec)?),
+        ModelEdit::Clear => None,
+    };
+    if before.model.as_deref() == spec {
+        return Ok(before);
+    }
+
+    let updated = edit_model_line(&original, spec)?;
+    let after = parse_automation_content(path, &updated, source)
+        .context("the edited automation no longer parses; file left unchanged")?;
+    let expected_after = AutomationDefinition {
+        model: spec.map(str::to_string),
+        ..before.clone()
+    };
+    if after != expected_after {
+        bail!(
+            "cannot edit the model of '{}' safely; file left unchanged",
+            before.name
+        );
+    }
+
+    write_if_unchanged(path, &original, &updated)?;
+    Ok(after)
+}
+
+fn validate_model_spec(spec: &str) -> Result<&str> {
+    let spec = spec.trim();
+    if spec.is_empty() {
+        bail!("model cannot be empty");
+    }
+    if spec
+        .chars()
+        .any(|c| c == '"' || c == '\\' || c.is_control() || c.is_whitespace())
+    {
+        bail!("invalid model spec '{spec}'");
+    }
+    Ok(spec)
+}
+
+/// Replaces, removes, or appends the top-level `model:` frontmatter line.
+fn edit_model_line(content: &str, spec: Option<&str>) -> Result<String> {
+    let lines: Vec<&str> = content.split_inclusive('\n').collect();
+    let close = lines
+        .iter()
+        .enumerate()
+        .skip(1)
+        .find(|(_, line)| matches!(line.trim(), "---" | "..."))
+        .map(|(index, _)| index)
+        .context("Unterminated YAML frontmatter")?;
+    let model_lines: Vec<usize> = (1..close)
+        .filter(|&index| is_model_key_line(lines[index]))
+        .collect();
+    if model_lines.len() > 1 {
+        bail!("frontmatter has more than one `model` key");
+    }
+    let newline = if lines[0].ends_with("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
+
+    let mut out: Vec<String> = lines.iter().map(|line| (*line).to_string()).collect();
+    match (model_lines.first(), spec) {
+        (Some(&index), Some(spec)) => {
+            let line = lines[index];
+            let ending = &line[line.trim_end_matches(['\r', '\n']).len()..];
+            let comment = inline_comment(line.trim_end_matches(['\r', '\n']));
+            out[index] = format!("model: \"{spec}\"{comment}{ending}");
+        }
+        (Some(&index), None) => {
+            out.remove(index);
+        }
+        (None, Some(spec)) => {
+            out.insert(close, format!("model: \"{spec}\"{newline}"));
+        }
+        (None, None) => {}
+    }
+    Ok(out.concat())
+}
+
+fn is_model_key_line(line: &str) -> bool {
+    line.strip_prefix("model")
+        .is_some_and(|rest| rest.trim_start_matches([' ', '\t']).starts_with(':'))
+}
+
+/// The ` # comment` tail of a `model: value` line, or an empty string.
+fn inline_comment(line: &str) -> &str {
+    let value = line[line.find(':').map_or(line.len(), |i| i + 1)..].trim_start();
+    let offset = line.len() - value.len();
+    let search_from = match value.chars().next() {
+        Some(quote @ ('"' | '\'')) => value[1..].find(quote).map_or(value.len(), |end| end + 2),
+        _ => 0,
+    };
+    value[search_from..]
+        .find(" #")
+        .map_or("", |index| line[offset + search_from + index..].trim_end())
+}
+
+fn write_if_unchanged(path: &Path, original: &str, updated: &str) -> Result<()> {
+    let file_name = path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .context("invalid automation file name")?;
+    let tmp = path.with_file_name(format!(".{file_name}.{}.tmp", std::process::id()));
+    fs::write(&tmp, updated).with_context(|| format!("write {}", tmp.display()))?;
+    let result = (|| {
+        if let Ok(metadata) = fs::metadata(path) {
+            fs::set_permissions(&tmp, metadata.permissions())
+                .with_context(|| format!("copy permissions to {}", tmp.display()))?;
+        }
+        let current = fs::read_to_string(path)
+            .with_context(|| format!("re-read automation file {}", path.display()))?;
+        if current != original {
+            bail!(
+                "{} changed on disk while saving; reload and try again",
+                path.display()
+            );
+        }
+        fs::rename(&tmp, path).with_context(|| format!("replace {}", path.display()))
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
 }
 
 fn file_stem(path: &Path) -> Result<String> {
@@ -920,6 +1102,105 @@ mod tests {
         .unwrap();
         assert_eq!(json["settings"]["root"]["origin"], "caller");
         assert_eq!(json["settings"]["model"]["origin"], "config");
+    }
+
+    const EDIT_FIXTURE: &str = "---\n# owner: example\nroot: \"~/work\"   # keep me\nmodel: claude-cli:claude-opus-5@high # current pick\nsubagent: helper\nmax_retries: 1\n---\n\nBody line one.\n\nmodel: not frontmatter\n";
+
+    fn write_fixture(content: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("job.md");
+        fs::write(&path, content).unwrap();
+        (dir, path)
+    }
+
+    #[test]
+    fn set_model_replaces_only_the_model_line() {
+        let (_dir, path) = write_fixture(EDIT_FIXTURE);
+        let updated = set_model(
+            &path,
+            Some(Some("claude-cli:claude-opus-5@high")),
+            ModelEdit::Set("claude-cli@work:claude-sonnet-5@low@fast"),
+        )
+        .unwrap();
+        assert_eq!(
+            updated.model.as_deref(),
+            Some("claude-cli@work:claude-sonnet-5@low@fast")
+        );
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            EDIT_FIXTURE.replace(
+                "model: claude-cli:claude-opus-5@high # current pick",
+                "model: \"claude-cli@work:claude-sonnet-5@low@fast\" # current pick"
+            )
+        );
+    }
+
+    #[test]
+    fn clear_then_set_round_trips_without_touching_other_lines() {
+        let (_dir, path) = write_fixture(EDIT_FIXTURE);
+        let cleared = set_model(&path, None, ModelEdit::Clear).unwrap();
+        assert!(cleared.model.is_none());
+        let without =
+            EDIT_FIXTURE.replace("model: claude-cli:claude-opus-5@high # current pick\n", "");
+        assert_eq!(fs::read_to_string(&path).unwrap(), without);
+
+        set_model(
+            &path,
+            Some(None),
+            ModelEdit::Set("stepfun:step-3.7-flash@low"),
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            without.replace(
+                "max_retries: 1\n---",
+                "max_retries: 1\nmodel: \"stepfun:step-3.7-flash@low\"\n---"
+            )
+        );
+    }
+
+    #[test]
+    fn set_model_keeps_paused_job_and_crlf_line_endings() {
+        let content = "---\r\ntimeout_secs: 60\r\n---\r\nPrompt\r\n";
+        let (_dir, path) = write_fixture(content);
+        let updated =
+            set_model(&path, Some(None), ModelEdit::Set("gemini:gemini-3.8-flash")).unwrap();
+        assert!(updated.schedule.is_none());
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "---\r\ntimeout_secs: 60\r\nmodel: \"gemini:gemini-3.8-flash\"\r\n---\r\nPrompt\r\n"
+        );
+    }
+
+    #[test]
+    fn set_model_refuses_stale_unsafe_or_invalid_edits_and_leaves_file_intact() {
+        let (_dir, path) = write_fixture(EDIT_FIXTURE);
+        let cases: [(Option<Option<&str>>, ModelEdit<'_>, &str); 4] = [
+            (Some(None), ModelEdit::Set("a:b"), "changed on disk"),
+            (
+                Some(Some("other:model")),
+                ModelEdit::Clear,
+                "changed on disk",
+            ),
+            (None, ModelEdit::Set("a:b \"x"), "invalid model spec"),
+            (None, ModelEdit::Set("  "), "model cannot be empty"),
+        ];
+        for (expected, edit, message) in cases {
+            let err = set_model(&path, expected, edit).unwrap_err();
+            assert!(format!("{err:#}").contains(message), "{err:#}");
+            assert_eq!(fs::read_to_string(&path).unwrap(), EDIT_FIXTURE);
+        }
+
+        let block = "---\nmodel: >\n  claude-cli:claude-opus-5\n---\nPrompt\n";
+        let (_dir2, block_path) = write_fixture(block);
+        assert!(set_model(&block_path, None, ModelEdit::Set("a:b")).is_err());
+        assert_eq!(fs::read_to_string(&block_path).unwrap(), block);
+        let leftovers: Vec<_> = fs::read_dir(block_path.parent().unwrap())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty());
     }
 
     #[test]

@@ -1,5 +1,5 @@
 use std::fmt::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crossterm::event::KeyCode;
 use ratatui::prelude::*;
@@ -817,6 +817,21 @@ fn handle_workspace_picker_key(app: &mut MonitorApp, key: KeyCode) {
     }
 }
 
+/// Where a committed model choice is written.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PickerTarget {
+    /// The Config tab field in `ModelPickerState::field`, in the current
+    /// write target.
+    Config,
+    /// The `model:` of one automation file. `declared` is the value on disk
+    /// when the picker opened; the save refuses if it changed since.
+    Automation {
+        name: String,
+        path: PathBuf,
+        declared: Option<String>,
+    },
+}
+
 /// Which step of the model+thinking picker is active.
 #[derive(PartialEq, Eq)]
 pub enum PickerPhase {
@@ -847,6 +862,8 @@ pub struct ModelPickerState {
     pub thinking_current: config::ThinkingLevel,
     /// Index into `config::ThinkingLevel::all()` of the highlighted level.
     pub thinking_selected: usize,
+    /// Where the choice is saved.
+    pub target: PickerTarget,
 }
 
 impl ModelPickerState {
@@ -916,6 +933,7 @@ impl ModelPickerState {
             chosen_model: model_part.clone(),
             thinking_current,
             thinking_selected,
+            target: PickerTarget::Config,
         };
         state.recompute();
         // Preselect the current value (exact `provider:id` or bare `id`).
@@ -1044,6 +1062,11 @@ fn commit_model_picker(app: &mut MonitorApp) {
     let field = picker.field.clone();
     let model = picker.chosen_model.clone();
     let level = picker.selected_thinking();
+    if let PickerTarget::Automation { .. } = picker.target {
+        let spec = zdx_engine::models::format_model_thinking(&model, level);
+        crate::tabs::automations::save_picked_model(app, &spec);
+        return;
+    }
 
     let spec = match picker.kind {
         // Model mode: update the entry at `model_modes.<i>` or append via

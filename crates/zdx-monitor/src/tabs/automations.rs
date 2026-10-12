@@ -1,14 +1,16 @@
 use std::path::{Path, PathBuf};
 
+use crossterm::event::KeyCode;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
 use zdx_engine::automation_daemon::{
     self, DaemonAutomations, DaemonContext, DaemonContextSource, DaemonContextState,
 };
-use zdx_engine::automations::{AutomationOverview, SettingOrigin};
+use zdx_engine::automations::{self, AutomationOverview, ModelEdit, SettingOrigin};
 use zdx_engine::config::paths;
 
 use crate::app::MonitorApp;
+use crate::tabs::config::{ModelFieldKind, ModelPickerState, PickerTarget};
 use crate::ui::{SELECTED_BG, truncate_chars};
 
 /// Automations resolved the way the scheduled daemon resolves them, through
@@ -17,6 +19,154 @@ use crate::ui::{SELECTED_BG, truncate_chars};
 /// tab entry, not on the refresh tick.
 pub(crate) fn load_automations() -> DaemonAutomations {
     automation_daemon::automations()
+}
+
+/// Replaces the tab's snapshot, keeping the selection on `keep` (by name)
+/// when it is still listed.
+pub(crate) fn apply_snapshot(
+    app: &mut MonitorApp,
+    snapshot: DaemonAutomations,
+    keep: Option<&str>,
+) {
+    app.automations = snapshot.automations;
+    app.automations_daemon = Some(snapshot.daemon);
+    app.automations_error = snapshot.error;
+    let last = app.automations.len().saturating_sub(1);
+    app.selected_index = keep
+        .and_then(|name| app.automations.iter().position(|item| item.name == name))
+        .unwrap_or(app.selected_index)
+        .min(last);
+}
+
+/// Automations-tab keys: `Enter` edits the selected job's model in the shared
+/// model picker, `d`/`Delete` removes its model override. Returns whether
+/// the key was handled.
+pub(crate) fn handle_automations_key(app: &mut MonitorApp, key: KeyCode) -> bool {
+    match key {
+        KeyCode::Enter => open_automation_model_picker(app),
+        KeyCode::Char('d') | KeyCode::Delete => clear_selected_model(app),
+        _ => return false,
+    }
+    true
+}
+
+/// Opens the Config tab's model picker for the selected automation, seeded
+/// with the model the job resolves to now.
+pub(crate) fn open_automation_model_picker(app: &mut MonitorApp) {
+    let Some(item) = app.automations.get(app.selected_index) else {
+        return;
+    };
+    let unknown = DaemonContextState::Unavailable {
+        reason: "daemon settings not checked".to_string(),
+    };
+    let daemon = app.automations_daemon.as_ref().unwrap_or(&unknown);
+    let config = match automation_daemon::job_config(daemon, item) {
+        Ok(config) => config,
+        Err(err) => {
+            let message = format!("Cannot edit {}: {err:#}", item.name);
+            app.set_status(message);
+            return;
+        }
+    };
+    let current = item
+        .settings
+        .as_ref()
+        .map(|settings| settings.model.spec.clone())
+        .or_else(|| item.declared_model.clone())
+        .unwrap_or_default();
+    let mut picker = ModelPickerState::new(
+        format!("automation {}", item.name),
+        ModelFieldKind::Chat,
+        &current,
+        &config.providers,
+        &config.model_modes,
+    );
+    picker.target = PickerTarget::Automation {
+        name: item.name.clone(),
+        path: item.path.clone(),
+        declared: item.declared_model.clone(),
+    };
+    app.model_picker = Some(picker);
+}
+
+/// Saves the picker's choice as the automation's `model:`.
+pub(crate) fn save_picked_model(app: &mut MonitorApp, spec: &str) {
+    save_model_with(app, ModelEdit::Set(spec), load_automations);
+}
+
+fn clear_selected_model(app: &mut MonitorApp) {
+    let Some(item) = app.automations.get(app.selected_index) else {
+        return;
+    };
+    if item.declared_model.is_none() {
+        let message = format!("{} has no model override; it already inherits", item.name);
+        app.set_status(message);
+        return;
+    }
+    let target = PickerTarget::Automation {
+        name: item.name.clone(),
+        path: item.path.clone(),
+        declared: item.declared_model.clone(),
+    };
+    edit_model_with(app, &target, ModelEdit::Clear, load_automations);
+}
+
+fn save_model_with(
+    app: &mut MonitorApp,
+    edit: ModelEdit<'_>,
+    load: impl FnOnce() -> DaemonAutomations,
+) {
+    let Some(target) = app.model_picker.take().map(|picker| picker.target) else {
+        return;
+    };
+    edit_model_with(app, &target, edit, load);
+}
+
+/// Writes `edit` through the shared engine edit, then reloads the daemon
+/// view. Errors leave the file unchanged and are shown in the status line.
+fn edit_model_with(
+    app: &mut MonitorApp,
+    target: &PickerTarget,
+    edit: ModelEdit<'_>,
+    load: impl FnOnce() -> DaemonAutomations,
+) {
+    let PickerTarget::Automation {
+        name,
+        path,
+        declared,
+    } = target
+    else {
+        return;
+    };
+    let result = automations::set_model(path, Some(declared.as_deref()), edit);
+    apply_snapshot(app, load(), Some(name));
+    let message = match result {
+        Ok(_) => {
+            let action = match edit {
+                ModelEdit::Set(spec) => format!("Set {name} model to {spec}"),
+                ModelEdit::Clear => format!("Cleared {name} model override"),
+            };
+            let now = app
+                .automations
+                .iter()
+                .find(|item| &item.name == name)
+                .map(|item| match &item.settings {
+                    Some(settings) => format!(
+                        " · now {} ({})",
+                        settings.model.spec,
+                        origin_label(settings.model.origin)
+                    ),
+                    None => format!(
+                        " · unresolved: {}",
+                        item.error.as_deref().unwrap_or("unknown error")
+                    ),
+                })
+                .unwrap_or_default();
+            format!("{action}{now}")
+        }
+        Err(err) => format!("Failed to change {name} model (file unchanged): {err:#}"),
+    };
+    app.set_status(message);
 }
 
 struct AutomationsView<'a> {
@@ -729,5 +879,229 @@ mod tests {
         let text = render_text(&view, 100, 20);
         assert!(text.contains("running daemon · root ~/workspace"));
         assert!(text.contains("inherited from daemon"));
+    }
+
+    mod editing {
+        use std::fs;
+
+        use ratatui::backend::TestBackend;
+        use zdx_engine::automation_daemon::automations_for;
+
+        use super::super::*;
+        use crate::tabs::config::{PickerPhase, handle_model_picker_key, render_model_picker};
+
+        const PAUSED: &str =
+            "---\n# paused on purpose\ntimeout_secs: 60\n---\nInherited job prompt.\n";
+        const EXPLICIT: &str = "---\nschedule: \"0 9 * * 1\"\nmodel: \"claude-cli:claude-sonnet-5@low\" # pinned\n---\nBody.\n";
+
+        struct Fixture {
+            _home: zdx_engine::test_support::TestZdxHomeGuard,
+            app: MonitorApp,
+            dir: PathBuf,
+            state: DaemonContextState,
+        }
+
+        impl Fixture {
+            fn new() -> Self {
+                let home = zdx_engine::test_support::temp_zdx_home();
+                let dir = home.path().join("automations");
+                fs::create_dir_all(&dir).unwrap();
+                fs::write(dir.join("explicit.md"), EXPLICIT).unwrap();
+                fs::write(dir.join("paused.md"), PAUSED).unwrap();
+                let daemon_root = home.path().join("daemon-root");
+                fs::create_dir_all(daemon_root.join(".zdx")).unwrap();
+                fs::write(
+                    daemon_root.join(".zdx").join("config.toml"),
+                    "model = \"claude-cli@work:claude-opus-5@high\"\n",
+                )
+                .unwrap();
+                let state = DaemonContextState::Available {
+                    context: DaemonContext {
+                        source: DaemonContextSource::Running,
+                        root: daemon_root.clone(),
+                        config_dir: daemon_root,
+                        pid: Some(1),
+                        started_at: None,
+                        note: None,
+                    },
+                };
+                let mut app = crate::app::build_app(home.path()).unwrap();
+                app.active_section = crate::app::Section::Automations;
+                app.status_section = crate::app::Section::Automations;
+                apply_snapshot(&mut app, automations_for(state.clone(), &dir), None);
+                Self {
+                    _home: home,
+                    app,
+                    dir,
+                    state,
+                }
+            }
+
+            fn select(&mut self, name: &str) {
+                self.app.selected_index = self
+                    .app
+                    .automations
+                    .iter()
+                    .position(|item| item.name == name)
+                    .unwrap();
+            }
+
+            fn loader(&self) -> impl FnOnce() -> DaemonAutomations + use<> {
+                let (state, dir) = (self.state.clone(), self.dir.clone());
+                move || automations_for(state, &dir)
+            }
+
+            fn file(&self, name: &str) -> String {
+                fs::read_to_string(self.dir.join(format!("{name}.md"))).unwrap()
+            }
+        }
+
+        #[test]
+        fn picker_opens_on_the_resolved_daemon_model() {
+            let mut fx = Fixture::new();
+            fx.select("paused");
+            open_automation_model_picker(&mut fx.app);
+            let picker = fx.app.model_picker.as_ref().expect("picker opened");
+            assert_eq!(picker.field, "automation paused");
+            assert_eq!(picker.chosen_model, "claude-cli@work:claude-opus-5");
+            assert_eq!(
+                picker.thinking_current,
+                zdx_engine::config::ThinkingLevel::High
+            );
+            assert!(matches!(
+                &picker.target,
+                PickerTarget::Automation { name, declared: None, .. } if name == "paused"
+            ));
+
+            fx.select("explicit");
+            open_automation_model_picker(&mut fx.app);
+            let picker = fx.app.model_picker.as_ref().unwrap();
+            assert_eq!(picker.chosen_model, "claude-cli:claude-sonnet-5");
+            assert!(matches!(
+                &picker.target,
+                PickerTarget::Automation { declared: Some(model), .. }
+                    if model == "claude-cli:claude-sonnet-5@low"
+            ));
+        }
+
+        #[test]
+        fn cancel_writes_nothing() {
+            let mut fx = Fixture::new();
+            fx.select("paused");
+            open_automation_model_picker(&mut fx.app);
+            handle_model_picker_key(&mut fx.app, KeyCode::Enter);
+            assert!(fx.app.model_picker.as_ref().unwrap().phase == PickerPhase::Thinking);
+            handle_model_picker_key(&mut fx.app, KeyCode::Esc);
+            handle_model_picker_key(&mut fx.app, KeyCode::Esc);
+            assert!(fx.app.model_picker.is_none());
+            assert_eq!(fx.file("paused"), PAUSED);
+        }
+
+        #[test]
+        fn inherited_becomes_explicit_then_resets_keeping_the_file() {
+            let mut fx = Fixture::new();
+            fx.select("paused");
+            open_automation_model_picker(&mut fx.app);
+            let loader = fx.loader();
+            save_model_with(
+                &mut fx.app,
+                ModelEdit::Set("stepfun:step-3.7-flash@low"),
+                loader,
+            );
+            assert!(fx.app.model_picker.is_none());
+            assert_eq!(
+                fx.file("paused"),
+                PAUSED.replace(
+                    "timeout_secs: 60\n---",
+                    "timeout_secs: 60\nmodel: \"stepfun:step-3.7-flash@low\"\n---"
+                )
+            );
+            let selected = &fx.app.automations[fx.app.selected_index];
+            assert_eq!(selected.name, "paused");
+            let model = &selected.settings.as_ref().unwrap().model;
+            assert_eq!(model.spec, "stepfun:step-3.7-flash@low");
+            assert_eq!(model.origin, SettingOrigin::Automation);
+            assert!(selected.schedule.is_none(), "paused job stays paused");
+            assert!(
+                fx.app
+                    .status_message
+                    .contains("now stepfun:step-3.7-flash@low (set by automation)"),
+                "{}",
+                fx.app.status_message
+            );
+
+            let target = PickerTarget::Automation {
+                name: "paused".to_string(),
+                path: selected.path.clone(),
+                declared: selected.declared_model.clone(),
+            };
+            let loader = fx.loader();
+            edit_model_with(&mut fx.app, &target, ModelEdit::Clear, loader);
+            assert_eq!(fx.file("paused"), PAUSED);
+            let selected = &fx.app.automations[fx.app.selected_index];
+            assert_eq!(selected.name, "paused");
+            assert_eq!(
+                selected.settings.as_ref().unwrap().model.origin,
+                SettingOrigin::Config
+            );
+            assert!(fx.app.status_message.contains("inherited from config"));
+        }
+
+        #[test]
+        fn reset_on_inherited_job_is_a_no_op() {
+            let mut fx = Fixture::new();
+            fx.select("paused");
+            assert!(handle_automations_key(&mut fx.app, KeyCode::Char('d')));
+            assert!(fx.app.status_message.contains("already inherits"));
+            assert_eq!(fx.file("paused"), PAUSED);
+        }
+
+        #[test]
+        fn concurrent_change_fails_visibly_and_keeps_the_new_file() {
+            let mut fx = Fixture::new();
+            fx.select("explicit");
+            open_automation_model_picker(&mut fx.app);
+            let changed = EXPLICIT.replace("claude-sonnet-5@low", "claude-sonnet-5@max");
+            fs::write(fx.dir.join("explicit.md"), &changed).unwrap();
+
+            let loader = fx.loader();
+            save_model_with(
+                &mut fx.app,
+                ModelEdit::Set("gemini:gemini-3.8-flash@low"),
+                loader,
+            );
+            assert_eq!(fx.file("explicit"), changed);
+            assert!(
+                fx.app.status_message.contains("file unchanged")
+                    && fx.app.status_message.contains("changed on disk"),
+                "{}",
+                fx.app.status_message
+            );
+            let selected = &fx.app.automations[fx.app.selected_index];
+            assert_eq!(selected.name, "explicit");
+            assert_eq!(
+                selected.declared_model.as_deref(),
+                Some("claude-cli:claude-sonnet-5@max")
+            );
+        }
+
+        #[test]
+        fn picker_renders_in_a_narrow_terminal() {
+            let mut fx = Fixture::new();
+            fx.select("paused");
+            open_automation_model_picker(&mut fx.app);
+            let picker = fx.app.model_picker.as_ref().unwrap();
+            let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+            terminal
+                .draw(|frame| render_model_picker(frame, picker, frame.area()))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let text: String = (0..buffer.area.height)
+                .flat_map(|y| (0..buffer.area.width).map(move |x| (x, y)))
+                .map(|(x, y)| buffer.cell((x, y)).unwrap().symbol().to_string())
+                .collect();
+            assert!(text.contains("automation"), "{text}");
+            assert!(text.contains("filter"), "{text}");
+        }
     }
 }

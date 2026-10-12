@@ -273,6 +273,28 @@ pub fn automations_for(daemon: DaemonContextState, automations_dir: &Path) -> Da
     }
 }
 
+/// Config whose providers decide which models `overview` can use: its own
+/// `root:` layers, else the daemon's config directory. When neither is known
+/// (unresolved job, unavailable daemon), the global config alone, never the
+/// caller's workspace.
+///
+/// # Errors
+/// Returns an error if the chosen config layers fail to load.
+pub fn job_config(daemon: &DaemonContextState, overview: &AutomationOverview) -> Result<Config> {
+    let dir = match (&overview.settings, daemon) {
+        (Some(settings), _) if settings.root.origin == SettingOrigin::Automation => {
+            Some(settings.root.path.clone())
+        }
+        (Some(_), DaemonContextState::Available { context }) => Some(context.config_dir.clone()),
+        _ => None,
+    };
+    match dir {
+        Some(dir) => Config::load_layered(&paths::config_layer_paths_for(&dir))
+            .with_context(|| format!("load config for {}", dir.display())),
+        None => Config::load_layered(&[paths::config_path()]).context("load global config"),
+    }
+}
+
 fn record_path() -> PathBuf {
     paths::zdx_home().join("run").join(RECORD_FILE)
 }
@@ -528,5 +550,56 @@ mod tests {
                 .unwrap();
             assert_eq!(scoped.settings.as_ref().unwrap().root.path, own_root.path());
         }
+    }
+
+    #[test]
+    fn job_config_follows_the_jobs_own_context() {
+        let home = crate::test_support::temp_zdx_home();
+        fs::write(
+            home.path().join("config.toml"),
+            "model = \"global:model@low\"\n",
+        )
+        .unwrap();
+        let daemon_root = tempdir().unwrap();
+        write_config(daemon_root.path(), "model = \"daemon:model@high\"\n");
+        let own_root = tempdir().unwrap();
+        write_config(own_root.path(), "model = \"own:model@medium\"\n");
+        let dir = home.path().join("automations");
+        write_automation(&dir, "inherited", "");
+        write_automation(
+            &dir,
+            "scoped",
+            &format!("root: \"{}\"\n", own_root.path().display()),
+        );
+
+        let running = available(daemon_root.path(), DaemonContextSource::Running);
+        let view = automations_for(running.clone(), &dir);
+        let model_for = |state: &DaemonContextState, item: &AutomationOverview| {
+            job_config(state, item).unwrap().model
+        };
+        let find = |view: &DaemonAutomations, name: &str| {
+            view.automations
+                .iter()
+                .find(|a| a.name == name)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(
+            model_for(&running, &find(&view, "inherited")),
+            "daemon:model@high"
+        );
+        assert_eq!(
+            model_for(&running, &find(&view, "scoped")),
+            "own:model@medium"
+        );
+
+        let unknown = DaemonContextState::Unavailable {
+            reason: "daemon is not running".to_string(),
+        };
+        let view = automations_for(unknown.clone(), &dir);
+        assert_eq!(
+            model_for(&unknown, &find(&view, "inherited")),
+            "global:model@low"
+        );
     }
 }

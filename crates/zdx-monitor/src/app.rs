@@ -23,7 +23,7 @@ use crate::tabs::agents::{
     ActiveAgentInfo, AgentOverlayState, agent_overlay_page_size, handle_agent_overlay_key,
     handle_overlay_click, load_active_agents, open_agent_overlay, refresh_agent_overlay,
 };
-use crate::tabs::automations::load_automations;
+use crate::tabs::automations::{apply_snapshot, handle_automations_key, load_automations};
 use crate::tabs::background::{
     BackgroundDetailState, BackgroundInfo, handle_background_detail_key, kill_selected_background,
     load_background, open_background_detail, refresh_background_detail,
@@ -383,10 +383,7 @@ fn switch_section(app: &mut MonitorApp, section: Section) {
         app.log_query_editing = false;
     }
     if app.active_section == Section::Automations {
-        let snapshot = load_automations();
-        app.automations = snapshot.automations;
-        app.automations_daemon = Some(snapshot.daemon);
-        app.automations_error = snapshot.error;
+        apply_snapshot(app, load_automations(), None);
     }
     if app.active_section == Section::Threads {
         refresh_threads_if_stale(app);
@@ -396,7 +393,7 @@ fn switch_section(app: &mut MonitorApp, section: Section) {
     }
 }
 
-fn build_app(root: &Path) -> Result<MonitorApp> {
+pub(crate) fn build_app(root: &Path) -> Result<MonitorApp> {
     let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let config_workspaces = workspace_config::discover(Some(&root)).context("list workspaces")?;
     let view = load_config_view(&config_workspaces[0]).context("load config")?;
@@ -617,6 +614,9 @@ fn dispatch_key_event(app: &mut MonitorApp, key: KeyEvent) {
         return;
     }
     if app.active_section == Section::Config && handle_config_key(app, key.code) {
+        return;
+    }
+    if app.active_section == Section::Automations && handle_automations_key(app, key.code) {
         return;
     }
     match key.code {

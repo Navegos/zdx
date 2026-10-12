@@ -9,7 +9,7 @@ Scope: CLI argument parsing/router, subcommands, and interactive/exec mode entry
 - `src/cli/`: argument structs + command dispatch
 - `src/cli/commands/ask_media.rs`: one-shot media understanding (`zdx ask-media`) over `zdx_engine::media`
 - `src/cli/commands/{auth,chat,config,exec,models}.rs`: auth, interactive chat, config, exec, and models command handlers
-- `src/cli/commands/automations.rs`: automations commands (`list [--json] [--daemon]`, `validate`, `run`); prompt composition and run records over the engine's `automations::resolve_run`
+- `src/cli/commands/automations.rs`: automations commands (`list [--json] [--daemon]`, `validate`, `set-model`, `run`); prompt composition and run records over the engine's `automations::resolve_run`
 - `src/cli/commands/bg.rs`: background-process commands (`zdx bg list [--json]`, `zdx bg kill <bg_id>`); thin wrapper over `zdx_engine::background_activity`
 - `src/cli/commands/bot.rs`: Telegram bot setup/init command handler (`zdx bot init`)
 - `src/cli/commands/daemon.rs`: scheduled automations daemon loop (writes the daemon context record, reloads config on ticks with due jobs)
@@ -26,7 +26,7 @@ Scope: CLI argument parsing/router, subcommands, and interactive/exec mode entry
 - `src/cli/commands/worktree.rs`: worktree command handler
 - `src/modes/exec.rs`: non-interactive streaming mode
 - `src/modes/mod.rs`: mode exports (exec + feature-gated TUI)
-- `tests/integration/`: CLI integration tests (`assert_cmd`, fixtures), aggregated into a single test binary via `tests/integration/main.rs`. Add new test files as `tests/integration/<name>.rs` and register them with `mod <name>;` in `main.rs` (for example `threads_export.rs` covers `zdx threads export`, `exec_subagent.rs` covers `zdx exec --subagent`, `automations_run.rs` covers automation prompt layers, runtime context, `root`, `list --json`, and `list --daemon`, `service.rs` covers `zdx service status`/target validation without mutating launchd, `stream_stall.rs` covers stalled-stream timeouts, including a stalled `invoke_subagent` child, against a raw TCP mock that can hold a socket open).
+- `tests/integration/`: CLI integration tests (`assert_cmd`, fixtures), aggregated into a single test binary via `tests/integration/main.rs`. Add new test files as `tests/integration/<name>.rs` and register them with `mod <name>;` in `main.rs` (for example `threads_export.rs` covers `zdx threads export`, `exec_subagent.rs` covers `zdx exec --subagent`, `automations_run.rs` covers automation prompt layers, runtime context, `root`, `list --json`, `list --daemon`, and `set-model`, `service.rs` covers `zdx service status`/target validation without mutating launchd, `stream_stall.rs` covers stalled-stream timeouts, including a stalled `invoke_subagent` child, against a raw TCP mock that can hold a socket open).
   - `tests/integration/opencode_go_headers.rs` covers OpenCode session routing, identity isolation, and stability across requests.
   - `tests/integration/responses_usage.rs` checks that a Responses API turn stores the provider's usage once (guards the shared Responses mapper's terminal event order).
 

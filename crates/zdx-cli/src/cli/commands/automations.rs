@@ -264,6 +264,23 @@ pub fn list_daemon(json: bool) -> Result<()> {
     Ok(())
 }
 
+/// Sets (`spec`) or clears (`clear`) the declared model of one automation.
+pub fn set_model(caller: &Caller<'_>, name: &str, spec: Option<&str>, clear: bool) -> Result<()> {
+    let automation = automations::load_by_name(caller.root, name)
+        .with_context(|| format!("load automation '{name}'"))?;
+    let edit = match (spec, clear) {
+        (Some(spec), false) => automations::ModelEdit::Set(spec),
+        (None, true) => automations::ModelEdit::Clear,
+        _ => anyhow::bail!("pass either a model spec or --clear"),
+    };
+    let updated = automations::set_model(&automation.path, None, edit)?;
+    match updated.model.as_deref() {
+        Some(model) => println!("{name}: model = {model}"),
+        None => println!("{name}: model cleared (inherits)"),
+    }
+    Ok(())
+}
+
 /// Records a scheduled run that could not start, without running it.
 pub fn record_failed_start(
     automation: &AutomationDefinition,

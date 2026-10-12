@@ -686,6 +686,25 @@ enum AutomationCommands {
         #[arg(long)]
         json: bool,
     },
+    /// Set or clear the `model` of one automation file (other keys, comments,
+    /// and the prompt stay unchanged)
+    SetModel {
+        /// Automation name (file stem)
+        #[arg(value_name = "NAME")]
+        name: String,
+
+        /// Model spec (`provider[@account]:model[@thinking][@fast]`)
+        #[arg(
+            value_name = "SPEC",
+            required_unless_present = "clear",
+            conflicts_with = "clear"
+        )]
+        spec: Option<String>,
+
+        /// Remove the model override so the automation inherits it
+        #[arg(long)]
+        clear: bool,
+    },
     /// Run one automation by name (file stem)
     Run {
         /// Automation name (file stem)
@@ -1585,6 +1604,9 @@ async fn dispatch_automations(
             date_end,
             json,
         }),
+        AutomationCommands::SetModel { name, spec, clear } => {
+            commands::automations::set_model(&caller, &name, spec.as_deref(), clear)
+        }
         AutomationCommands::Run { name } => {
             let thread_opts: ThreadPersistenceOptions = context.thread_args.into();
             Box::pin(commands::automations::run(&caller, &thread_opts, &name)).await
