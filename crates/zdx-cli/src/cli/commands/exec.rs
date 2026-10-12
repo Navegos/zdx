@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use zdx_engine::config;
 use zdx_engine::core::agent::{ToolConfig, ToolSelection};
-use zdx_engine::core::context::PromptContextInclusion;
+use zdx_engine::core::context::{EffectivePrompt, PromptContextInclusion};
 use zdx_engine::core::thread_persistence::ThreadPersistenceOptions;
 use zdx_engine::subagents::{self, SubagentDefinition};
 use zdx_engine::tools::ToolRegistry;
@@ -21,7 +21,9 @@ pub struct ExecRunOptions<'a> {
     pub prompt: &'a str,
     pub config: &'a config::Config,
     pub model_override: Option<&'a str>,
-    pub effective_system_prompt_override: Option<&'a str>,
+    /// Prebuilt prompt (system prompt plus runtime-context snapshot). Ignored
+    /// when `subagent` is set.
+    pub effective_prompt_override: Option<&'a EffectivePrompt>,
     pub tool_timeout_override: Option<u32>,
     pub event_filter_override: Option<&'a str>,
     pub stream: bool,
@@ -67,20 +69,21 @@ pub async fn run(options: ExecRunOptions<'_>) -> Result<()> {
         c
     };
 
-    let effective_system_prompt = match subagent.as_ref() {
-        Some(definition) => Some(
-            subagents::render_prompt(
-                &config,
-                &root_path,
-                definition,
-                &config.model,
-                PromptContextInclusion::default(),
-            )
-            .with_context(|| format!("render subagent '{}'", definition.name))?,
-        ),
-        None => options
-            .effective_system_prompt_override
-            .map(std::string::ToString::to_string),
+    let effective_prompt = match subagent.as_ref() {
+        Some(definition) => Some(EffectivePrompt {
+            prompt: Some(
+                subagents::render_prompt(
+                    &config,
+                    &root_path,
+                    definition,
+                    &config.model,
+                    PromptContextInclusion::default(),
+                )
+                .with_context(|| format!("render subagent '{}'", definition.name))?,
+            ),
+            ..EffectivePrompt::default()
+        }),
+        None => options.effective_prompt_override.cloned(),
     };
 
     let subagent_tools = subagent
@@ -110,7 +113,7 @@ pub async fn run(options: ExecRunOptions<'_>) -> Result<()> {
             .transpose()?
             .unwrap_or_default(),
         stream: options.stream,
-        effective_system_prompt,
+        effective_prompt,
         no_system_prompt: options.no_system_prompt,
         activity_kind: options.activity_kind.map(std::string::ToString::to_string),
         activity_parent_thread_id: options

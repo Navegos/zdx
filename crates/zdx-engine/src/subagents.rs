@@ -241,6 +241,53 @@ pub fn render_prompt(
     render_prompt_inner(config, root, definition, model, inclusion, None).map(|(prompt, _)| prompt)
 }
 
+/// Renders a subagent prompt for a non-interactive run (automations), plus the
+/// runtime-context snapshot for the first user turn.
+///
+/// The subagent body replaces the default system prompt, so the canonical
+/// project instructions, Safety/Git rules, and `instruction_layers` are
+/// appended to it (see
+/// [`crate::core::context::render_non_interactive_standalone_prompt`]). Tools and
+/// skills stay as the profile declares: skills are not added to the catalog,
+/// and the delegation catalog is dropped when the profile's tool list has no
+/// `invoke_subagent`.
+///
+/// # Errors
+/// Returns an error if rendering fails or produces an empty prompt.
+pub fn render_prompt_with_layers(
+    config: &crate::config::Config,
+    root: &Path,
+    definition: &SubagentDefinition,
+    model: &str,
+    inclusion: PromptContextInclusion,
+    instruction_layers: &[&str],
+) -> Result<(String, Option<crate::core::context::RuntimeContext>)> {
+    let mut inclusion = inclusion;
+    inclusion.skills = false;
+    let mut config = config.clone();
+    if definition.tools.as_ref().is_some_and(|tools| {
+        !tools
+            .iter()
+            .any(|tool| tool.eq_ignore_ascii_case("invoke_subagent"))
+    }) {
+        config.subagents.enabled = false;
+    }
+    let subagent_skills = resolve_subagent_skills(&config, root, definition)?;
+    crate::core::context::render_non_interactive_standalone_prompt(
+        &config,
+        root,
+        model,
+        &definition.prompt_body,
+        inclusion,
+        &StandalonePromptSkillContext {
+            available_skills: subagent_skills.allowed,
+            auto_loaded_skill_contents: subagent_skills.auto_loaded,
+        },
+        instruction_layers,
+    )
+    .with_context(|| format!("render subagent '{}'", definition.name))
+}
+
 /// Renders a subagent prompt with the full discovered skills catalog exposed
 /// as the `skills_list` template var, instead of forcing skills off.
 ///

@@ -27,6 +27,29 @@ pub const THREAD_TLDR_PROMPT_TEMPLATE: &str = include_str!("../prompts/thread_tl
 /// Prompt template for system prompt assembly (`MiniJinja`).
 pub const SYSTEM_PROMPT_TEMPLATE: &str = include_str!("../prompts/system_prompt_template.md");
 
+/// Named `MiniJinja` partials shared by the system prompt template and the
+/// non-interactive subagent suffix (`{% include "<name>" %}`), so each block has
+/// one source.
+pub const PROMPT_PARTIALS: &[(&str, &str)] = &[
+    (
+        "project_instructions",
+        include_str!("../prompts/partials/project_instructions.md"),
+    ),
+    (
+        "runtime_layers",
+        include_str!("../prompts/partials/runtime_layers.md"),
+    ),
+    (
+        "safety_rules",
+        include_str!("../prompts/partials/safety_rules.md"),
+    ),
+];
+
+/// Appended to a named subagent's prompt when it runs non-interactively (automation
+/// `subagent:`): project instructions, Safety/Git rules, and runtime layers.
+pub const NON_INTERACTIVE_SUBAGENT_SUFFIX_TEMPLATE: &str =
+    include_str!("../prompts/non_interactive_subagent_suffix.md");
+
 /// Built-in instruction layer for headless automation behavior.
 pub const AUTOMATION_INSTRUCTION_LAYER: &str =
     include_str!("../instruction_layers/automation_instruction_layer.md");

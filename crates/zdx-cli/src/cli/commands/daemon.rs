@@ -25,11 +25,11 @@ struct DaemonState {
 /// # Errors
 /// Returns an error if state loading/writing fails.
 pub async fn run(
-    root: &Path,
+    caller: &automation_commands::Caller<'_>,
     thread_opts: &ThreadPersistenceOptions,
-    config: &config::Config,
     poll_interval_secs: u64,
 ) -> Result<()> {
+    let root = caller.root;
     let poll = Duration::from_secs(poll_interval_secs.max(1));
     zdx_engine::pidfile::ensure_unique("daemon")?;
     let state_path = daemon_state_path();
@@ -64,9 +64,8 @@ pub async fn run(
 
                     tracing::info!(name = %automation.name, "Running automation");
                     match automation_commands::run_definition(
-                        root,
+                        caller,
                         thread_opts,
-                        config,
                         &automation,
                         automation_commands::RunTrigger::Daemon,
                     )

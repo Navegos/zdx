@@ -30,7 +30,7 @@ pub async fn run(
             prompt,
             config,
             model_override,
-            effective_system_prompt_override: None,
+            effective_prompt_override: None,
             tool_timeout_override: None,
             event_filter_override: None,
             stream: false,

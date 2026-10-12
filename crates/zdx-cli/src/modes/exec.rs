@@ -37,8 +37,9 @@ pub struct ExecOptions {
     pub event_filter: Vec<String>,
     /// Emit incremental `assistant_delta` events instead of only the completed text.
     pub stream: bool,
-    /// Optional fully-rendered system prompt override.
-    pub effective_system_prompt: Option<String>,
+    /// Optional prebuilt prompt (system prompt plus runtime-context snapshot)
+    /// used instead of composing the default exec prompt.
+    pub effective_prompt: Option<zdx_engine::core::context::EffectivePrompt>,
     /// Disable all system prompt/context composition.
     pub no_system_prompt: bool,
     /// Logical role for this run in the active-agents registry.
@@ -117,15 +118,8 @@ pub async fn run_exec(
 
     let effective = if options.no_system_prompt {
         None
-    } else if let Some(prompt) = options.effective_system_prompt.as_ref() {
-        Some(zdx_engine::core::context::EffectivePrompt {
-            prompt: Some(prompt.clone()),
-            runtime_context: None,
-            loaded_agents_paths: Vec::new(),
-            scoped_context_paths: Vec::new(),
-            warnings: Vec::new(),
-            loaded_skills: Vec::new(),
-        })
+    } else if let Some(prompt) = options.effective_prompt.as_ref() {
+        Some(prompt.clone())
     } else {
         let instruction_layers = exec_instruction_layers();
         Some(
@@ -392,7 +386,7 @@ mod tests {
             tool_config: zdx_engine::core::agent::ToolConfig::default(),
             event_filter: Vec::new(),
             stream: false,
-            effective_system_prompt: None,
+            effective_prompt: None,
             no_system_prompt: false,
             activity_kind: None,
             activity_parent_thread_id: None,
@@ -420,7 +414,7 @@ mod tests {
             tool_config: zdx_engine::core::agent::ToolConfig::default(),
             event_filter: Vec::new(),
             stream: false,
-            effective_system_prompt: None,
+            effective_prompt: None,
             no_system_prompt: false,
             activity_kind: None,
             activity_parent_thread_id: None,

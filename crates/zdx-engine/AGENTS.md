@@ -12,7 +12,7 @@ Scope: core runtime engine — config, agent orchestration, tools, prompt/contex
 - `src/audio/transcribe.rs`: shared audio transcription helpers (OpenAI/Mistral via `/audio/transcriptions`; xAI Grok STT via `/stt`; ElevenLabs Scribe via `/v1/speech-to-text` with `xi-api-key`)
 - `src/agent_activity.rs`: active-run registry (ephemeral marker files for agent turns)
 - `src/background_activity.rs`: background-process registry — durable marker files under `~/.zdx/run/background/` for long-lived processes started with the Bash tool's `background: true`; identity-guarded (`pid`+birth-time+`pgid`) kill defends against PID reuse; exited-tombstone + age prune
-- `src/automations.rs`: automation discovery + frontmatter parsing
+- `src/automations.rs`: automation discovery + frontmatter parsing, and the shared resolver (`resolve_run`, `resolve_run_settings`, `overview`) for each automation's effective root, config, subagent, and model with per-value origins. Surfaces (CLI, Monitor, Mini App) consume these; they do not re-derive model or root.
 - `src/config.rs`: config loading + paths (embeds `zdx_assets::DEFAULT_CONFIG_TOML`)
 - `src/custom_commands.rs`: custom slash command discovery + frontmatter parsing (`<ZDX_HOME>/commands` + ancestor/current `.zdx/commands`, plus bundled commands from `zdx_assets::bundled_command_assets()`)
 - `src/followups.rs`: shared `<followups>` suggestion-block parsing (surfaces strip + render their own way)

@@ -807,6 +807,10 @@ fn render_prompt_template(
 ) -> std::result::Result<Option<String>, String> {
     let mut env = Environment::new();
     env.set_undefined_behavior(UndefinedBehavior::Strict);
+    for (name, source) in zdx_assets::PROMPT_PARTIALS {
+        env.add_template(name, source)
+            .map_err(|error| error.to_string())?;
+    }
     env.add_template("system_prompt", template)
         .map_err(|error| error.to_string())?;
 
@@ -863,6 +867,62 @@ pub fn render_standalone_prompt_template_with_context(
     skill_context: &StandalonePromptSkillContext,
     extra_context: Option<&str>,
 ) -> Result<(String, Option<RuntimeContext>)> {
+    render_standalone_inner(
+        config,
+        root,
+        model,
+        template,
+        inclusion,
+        skill_context,
+        extra_context,
+        None,
+    )
+}
+
+/// Like [`render_standalone_prompt_template_with_context`], for a standalone
+/// profile that runs non-interactively (an automation with `subagent:`).
+///
+/// The profile body replaces the default system prompt, so the canonical
+/// project-instructions, Safety/Git, and runtime-layer blocks are appended
+/// after it (`NON_INTERACTIVE_SUBAGENT_SUFFIX_TEMPLATE`). Project instructions are
+/// emptied in the body's own vars, so a body that renders `project_context`
+/// does not get a second copy.
+///
+/// # Errors
+/// Returns an error if the body, a layer, or the suffix fails to render, or
+/// the body renders empty.
+pub fn render_non_interactive_standalone_prompt(
+    config: &Config,
+    root: &Path,
+    model: &str,
+    template: &str,
+    inclusion: PromptContextInclusion,
+    skill_context: &StandalonePromptSkillContext,
+    instruction_layers: &[&str],
+) -> Result<(String, Option<RuntimeContext>)> {
+    render_standalone_inner(
+        config,
+        root,
+        model,
+        template,
+        inclusion,
+        skill_context,
+        None,
+        Some(instruction_layers),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_standalone_inner(
+    config: &Config,
+    root: &Path,
+    model: &str,
+    template: &str,
+    inclusion: PromptContextInclusion,
+    skill_context: &StandalonePromptSkillContext,
+    extra_context: Option<&str>,
+    non_interactive_layers: Option<&[&str]>,
+) -> Result<(String, Option<RuntimeContext>)> {
     let sections_result = load_prompt_context_sections(root, config);
     let inline_project_context = if inclusion.project_context {
         sections_result.inline_project_context.as_deref()
@@ -912,11 +972,39 @@ pub fn render_standalone_prompt_template_with_context(
         .clone_from(&skill_context.auto_loaded_skill_contents);
 
     let runtime_context = build_runtime_context_blocks(&vars, extra_context);
-    let prompt = render_prompt_template(template.trim(), &vars)
+    let Some(layers) = non_interactive_layers else {
+        let prompt = render_prompt_template(template.trim(), &vars)
+            .map_err(|error| anyhow::anyhow!(error))?
+            .filter(|prompt| !prompt.trim().is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!("standalone prompt template rendered an empty prompt")
+            })?;
+        return Ok((prompt, Some(runtime_context)));
+    };
+
+    let mut body_vars = vars.clone();
+    body_vars.project_context = String::new();
+    body_vars.scoped_context = Vec::new();
+    let body = render_prompt_template(template.trim(), &body_vars)
         .map_err(|error| anyhow::anyhow!(error))?
-        .filter(|prompt| !prompt.trim().is_empty())
         .ok_or_else(|| anyhow::anyhow!("standalone prompt template rendered an empty prompt"))?;
-    Ok((prompt, Some(runtime_context)))
+
+    let mut suffix_vars = vars;
+    suffix_vars.instruction_layers = layers
+        .iter()
+        .map(|layer| {
+            render_prompt_template(layer.trim(), &suffix_vars)
+                .map_err(|error| anyhow::anyhow!("render instruction layer: {error}"))
+        })
+        .filter_map(Result::transpose)
+        .collect::<Result<_>>()?;
+    let suffix = render_prompt_template(
+        zdx_assets::NON_INTERACTIVE_SUBAGENT_SUFFIX_TEMPLATE,
+        &suffix_vars,
+    )
+    .map_err(|error| anyhow::anyhow!("render non-interactive subagent suffix: {error}"))?
+    .unwrap_or_default();
+    Ok((format!("{body}\n\n{suffix}"), Some(runtime_context)))
 }
 
 /// Collects all AGENTS.md paths to check, in order.

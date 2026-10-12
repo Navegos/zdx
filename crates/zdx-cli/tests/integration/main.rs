@@ -6,6 +6,7 @@
 
 mod fixtures;
 
+mod automations_run;
 mod cli_help;
 mod config_path;
 mod custom_provider_api;

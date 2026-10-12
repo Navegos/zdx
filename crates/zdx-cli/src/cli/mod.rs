@@ -647,7 +647,11 @@ enum MemoryCommands {
 #[derive(clap::Subcommand)]
 enum AutomationCommands {
     /// List discovered automations
-    List,
+    List {
+        /// Output JSON with declared and resolved root/model per automation
+        #[arg(long)]
+        json: bool,
+    },
     /// Validate automation files
     Validate,
     /// Run scheduled automations daemon
@@ -980,7 +984,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
     let Cli {
         command,
         root,
-        system_prompt: _,
+        system_prompt,
         model,
         thread_args,
         worktree,
@@ -1003,12 +1007,17 @@ async fn dispatch(cli: Cli) -> Result<()> {
         worktree_id: worktree.as_deref(),
         thread_args: &thread_args,
         config: &config,
+        model: model.as_deref(),
+        system_prompt: system_prompt.as_deref(),
     };
 
     Box::pin(dispatch_command(command, &context)).await
 }
 
-fn apply_system_prompt_override(config: &mut config::Config, system_prompt: Option<&str>) {
+pub(crate) fn apply_system_prompt_override(
+    config: &mut config::Config,
+    system_prompt: Option<&str>,
+) {
     let Some(sp) = system_prompt else {
         return;
     };
@@ -1051,6 +1060,11 @@ struct DispatchContext<'a> {
     worktree_id: Option<&'a str>,
     thread_args: &'a ThreadArgs,
     config: &'a config::Config,
+    /// Global `--model`; only interactive chat reads it.
+    model: Option<&'a str>,
+    /// Global `--system-prompt`, already applied to `config`. Kept so a run
+    /// that reloads config for another root can apply it again.
+    system_prompt: Option<&'a str>,
 }
 
 #[allow(clippy::struct_excessive_bools)]
@@ -1111,18 +1125,22 @@ async fn run_exec_command(context: &DispatchContext<'_>, input: ExecCommandInput
     let root_path = resolve_root(context.root, context.worktree_id)?;
     let root_string = root_path.to_string_lossy().to_string();
     let prompt = resolve_exec_prompt(input.prompt, input.prompt_file.as_deref())?;
-    let effective_system_prompt = input
+    let effective_prompt = input
         .effective_system_prompt_file
         .as_deref()
         .map(|path| read_exec_input_file(path, "effective system prompt file"))
-        .transpose()?;
+        .transpose()?
+        .map(|prompt| zdx_engine::core::context::EffectivePrompt {
+            prompt: Some(prompt),
+            ..Default::default()
+        });
     commands::exec::run(commands::exec::ExecRunOptions {
         root: &root_string,
         thread_opts: &thread_opts,
         prompt: &prompt,
         config: context.config,
         model_override: input.model.as_deref(),
-        effective_system_prompt_override: effective_system_prompt.as_deref(),
+        effective_prompt_override: effective_prompt.as_ref(),
         tool_timeout_override: None,
         event_filter_override: input.filter.as_deref(),
         stream: input.stream,
@@ -1523,16 +1541,25 @@ async fn dispatch_automations(
     command: AutomationCommands,
     context: &DispatchContext<'_>,
 ) -> Result<()> {
+    if context.model.is_some() {
+        anyhow::bail!(
+            "--model is not supported for automations; set `model:` in the automation file"
+        );
+    }
     let root_path = resolve_root(context.root, context.worktree_id)?;
+    let caller = commands::automations::Caller {
+        root: &root_path,
+        config: context.config,
+        system_prompt_override: context.system_prompt,
+    };
     match command {
-        AutomationCommands::List => commands::automations::list(&root_path),
-        AutomationCommands::Validate => commands::automations::validate(&root_path, context.config),
+        AutomationCommands::List { json } => commands::automations::list(&caller, json),
+        AutomationCommands::Validate => commands::automations::validate(&caller),
         AutomationCommands::Daemon { poll_interval_secs } => {
             let thread_opts: ThreadPersistenceOptions = context.thread_args.into();
             Box::pin(commands::daemon::run(
-                &root_path,
+                &caller,
                 &thread_opts,
-                context.config,
                 poll_interval_secs,
             ))
             .await
@@ -1552,7 +1579,7 @@ async fn dispatch_automations(
         }),
         AutomationCommands::Run { name } => {
             let thread_opts: ThreadPersistenceOptions = context.thread_args.into();
-            commands::automations::run(&root_path, &thread_opts, context.config, &name).await
+            Box::pin(commands::automations::run(&caller, &thread_opts, &name)).await
         }
     }
 }
