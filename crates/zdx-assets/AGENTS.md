@@ -27,5 +27,4 @@ Scope: embedded asset content (prompts, instruction layers, default TOMLs, bundl
 
 ## Checks
 
-- `cargo check -p zdx-assets`
-- Final verification after a change that touches runtime consumers: `just ci`
+- `cargo check -p zdx-assets`. For changes that touch runtime consumers, follow the root verification rules.

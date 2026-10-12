@@ -22,5 +22,4 @@ Scope: pure shared value types, enums, and associated pure helper logic used acr
 
 ## Checks
 
-- `cargo test -p zdx-types` --lib --bins --tests
-- Final: `just ci`
+- Follow the root verification rules. Scoped tests: `cargo test -p zdx-types --lib --bins --tests`.

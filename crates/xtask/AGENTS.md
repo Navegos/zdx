@@ -5,6 +5,7 @@ Scope: maintainer-only workspace utilities (defaults/config/codebase generation)
 ## Where things are
 
 - `src/main.rs`: xtask command entrypoint
+- `src/codebase.rs`: `codebase.txt` generation (`just codebase`)
 
 ## Conventions
 
@@ -13,10 +14,5 @@ Scope: maintainer-only workspace utilities (defaults/config/codebase generation)
 
 ## Checks
 
-- Default final verification after code changes: `just ci` from repo root
-- Intermediate iteration for this crate: `cargo test -p xtask` --lib --bins --tests
+- Follow the root verification rules. Scoped tests: `cargo test -p xtask --lib --bins --tests`.
 - Run commands from repo root via `cargo xtask ...` or `just update-*` recipes
-
-## Maintenance
-
-- Add/move/delete `.rs` files in this crate: update this file.

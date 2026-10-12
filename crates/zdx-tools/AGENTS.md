@@ -18,6 +18,7 @@ Leaf tool implementations that only need a root directory and optional timeout â
 - `src/walk.rs`: shared traversal policy for `glob`/`grep` â€” the wall-clock `WalkBudget` (5s, sliceable into phases), `.git` pruning, and the shallow-then-parallel `walk()`
 - `src/web_search.rs`: web search via Parallel API
 - `src/fetch_webpage.rs`: URL content extraction via Parallel API
+- `src/parallel.rs`: shared Parallel.ai HTTP client, retry policy, and error reporting for `web_search` and `fetch_webpage`
 - `src/apply_patch/`: unified diff patch application
 
 ## Key types

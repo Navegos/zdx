@@ -1,6 +1,6 @@
 # zdx-providers
 
-LLM provider implementations extracted from `zdx-core`.
+LLM provider implementations, used by `zdx-engine`.
 
 ## Layout
 
@@ -11,7 +11,8 @@ LLM provider implementations extracted from `zdx-core`.
 - `src/anthropic/` — Anthropic Messages API + Claude CLI OAuth provider
 - `src/openai/` — OpenAI Responses/Chat Completions/image generation API + Codex OAuth provider
 - `src/gemini/` — Google Gemini API + Antigravity OAuth providers
-- `src/openrouter.rs`, `src/deepseek.rs`, `src/mistral.rs`, `src/moonshot.rs`, `src/stepfun.rs`, `src/xiaomi.rs`, `src/minimax.rs`, `src/zai.rs`, `src/xai.rs` — thin OpenAI-compatible providers
+- `src/openrouter.rs`, `src/deepseek.rs`, `src/mistral.rs`, `src/moonshot.rs`, `src/stepfun.rs`, `src/minimax.rs`, `src/xai.rs`, `src/lmstudio.rs` (local server), `src/xiaomi_plan.rs` (MiMo Token Plan) — thin OpenAI-compatible providers; `src/xiaomi.rs` and `src/zai.rs` are too, with the quirks below
+- `src/alibaba.rs` — Alibaba DashScope chat completions; `src/alibaba/image.rs` — Qwen-Image generation and editing
 - `src/zai.rs` — Z.AI GLM. The GLM-5.3 family always reasons: it 400s on `thinking: {"type": "disabled"}` (code 1210) and accepts only `reasoning_effort` `low|high|max`, so that family gets no thinking toggle and carries the level as a top-level effort instead; other GLM models keep the documented enabled/disabled toggle (verified against `api.z.ai` 2026-09-15).
 - `src/meta.rs` — Meta Muse Spark over the Responses API. Reasoning cannot be disabled: `effort: "none"` is HTTP 400 and omitting `reasoning` hands depth to the model (~118 reasoning tokens for a one-line answer vs 5 at `minimal`), so `off` sends `minimal` with no summary. `max` is Standard-tier `muse-spark-1.3` only (Contributor 400s) and is clamped to `xhigh` elsewhere (verified live 2026-09-16; docs: dev.meta.ai/docs/reasoning).
 - `src/grok_build.rs` — Grok Build provider: xAI Grok subscription OAuth over the Responses API at `cli-chat-proxy.grok.com` (bearer from `oauth::grok_build`, refreshed on demand). Subscription tokens must go to the proxy with Grok CLI client headers: `api.x.ai` answers 402 `personal-team-blocked:spending-limit`, and the proxy answers 426 when the headers are missing or `GROK_CLI_VERSION` is below its minimum (bump it to the current stable from `https://x.ai/cli/stable`)

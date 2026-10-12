@@ -19,7 +19,8 @@ Scope: full-screen interactive TUI (state/update/render/effects/runtime).
 - `runtime/inbox.rs`: runtime inbox channel types
 - `runtime/image_ops.rs`: shared image loading/transform helpers (preview + attachments)
 - `runtime/handlers/voice.rs`: microphone capture + voice transcription task handlers
-- `runtime/handlers/`: side-effect handlers (thread ops, agent spawn, auth, skills)
+- `runtime/handlers/`: side-effect handlers (thread ops, agent spawn, auth, skills, bash, file picker)
+- `runtime/context_analyze.rs`: context analysis handler
 - `runtime/handoff.rs`: handoff generation handlers (thin adapter over `zdx_engine::core::handoff_generation`)
 - `runtime/prompt_builder.rs`: prompt-builder generation handlers (thin adapter over `zdx_engine::core::prompt_builder_generation`)
 - `runtime/thread_title.rs`: auto-title handlers
@@ -51,12 +52,4 @@ Scope: full-screen interactive TUI (state/update/render/effects/runtime).
 
 ## Checks
 
-- Default final verification after code changes: `just ci` from repo root
-- Intermediate iteration for this crate: `cargo test -p zdx-tui` --lib --bins --tests
-- Use `just lint` or `just test` only when intentionally running one half of CI
-
-## Maintenance
-
-- Add/move/delete `.rs` files in this crate: update this file.
-- Add/move/delete prompt layer files in this crate: update this file.
-- Architecture changes: update `docs/ARCHITECTURE.md`..
+- Follow the root verification rules. Scoped tests: `cargo test -p zdx-tui --lib --bins --tests`.

@@ -24,10 +24,14 @@ Scope: core runtime engine — config, agent orchestration, tools, prompt/contex
 - `src/images/mod.rs`: shared image utilities module exports
 - `src/images/decode.rs`: generic image decode/resize/PNG encode helpers
 - `src/images/path_mime.rs`: path normalization + extension MIME helpers
+- `src/media.rs`: one-shot media understanding (audio/video/PDF/image + prompt → Gemini text); shared by the `ask_media` tool and `zdx ask-media`
 - `src/pidfile.rs`: PID file management
+- `src/proc_liveness.rs`: process liveness and identity primitives shared by the PID file, agent-activity, and background-process trackers
 - `src/service.rs`: launchd-backed control for the long-lived `bot`/`daemon` services — plist rendering, `install`/`uninstall`/`start`/`stop`/`restart`, and combined launchd+PID-file `state()`. Also owns the queued restart: one persisted request at `run/restart-queue.json` (`queue_restart` merges into a pending one and refuses unless a supervised bot is running to perform it; `QueuedRestart::is_fulfilled` compares service PID-file start times against `requested_at`). Agents run `~/.local/bin/zdx` (never `current_exe()`) so restart picks up the installed binary, launched via `zsh -c 'exec …'` so `~/.zshenv` (provider API keys, PATH) is sourced. Plists set `ZDX_SERVICE_SUPERVISOR=launchd` and capture output to `~/.zdx/run/logs/{name}.{out,err}`. macOS-only.
+- `src/telegram.rs`: outbound Telegram Bot API calls (create topic, send message, send document); shared by the Telegram tool and `zdx telegram`
 - `src/tracing_init.rs`: tracing setup
 - `src/workspace_config.rs`: shared workspace model-settings view — workspace list (Telegram profile `cwd`s used as-is + the caller's root resolved to its project root), per-setting effective value + origin layer (`default`/`global`/`workspace`/`ancestor`) + inherited fallback, and targeted `set_setting`/`reset_setting` on one layer. Backs Monitor Config, `zdx config workspaces`, and `/api/workspaces`. Writers reuse `Config::*_to` (whose `layer_document` seeds the template only for the global file, so overlays stay minimal) and `Config::unset_layer_key`.
+- `src/zdx_context.rs`: shared `{{ZDX_CONTEXT}}` block that tells helper subagents (handoff, tldr, prompt-builder, `Read_Thread`), which run without a system prompt, about installed subagents and skills
 
 ### Core runtime (`src/core/`)
 
@@ -37,27 +41,35 @@ Scope: core runtime engine — config, agent orchestration, tools, prompt/contex
 - `core/interrupt.rs`: signal handling
 - `core/agent.rs`: agent loop + event channels. Owns the stalled-stream limit (`stream_idle_timeout_secs`): one no-progress budget per provider request, covering the wait for the stream to open and the gaps between non-`Ping` events, measured on Tokio's clock so tests use paused time. A stall is a retryable `Timeout` provider error, so it goes through the normal retry gate.
 - `core/artifacts.rs`: shared thread artifact model — artifact-dir scan merged with transcript `<media>` refs (deduped), preview kinds, download path guard
+- `core/fts_query.rs`: shared FTS5 `MATCH` builder, so thread search and memory search interpret a query the same way
+- `core/goal.rs`: goal mode: in-memory objective state and the verifier agent that decides when the goal is met
 - `core/handoff_generation.rs`: LLM-based handoff context generation and the header-first `/handoff` and `/btw` seeds (source header, labelled user message, labelled generated background; shared by TUI + bot)
 - `core/media_fallback.rs`: image fallback for models with `input_images = false` — swaps user/tool-result image blocks for a note pointing at the `ask_media` tool, applied per model turn in `core/agent.rs`
 - `core/prompt_builder_generation.rs`: LLM-based prompt-builder generation (shared by TUI + bot)
 - `core/recency.rs`: shared recency decay applied to search relevance scores (`thread_index` and `native_memory`)
 - `core/native_memory.rs`: native SQLite-backed memory index/search over exported thread Markdown, Notes, and Calendar; owns `$ZDX_HOME/cache/memory.sqlite` and native `zdxmem:v1:*` docids. Includes the opt-in hosted embedding layer (`[memory.embeddings]` profile, budgets, `(input_hash, profile_fingerprint)` vector storage, vector/hybrid retrieval with RRF fusion); agent searches never trigger corpus embedding.
-- `core/thread_index.rs`: derived thread cache — owns `$ZDX_HOME/cache/threads.sqlite` (thread metadata, export dirty state, FTS over title + user/assistant text, tool-call rows). Incremental `(mtime,size)` sync; serves `list_threads()`, `search_threads()`, and `search_thread_tools()` with raw file-scan fallback. **The sync is split by scope and the split is load-bearing.** `SyncScope::Meta` upserts only the `SUMMARY_COLUMNS` metadata, reading one line per changed thread; `SyncScope::Full` additionally rebuilds preview, `activity_at`, FTS text and tool rows, which re-reads and re-tokenizes each changed transcript end to end (~90ms for a multi-megabyte thread versus ~1ms for its metadata). Content freshness is tracked separately from metadata freshness by `content_mtime_ns`/`content_size`, so the cheap pass can leave a row marked for the expensive one. Listing, lineage and lookup paths take `Meta`; only search and browse, which read the content columns, take `Full`. Routing a metadata reader to `Full` silently puts the whole corpus's re-tokenization back on the Mini App's hot path — that regression measured 7.7s with 20 active threads. Each scope keeps its own `SYNC_INTERVAL` watermark, and a `Full` sync satisfies both. A sync riding along with a read logs its scope, duration and file/read/content counts — `debug`, or `info` past `SLOW_SYNC`. Documents its intentional semantic differences from the old raw-JSONL scan in the module docs.
-
-`indexed_thread_files()` publishes every thread's `(mtime_ns, size)` change token from the index after a `Meta` sync, so a second derived cache never has to `stat()` the corpus to learn what changed. `usage_stats` consumes it; the tokens are byte-identical to a direct `ThreadFileMeta` read, so consumers compare them against their own stored tokens.
+- `core/thread_index.rs`: derived thread cache at `$ZDX_HOME/cache/threads.sqlite` (metadata, export dirty state, FTS over title + user/assistant text, tool-call rows); serves `list_threads()`, `search_threads()`, `search_thread_tools()` with a raw file-scan fallback. **The sync split is load-bearing:** `SyncScope::Meta` reads one line per changed thread; `SyncScope::Full` re-reads and re-tokenizes each changed transcript. Listing, lineage and lookup paths must take `Meta`; only search and browse take `Full`. Routing a metadata reader to `Full` puts corpus re-tokenization back on the Mini App hot path (measured 7.7s with 20 active threads). Details are in the module docs.
+  - `indexed_thread_files()` publishes each thread's `(mtime_ns, size)` change token after a `Meta` sync, so other derived caches (`usage_stats`) never `stat()` the corpus themselves.
 - `core/subagent.rs`: child `zdx exec` subagent runner. Child runs persist their own thread JSONL tagged via `ExecSubagentOptions::thread_origin_kind`/`thread_parent_id`/`thread_subagent_name` (so their usage is captured by `usage_stats`); tagged threads are hidden from default listings. `ExecSubagentOptions::thread_id` runs the child against an explicit existing thread (`--thread`, resumable workers). Unix children use the shared `zdx-tools` lease supervisor so cancellation, future drop, or owner death TERM→KILLs the group and reaps the target.
 - `core/thread_export.rs`: clean Markdown transcript exports derived from saved thread JSONL
 - `core/title_generation.rs`: LLM-based title generation (shared by TUI + bot)
 - `core/tldr_generation.rs`: LLM-based thread TLDR/recap generation (shared by TUI)
-- `core/thread_persistence.rs`: thread persistence. `list_threads()` hides child runs (any thread with `Meta.origin_kind` set — subagents/helpers); `list_all_threads()` includes them. Usage stats scan raw files (`list_thread_files`) so they still count child runs.
+- `core/thread_persistence/`: thread persistence (JSONL per thread; `persist`, `replay`, `search`, `storage`, `format`, `event`). `list_threads()` hides child runs (any thread with `Meta.origin_kind` set — subagents/helpers); `list_all_threads()` includes them. Usage stats scan raw files (`list_thread_files`) so they still count child runs.
 - `core/thread_trajectory.rs`: UI-agnostic, serde-serializable per-thread trajectory projection shared by CLI JSON/text, Monitor, and the Mini App API; owns span pairing, exact interval placement/overlap, bottleneck ranking, live snapshots, and legacy uncertainty
-- `core/usage_stats.rs`: usage/cost aggregation over saved threads (per provider/model), backed by a derived, disposable SQLite cache at `$ZDX_HOME/cache/usage.sqlite` (`rusqlite`, bundled) that re-scans only changed threads. It learns *which* threads changed from `thread_index::indexed_thread_files()`, not from its own directory walk — the index already walks on its own freshness window and stores the same tokens, so walking again cost a second full `stat()` of the corpus on the Mini App dashboard path. The walk remains as a fallback for a non-configured `threads_dir` (tests) or an unavailable index.
-- `core/workers.rs`: in-memory `WorkerManager` for the orchestrator profile — one FIFO/status/cancel-token per worker thread, serial prompts per worker, concurrent workers, `WorkerEvent` channel ordered per worker as `Created` → (`Prompted` | `Activity`)* → `Completed`; `all_idle()` relies on each worker sending its `Completed` event under the same lock that settles its status — keep them together, the bot's queued restart depends on it; queued prompts are `QueuedPrompt { id, text, requester_thread_id }` with process-unique ids so one waiting prompt can be listed (`WorkerSnapshot.queue`) and removed (`remove_queued_prompt`) without cancelling the worker. Completions route by `requester_thread_id` (captured at enqueue), never by the mutable `WorkerState.owner_thread_id`, which only drives listings and cards; the default runner streams the child's tool lifecycle through `SubagentStreamSink` and relays it as `WorkerEvent::Activity` (`WorkerActivity`), draining all activity before the turn's `Completed`. `list_for_owner` orders workers by an in-memory `touched_at` (create/attach, enqueue, turn start, turn end), newest first with thread-id ties; the orchestrator card shows its first five. Workers are silent; a separate `mirrors` registry (`set_mirror_url`/`mirror_url`) holds only links to **legacy** Telegram mirror topics the bot recovers at startup, flowing into `WorkerSnapshot`/`CompletionEvent.mirror_url`. Worker identity is not stored: `thread_persistence::is_worker_lineage` (top-level + `parent_thread_id`) and its SQL twin `thread_index::WORKER_SQL` are the one rule behind `list_recent_workers`, `ThreadKindFilter::Worker`, and `worker_counts_for_parents` — keep them in step (`worker_filter_matches_only_worker_lineage` checks they agree). Workers run through `zdx --thread <id> exec` via the child subagent runner with process-group cancellation. All state is process-lifetime (restart loses queues/ownership; thread JSONL survives; the bot recovers mirrors from `thread_persistence::list_worker_topics`). Resumes (`send_message`, `enqueue_from_topic`) re-read the worker thread's persisted root **and** model override, because the child `zdx exec` never reads a thread's model override itself: without `-m` it silently re-resolves the model from the project root's config layers, so a workspace default edited mid-thread would switch the worker's model while status cards still report the persisted one.
+- `core/usage_stats.rs`: usage/cost aggregation over saved threads, backed by the disposable cache `$ZDX_HOME/cache/usage.sqlite` (see `docs/ARCHITECTURE.md`, Usage Accounting). It learns which threads changed from `thread_index::indexed_thread_files()`; do not add a second directory walk on the dashboard path. The walk stays only as a fallback (tests, unavailable index).
+- `core/workers.rs`: in-memory `WorkerManager` for the orchestrator profile (overview: `docs/ARCHITECTURE.md`, Orchestrator + Worker Threads). Invariants:
+  - `all_idle()` relies on each worker sending `Completed` under the same lock that settles its status. Keep them together; the bot's queued restart depends on it.
+  - Per worker, events arrive as `Created` → (`Prompted` | `Activity`)* → `Completed`; the default runner drains all `Activity` before the turn's `Completed`.
+  - Completions route by `QueuedPrompt.requester_thread_id` (captured at enqueue), never by the mutable `WorkerState.owner_thread_id`, which only drives listings and cards.
+  - `thread_persistence::is_worker_lineage` and its SQL twin `thread_index::WORKER_SQL` must stay in step (`worker_filter_matches_only_worker_lineage` checks this).
+  - Resumes (`send_message`, `enqueue_from_topic`) re-read the worker thread's persisted root **and** model override. The child `zdx exec` never reads a thread's model override: without `-m` it re-resolves the model from config layers, so a mid-thread workspace change would silently switch the worker's model.
+  - All state is process-lifetime; thread JSONL survives a restart.
 - `core/worktree.rs`: git worktree management helpers
 
 ### Tools (`src/tools/`)
 
 - `tools/mod.rs`: ToolContext, ToolRegistry, ToolSet, handlers
+- `tools/orchestrator.rs`: the orchestrator's thread-control tools (unbound stubs in the default registry; the bot rebinds them to its live `WorkerManager`)
 - `tools/background.rs`: `run_background` (spawn+register a background process, invoked by the Bash tool on `background: true`) + `background_output`/`background_kill` agent tools (thread-scoped)
 - `tools/gh_api.rs`: read-only GitHub REST tool over `gh api` (GET only, base64 content decoded, diff/raw media types); wraps `gh` because its token lives in the OS keyring
 - `tools/git.rs`: read-only git inspection tool (`status`/`log`/`diff`/`show`); fixed subcommands and flags, operands rejected if they look like options
@@ -97,54 +109,12 @@ Scope: core runtime engine — config, agent orchestration, tools, prompt/contex
 
 ## Checks
 
-- Default final verification after code changes: `just ci` from repo root
-- Intermediate iteration for this crate: `cargo test -p zdx-engine` --lib --bins --tests
-- Use `just lint` or `just test` only when intentionally running one half of CI
+- Follow the root verification rules. Scoped tests: `cargo test -p zdx-engine --lib --bins --tests`.
 
 ## Adding or updating models
 
-Two files must be updated:
-
-1. **`src/config.rs`** — hardcoded provider defaults (e.g. `default_xiaomi_provider()`).
-   Add the model ID to the provider's `models` vec. This is the source of truth for
-   `default_config.toml` generation.
-2. **`default_models.toml`** — model entries with pricing, capabilities, context limits.
-   For models available on OpenRouter, you can skip manual editing — the update command
-   fetches pricing/capabilities automatically via the OpenRouter API fallback.
-   For models NOT on OpenRouter, add a full `[[model]]` block manually.
-3. **`default_config.toml`** — **do not edit directly**. It is generated from `config.rs`.
-
-### Workflow
-
-```bash
-# 1. Edit config.rs (add model to provider's models vec)
-# 2. Build so the binary embeds your changes
-cargo build
-# 3. Regenerate both default files
-just update-defaults
-# 4. Verify entries in default_models.toml (OpenRouter fallback fills pricing/capabilities)
-# 5. Update local user config (~/.zdx/config.toml) manually
-# 6. Update local models registry
-cargo run -- models update
-```
-
-### Fallback chain for model data (in `zdx models update`)
-
-1. **models.dev** — primary upstream source
-2. **embedded `default_models.toml`** — for models manually added to the file
-3. **OpenRouter API** — automatic fallback with pricing, context, reasoning, images
-4. **"(custom)" placeholder** — last resort with zero pricing (needs manual fix)
-
-### Gotchas
-
-- `just update-defaults` regenerates `default_models.toml` from external sources.
-  Models not in models.dev fall back to OpenRouter, then to "(custom)" placeholders.
-- Always `cargo build` before running update commands — the binary must embed the
-  latest `config.rs` and `default_config.toml` changes.
-- `default_config.toml` is generated output. To change provider model lists,
-  edit the `default_*_provider()` functions in `config.rs`.
-
-## Maintenance
-
-- Add/move/delete `.rs` files in this crate: update this file.
-- Architecture changes: update `docs/ARCHITECTURE.md`.
+- Canonical workflow: the project skill `.zdx/skills/model-provider-mgmt/SKILL.md`.
+- Provider model lists live in the `default_*_provider()` functions in `src/config.rs`. `default_config.toml` is generated from them; never edit it directly.
+- Run `cargo build` before `just update-defaults`, so the binary embeds the latest `config.rs`.
+- `zdx models update` fills model data from models.dev, then the embedded `default_models.toml`, then OpenRouter, and last a zero-priced "(custom)" placeholder that needs a manual fix.
+- Ask the user before applying a change to their own `~/.zdx/config.toml` or models registry.
