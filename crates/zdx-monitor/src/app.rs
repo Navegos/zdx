@@ -12,6 +12,7 @@ use crossterm::event::{
 use crossterm::execute;
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::prelude::*;
+use zdx_engine::automations::AutomationOverview;
 use zdx_engine::core::thread_index::{ThreadBrowseOptions, ThreadKindFilter};
 use zdx_engine::core::usage_stats::UsageStats;
 use zdx_engine::workspace_config::{self, EditTarget, Setting, Workspace};
@@ -21,7 +22,7 @@ use crate::tabs::agents::{
     ActiveAgentInfo, AgentOverlayState, agent_overlay_page_size, handle_agent_overlay_key,
     handle_overlay_click, load_active_agents, open_agent_overlay, refresh_agent_overlay,
 };
-use crate::tabs::automations::{AutomationInfo, load_automations};
+use crate::tabs::automations::load_automations;
 use crate::tabs::background::{
     BackgroundDetailState, BackgroundInfo, handle_background_detail_key, kill_selected_background,
     load_background, open_background_detail, refresh_background_detail,
@@ -102,7 +103,12 @@ pub struct MonitorApp {
     pub threads_scan_options: Option<ThreadBrowseOptions>,
     /// Raw thread JSONL queued to open after the current key event.
     pub(crate) pending_open_path: Option<PathBuf>,
-    pub automations: Vec<AutomationInfo>,
+    /// Automations with settings resolved for `root`. Loaded on entry to the
+    /// Automations tab (not on the tick): resolution reads config and
+    /// subagent files.
+    pub automations: Vec<AutomationOverview>,
+    /// Why the Automations list could not be built, if it failed as a whole.
+    pub automations_error: Option<String>,
     pub services: Vec<ServiceInfo>,
     /// In-flight background service restart, if any. Only one runs at a time.
     pub restart_job: Option<RestartJob>,
@@ -372,6 +378,11 @@ fn switch_section(app: &mut MonitorApp, section: Section) {
     } else {
         app.log_query_editing = false;
     }
+    if app.active_section == Section::Automations {
+        let snapshot = load_automations(&app.root);
+        app.automations = snapshot.items;
+        app.automations_error = snapshot.error;
+    }
     if app.active_section == Section::Threads {
         refresh_threads_if_stale(app);
     } else {
@@ -415,7 +426,8 @@ fn build_app(root: &Path) -> Result<MonitorApp> {
         threads_rx: None,
         threads_scan_options: None,
         pending_open_path: None,
-        automations: load_automations(&root),
+        automations: Vec::new(),
+        automations_error: None,
         services,
         restart_job: None,
         active_agents: load_active_agents(),
