@@ -1,6 +1,6 @@
 //! Muse Code (Meta subscription) provider using the Responses API.
 //!
-//! Sends the same Muse Spark request shape as the API-key [`crate::meta`]
+//! Sends the same Muse request shape as the API-key [`crate::meta`]
 //! provider, swapping `META_API_KEY` for a Model API key minted through Meta's
 //! device-authorization flow (see [`crate::oauth::muse_code`]).
 //!

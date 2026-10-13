@@ -431,7 +431,7 @@ fn provider_specs(config: &config::Config) -> [ProviderSpec<'_>; 22] {
             provider_cfg: &config.providers.meta,
         },
         ProviderSpec {
-            // Same Muse Spark catalogue as `meta`; only the credential differs.
+            // Same Muse catalogue as `meta`; only the credential differs.
             provider_id: "muse-code",
             api_id: "meta",
             prefix: Some("muse-code"),
@@ -1390,6 +1390,41 @@ mod tests {
         assert!((contributor.pricing.input - 0.1).abs() < 1e-9);
         assert!((contributor.pricing.output - 0.2).abs() < 1e-9);
         assert_eq!(contributor.capabilities.output_limit, 131_072);
+    }
+
+    #[test]
+    fn test_lookup_default_model_covers_muse_wonder_1_0() {
+        // models.dev lists muse-wonder-1.0 with no cost; the pinned override
+        // keeps the Model API rates from collapsing to $0.
+        let model = lookup_default_model("meta:muse-wonder-1.0").expect("meta:muse-wonder-1.0");
+        assert_eq!(model.provider, "meta");
+        assert_eq!(model.display_name, "Muse Wonder");
+        assert_eq!(model.context_limit, 1_048_576);
+        assert!((model.pricing.input - 4.0).abs() < f64::EPSILON);
+        assert!((model.pricing.output - 20.0).abs() < f64::EPSILON);
+        assert!((model.pricing.cache_read - 0.2).abs() < f64::EPSILON);
+        assert!(model.capabilities.reasoning);
+        assert!(model.capabilities.input_images);
+
+        let subscription =
+            lookup_default_model("muse-code:muse-wonder-1.0").expect("muse-code:muse-wonder-1.0");
+        assert_eq!(subscription.provider, "muse-code");
+        assert_eq!(subscription.context_limit, 1_048_576);
+        assert!(subscription.pricing.input.abs() < f64::EPSILON);
+        assert!(subscription.pricing.output.abs() < f64::EPSILON);
+        assert!(subscription.capabilities.input_images);
+
+        // Subscription-only and absent from models.dev/OpenRouter; the seeded
+        // entry plus pinned override keep it from degrading to a generic default.
+        let full = lookup_default_model("muse-code:muse-wonder-full-1.0")
+            .expect("muse-code:muse-wonder-full-1.0");
+        assert_eq!(full.provider, "muse-code");
+        assert_eq!(full.display_name, "Muse Wonder Full");
+        assert_eq!(full.context_limit, 1_048_576);
+        assert!(full.pricing.input.abs() < f64::EPSILON);
+        assert!(full.capabilities.reasoning);
+        assert!(full.capabilities.input_images);
+        assert!(full.capabilities.api.is_none());
     }
 
     #[test]

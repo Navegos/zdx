@@ -1,6 +1,6 @@
 //! Meta Model API provider (Responses API).
 //!
-//! Serves Meta's Muse Spark family. Chat Completions is deliberately not
+//! Serves Meta's Muse Wonder and Muse Spark models. Chat Completions is deliberately not
 //! used: Meta redacts `reasoning_content` to empty for external keys and
 //! exposes no reasoning summaries there, so thinking would never display.
 //! The Responses API requests a natural-language summary via
@@ -24,15 +24,23 @@ fn bare_model_id(model: &str) -> &str {
     model.rsplit(':').next().unwrap_or(model)
 }
 
-/// Whether this Muse Spark model accepts the `max` reasoning effort.
-/// Per Meta docs, `max` is Standard-tier `muse-spark-1.3` only;
-/// Contributor-tier models reject it.
+/// Whether this Muse model accepts the `max` reasoning effort.
+/// Per Meta docs, `max` is supported by `muse-wonder-1.0`, Muse Wonder Full,
+/// and Standard-tier `muse-spark-1.3`; `muse-spark-1.3-contributor` rejects
+/// it. The Muse Code `muse-wonder-1.0-contributor` id also accepts it
+/// (verified live 2026-10-12, as was `muse-wonder-full-1.0`).
 fn supports_max_effort(model: &str) -> bool {
-    bare_model_id(model) == "muse-spark-1.3"
+    matches!(
+        bare_model_id(model),
+        "muse-wonder-full-1.0"
+            | "muse-wonder-1.0"
+            | "muse-wonder-1.0-contributor"
+            | "muse-spark-1.3"
+    )
 }
 
 /// Maps a ZDX thinking level to Meta's `reasoning_effort` vocabulary.
-/// Muse Spark always reasons: `"none"` is HTTP 400 and omitting the field
+/// Muse models always reason: `"none"` is HTTP 400 and omitting the field
 /// hands depth to the model (~20x the tokens of `minimal` on trivial turns,
 /// measured 2026-09-16), so `Off` clamps to `minimal` — the lowest accepted
 /// effort — and the caller keeps the summary off so nothing is displayed.
@@ -50,7 +58,7 @@ pub(crate) fn reasoning_effort_from_thinking_level(
     }
 }
 
-/// Builds the shared Muse Spark Responses configuration.
+/// Builds the shared Muse Responses configuration.
 ///
 /// Shared with the `muse-code` subscription provider, which sends the same
 /// request shape with an OAuth-minted key instead of an API key.
@@ -297,7 +305,7 @@ mod tests {
     }
 
     #[test]
-    fn meta_max_effort_is_standard_tier_only() {
+    fn meta_max_effort_only_for_models_that_accept_it() {
         assert_eq!(
             reasoning_effort_from_thinking_level(ThinkingLevel::Max, "muse-spark-1.3"),
             "max"
@@ -307,6 +315,19 @@ mod tests {
             reasoning_effort_from_thinking_level(ThinkingLevel::Max, "meta:muse-spark-1.3"),
             "max"
         );
+        for model in [
+            "muse-wonder-1.0",
+            "meta:muse-wonder-1.0",
+            "muse-code:muse-wonder-1.0",
+            "muse-code:muse-wonder-1.0-contributor",
+            "muse-code:muse-wonder-full-1.0",
+        ] {
+            assert_eq!(
+                reasoning_effort_from_thinking_level(ThinkingLevel::Max, model),
+                "max",
+                "{model}"
+            );
+        }
         // Contributor-tier models reject `max`; clamp to `xhigh`.
         for model in ["muse-spark-1.3-contributor", "muse-spark-1.1"] {
             assert_eq!(

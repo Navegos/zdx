@@ -133,3 +133,28 @@ context_limit = 1050000
 output_limit = 128000
 reasoning = true
 input_images = true
+
+# Muse Wonder (`muse-wonder-1.0`, released 2026-10-12): models.dev lists the model
+# under `meta` but with no cost, which the updater turns into $0. Pin the official
+# Model API rates. No long-context premium. Meta publishes no max output, so the
+# models.dev 131072 passes through.
+# https://dev.meta.ai/models/muse-wonder — verified 2026-10-12
+[[override]]
+id = "meta:muse-wonder-1.0"
+input = 4.0
+output = 20.0
+cache_read = 0.2
+cache_write = 0.0
+
+# Muse Wonder Full (`muse-wonder-full-1.0`, released 2026-10-12): Muse Code
+# subscription only (Power Usage / Maximum Usage), so pricing stays zeroed. Not in
+# models.dev or OpenRouter, so pin the metadata: 1M context, reasoning up to `max`,
+# and image input (verified live 2026-10-12 with a Power Usage key). Meta publishes
+# no max output; 131072 mirrors `muse-wonder-1.0`.
+# https://dev.meta.ai/models/muse-wonder, https://dev.meta.ai/docs/models — verified 2026-10-12
+[[override]]
+id = "muse-code:muse-wonder-full-1.0"
+context_limit = 1048576
+output_limit = 131072
+reasoning = true
+input_images = true

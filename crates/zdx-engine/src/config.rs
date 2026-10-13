@@ -2311,6 +2311,7 @@ fn default_meta_provider() -> ProviderConfig {
     ProviderConfig {
         enabled: Some(true),
         models: vec![
+            "muse-wonder-1.0".to_string(),
             "muse-spark-1.3".to_string(),
             "muse-spark-1.3-contributor".to_string(),
         ],
@@ -2322,10 +2323,16 @@ fn default_meta_provider() -> ProviderConfig {
 ///
 /// Contributor tier is intentionally excluded; the difference from the API-key
 /// `meta` provider is the credential, which is minted by `zdx login --muse-code`.
+/// `muse-wonder-full-1.0` is subscription-only and needs the Power Usage or
+/// Maximum Usage plan; lower plans get HTTP 404 for it.
 fn default_muse_code_provider() -> ProviderConfig {
     ProviderConfig {
         enabled: Some(true),
-        models: vec!["muse-spark-1.3".to_string()],
+        models: vec![
+            "muse-wonder-full-1.0".to_string(),
+            "muse-wonder-1.0".to_string(),
+            "muse-spark-1.3".to_string(),
+        ],
         ..Default::default()
     }
 }
@@ -5045,7 +5052,15 @@ file = "prompts/template.md"
 
         assert_eq!(
             providers.meta.models,
-            vec!["muse-spark-1.3", "muse-spark-1.3-contributor"]
+            vec![
+                "muse-wonder-1.0",
+                "muse-spark-1.3",
+                "muse-spark-1.3-contributor"
+            ]
+        );
+        assert_eq!(
+            providers.muse_code.models,
+            vec!["muse-wonder-full-1.0", "muse-wonder-1.0", "muse-spark-1.3"]
         );
 
         // Gemini 3.8 Flash batch is deliberately absent: OpenRouter serves it only
