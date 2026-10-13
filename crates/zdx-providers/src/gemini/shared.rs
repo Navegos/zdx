@@ -72,12 +72,13 @@ fn capabilities_for_model(model: &str) -> GeminiCapabilities {
         };
     }
 
-    // Gemini 3.7 / 3.8 Flash variants: "low", "medium", "high" — Google dropped
-    // "minimal" (the backend rejects it with a 400).
+    // Gemini 3.7 / 3.8 Flash and Gemini 4 variants: "low", "medium", "high" —
+    // Google dropped "minimal" (the backend rejects it with a 400).
     if model.contains("gemini-3.7-flash")
         || model.contains("gemini-3.7")
         || model.contains("gemini-3.8-flash")
         || model.contains("gemini-3.8")
+        || model.contains("gemini-4")
     {
         return GeminiCapabilities {
             supports_minimal: false,
@@ -115,7 +116,7 @@ impl GeminiThinkingConfig {
     /// nearest level the target model supports (per `capabilities_for_model`).
     /// For Gemini 2.5 models: maps to thinkingBudget tokens.
     pub fn from_thinking_level(level: ThinkingLevel, model: &str) -> Self {
-        if model.contains("gemini-3") || model.contains("gemini-pro-agent") {
+        if is_gemini_3_or_later(model) || model.contains("gemini-pro-agent") {
             let caps = capabilities_for_model(model);
             return Self::gemini_3_level(level, caps);
         }
@@ -347,7 +348,7 @@ impl GeminiContentsBuilder {
                     let mut part = json!({ "functionCall": Value::Object(function_call) });
                     if let Some(sig) = gemini_replay_signature(replay.as_ref(), &self.model) {
                         part["thoughtSignature"] = json!(sig);
-                    } else if is_gemini_3(&self.model) {
+                    } else if is_gemini_3_or_later(&self.model) {
                         part["thoughtSignature"] = json!(SYNTHETIC_THOUGHT_SIGNATURE);
                     }
 
@@ -363,7 +364,7 @@ impl GeminiContentsBuilder {
     }
 
     fn append_user_blocks(&mut self, blocks: &[ChatContentBlock]) {
-        let model_is_gemini_3 = is_gemini_3(&self.model);
+        let model_is_gemini_3 = is_gemini_3_or_later(&self.model);
         let mut parts = Vec::new();
         let mut tool_results = Vec::new();
         // On Gemini 2.5 and older, tool-result images cannot live inside
@@ -479,12 +480,12 @@ fn is_valid_thought_signature(sig: &str) -> bool {
         .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=' | b'-' | b'_'))
 }
 
-/// Returns true when `model` is in the Gemini 3 family. The
-/// `SYNTHETIC_THOUGHT_SIGNATURE` sentinel is only valid on Gemini 3
-/// `functionCall` parts (older models reject it), so this gate keeps the
-/// fallback narrowly scoped.
-fn is_gemini_3(model: &str) -> bool {
-    model.contains("gemini-3")
+/// Returns true when `model` is in the Gemini 3 family or newer (Gemini 4).
+/// These models take `thinkingLevel`, accept the `SYNTHETIC_THOUGHT_SIGNATURE`
+/// sentinel on `functionCall` parts (older models reject it), and accept images
+/// inside `functionResponse.parts`.
+fn is_gemini_3_or_later(model: &str) -> bool {
+    model.contains("gemini-3") || model.contains("gemini-4")
 }
 
 fn text_part(text: &str) -> Value {
@@ -729,6 +730,26 @@ mod tests {
         let config =
             GeminiThinkingConfig::from_thinking_level(ThinkingLevel::Low, "gemini-3.1-pro-preview");
         assert!(matches!(config, GeminiThinkingConfig::Level(ref l) if l == "low"));
+    }
+
+    /// Gemini 4 Argon: thinkingLevel with low/medium/high only. The API
+    /// rejects `minimal` with a 400, so Off clamps up to `low`.
+    #[test]
+    fn test_thinking_config_gemini_4_argon() {
+        let model = "gemini-4-argon";
+        for (level, expected) in [
+            (ThinkingLevel::Off, "low"),
+            (ThinkingLevel::Low, "low"),
+            (ThinkingLevel::Medium, "medium"),
+            (ThinkingLevel::High, "high"),
+            (ThinkingLevel::Max, "high"),
+        ] {
+            let config = GeminiThinkingConfig::from_thinking_level(level, model);
+            assert!(
+                matches!(config, GeminiThinkingConfig::Level(ref l) if l == expected),
+                "expected '{expected}' for {level:?} on Argon, got {config:?}"
+            );
+        }
     }
 
     /// Gemini 3.1 Flash Image Preview: only `minimal` and `high` are valid.
@@ -984,6 +1005,11 @@ mod tests {
 
         // Gemini 3: synthetic sentinel applied.
         let contents = build_contents(&messages, "gemini-3-pro-preview");
+        let parts = contents[1]["parts"].as_array().unwrap();
+        assert_eq!(parts[0]["thoughtSignature"], SYNTHETIC_THOUGHT_SIGNATURE);
+
+        // Gemini 4 (Argon) accepts the sentinel too.
+        let contents = build_contents(&messages, "gemini-4-argon");
         let parts = contents[1]["parts"].as_array().unwrap();
         assert_eq!(parts[0]["thoughtSignature"], SYNTHETIC_THOUGHT_SIGNATURE);
 

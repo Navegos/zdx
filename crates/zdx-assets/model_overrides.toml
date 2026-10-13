@@ -118,6 +118,19 @@ reasoning = false
 id = "google-antigravity:gemini-3.1-pro-low"
 reasoning = false
 
+# Gemini 4 Argon (`gemini-4-argon`, Gemini API GA 2026-10-13): pinned to the current
+# introductory rate, valid through 2026-11-30. Cached input is 95% off input.
+# EXPIRES: from 2026-12-01 the standard rate is $4 input / $20 output ($0.20 cached);
+# update this pin then. Context/output pass through (1048576 / 32768, matching the
+# live models.get metadata for generateContent).
+# https://aistudio.google.com/learn/gemini-4-argon-developer-guide — verified 2026-10-13
+[[override]]
+id = "gemini:gemini-4-argon"
+input = 2.0
+output = 10.0
+cache_read = 0.1
+cache_write = 0.0
+
 # GPT-6.1 Sol (released 2026-09-29): not yet in models.dev. The OpenRouter
 # fallback omits cache writes and reports cached input as 0.0999..., so pin the
 # official standard rates (prompts over 272K input tokens are billed higher;
