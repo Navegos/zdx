@@ -8,9 +8,13 @@
 //! disposable `SQLite` cache (`$ZDX_HOME/cache/usage.sqlite`) that stores each
 //! thread's partial aggregate keyed by `(thread_id, mtime, size)`; only
 //! changed or new threads are re-scanned on each run. JSONL stays canonical —
-//! the cache is rebuilt transparently if missing, corrupt, or built for a
-//! different attribution `default_model`, and the aggregator falls back to a
-//! full lean scan if the cache is unavailable.
+//! the cache is rebuilt transparently if missing or corrupt, and the
+//! aggregator falls back to a full lean scan if the cache is unavailable.
+//!
+//! The cache does not depend on the caller's `default_model`: usage that would
+//! fall back to it is stored unattributed and attributed when read. Callers
+//! with different configs (the bot, the Monitor, `zdx stats`) share it
+//! without invalidating each other.
 //!
 //! Attribution: usage events carry per-request `model`/`provider`; older events
 //! without them fall back to the thread's `model_override` or the supplied
@@ -216,7 +220,7 @@ fn thread_usage_stats_at(
 ) -> Result<UsageStats> {
     let path = threads_dir.join(format!("{thread_id}.jsonl"));
     let scan = scan_thread_file(&path)?;
-    let day_buckets = resolve_thread_buckets(&scan, default_model);
+    let day_buckets = resolve_thread_buckets(&scan, Some(default_model));
     let daily = daily_from_buckets(&day_buckets, None);
     let buckets = collapse_days(day_buckets, None);
     Ok(finalize(buckets, daily, 1, Vec::new()))
@@ -253,7 +257,7 @@ fn aggregate_scan_all(
         match scan_thread_file(&file.path) {
             Ok(scan) => {
                 threads_scanned += 1;
-                for (key, bucket) in resolve_thread_buckets(&scan, default_model) {
+                for (key, bucket) in resolve_thread_buckets(&scan, Some(default_model)) {
                     all_days.entry(key).or_default().merge(&bucket);
                 }
             }
@@ -305,7 +309,7 @@ fn aggregate_cached(
 ) -> Result<UsageStats> {
     let files = thread_file_tokens(threads_dir)?;
     let conn = open_cache(cache_path)?;
-    ensure_cache_valid(&conn, default_model)?;
+    ensure_cache_valid(&conn)?;
 
     let cached_meta = load_thread_meta(&conn)?;
     let mut current_ids: HashSet<&str> = HashSet::with_capacity(files.len());
@@ -326,7 +330,7 @@ fn aggregate_cached(
         let path = threads_dir.join(format!("{}.jsonl", file.id));
         match scan_thread_file(&path) {
             Ok(scan) => {
-                let buckets = resolve_thread_buckets(&scan, default_model);
+                let buckets = resolve_thread_buckets(&scan, None);
                 replace_thread_rows(&tx, &file.id, mtime_ns, size, &buckets)?;
                 threads_scanned += 1;
             }
@@ -346,27 +350,33 @@ fn aggregate_cached(
     }
     tx.commit()?;
 
-    let raw = load_all_buckets(&conn, since_day)?;
+    let raw = load_all_buckets(&conn, since_day, &default_attribution(default_model))?;
     let daily = load_daily(&conn, since_day)?;
     Ok(finalize(raw, daily, threads_scanned, warnings))
 }
 
+/// Provider of cached rows whose usage falls back to the caller's
+/// `default_model`. No real provider id is empty, so it cannot collide.
+const UNATTRIBUTED_PROVIDER: &str = "";
+
+/// `(provider, model)` that unattributed usage is credited to for this caller.
+fn default_attribution(default_model: &str) -> (String, String) {
+    let selection = providers::resolve_provider(default_model);
+    (selection.kind.id().to_string(), selection.model)
+}
+
 /// Resolves a thread's usage into per-`(provider, model, day)` buckets, applying
-/// the thread-level fallback (`model_override` or `default_model`) to usage that
-/// lacks a per-request provider/model.
+/// the thread-level fallback (`model_override`, else `default_model`) to usage
+/// that lacks a per-request provider/model. With `default_model` `None` (the
+/// cache), usage that would need it is keyed under [`UNATTRIBUTED_PROVIDER`].
 fn resolve_thread_buckets(
     scan: &ThreadUsageScan,
-    default_model: &str,
+    default_model: Option<&str>,
 ) -> BTreeMap<(String, String, i32), RawBucket> {
-    let fallback_model = scan
-        .model_override
-        .clone()
-        .unwrap_or_else(|| default_model.to_string());
-    let fallback_selection = providers::resolve_provider(&fallback_model);
-    let fallback_key = (
-        fallback_selection.kind.id().to_string(),
-        fallback_selection.model.clone(),
-    );
+    let fallback_key = match (scan.model_override.as_deref(), default_model) {
+        (Some(model), _) | (None, Some(model)) => default_attribution(model),
+        (None, None) => (UNATTRIBUTED_PROVIDER.to_string(), String::new()),
+    };
 
     let mut buckets: BTreeMap<(String, String, i32), RawBucket> = BTreeMap::new();
     for usage in &scan.usages {
@@ -434,9 +444,9 @@ fn mtime_nanos(modified: Option<SystemTime>) -> i64 {
 
 // ── Derived SQLite cache ────────────────────────────────────────────────────
 
-/// Bumped when the cache table layout changes; a mismatch drops and rebuilds
-/// the per-thread tables.
-const CACHE_SCHEMA_VERSION: &str = "2";
+/// Bumped when the cache table layout or row meaning changes; a mismatch drops
+/// and rebuilds the per-thread tables.
+const CACHE_SCHEMA_VERSION: &str = "3";
 
 const CREATE_META_SQL: &str =
     "CREATE TABLE IF NOT EXISTS cache_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);";
@@ -462,8 +472,11 @@ CREATE TABLE IF NOT EXISTS thread_usage (
 );
 CREATE INDEX IF NOT EXISTS idx_thread_usage_day ON thread_usage(day);";
 
+/// A new file name (not only a schema bump) for the default-model-free layout:
+/// builds that still write `usage.sqlite` wipe it whenever their default model
+/// or schema differs, and would keep wiping a shared file.
 fn cache_path() -> PathBuf {
-    paths::zdx_home().join("cache").join("usage.sqlite")
+    paths::zdx_home().join("cache").join("usage-v3.sqlite")
 }
 
 /// Opens the cache, recreating the file once only if it is genuinely
@@ -515,22 +528,16 @@ fn try_open_cache(path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
-/// Ensures the cache matches the current schema version and attribution model.
-/// A schema mismatch drops+recreates the data tables; a `default_model` change
-/// clears the per-thread data so it re-syncs against the new fallback.
-fn ensure_cache_valid(conn: &Connection, default_model: &str) -> Result<()> {
+/// Ensures the cache matches the current schema version; a mismatch drops and
+/// recreates the data tables.
+fn ensure_cache_valid(conn: &Connection) -> Result<()> {
     let version_ok = read_meta(conn, "schema_version")?.as_deref() == Some(CACHE_SCHEMA_VERSION);
-    let model_ok = read_meta(conn, "default_model")?.as_deref() == Some(default_model);
-
     if !version_ok {
         conn.execute_batch("DROP TABLE IF EXISTS thread_meta; DROP TABLE IF EXISTS thread_usage;")?;
     }
     conn.execute_batch(CREATE_DATA_SQL)?;
-
-    if !version_ok || !model_ok {
-        conn.execute_batch("DELETE FROM thread_meta; DELETE FROM thread_usage;")?;
+    if !version_ok {
         write_meta(conn, "schema_version", CACHE_SCHEMA_VERSION)?;
-        write_meta(conn, "default_model", default_model)?;
     }
     Ok(())
 }
@@ -612,10 +619,12 @@ fn delete_thread_rows(conn: &Connection, id: &str) -> Result<()> {
 }
 
 /// Loads and collapses all cached rows into `(provider, model)` totals, keeping
-/// only days on or after `since_day` (all days when `None`).
+/// only days on or after `since_day` (all days when `None`). Unattributed rows
+/// are credited to `default_key`.
 fn load_all_buckets(
     conn: &Connection,
     since_day: Option<i32>,
+    default_key: &(String, String),
 ) -> Result<BTreeMap<(String, String), RawBucket>> {
     let min_day = since_day.unwrap_or(i32::MIN);
     let mut stmt = conn.prepare(
@@ -639,6 +648,11 @@ fn load_all_buckets(
     let mut map: BTreeMap<(String, String), RawBucket> = BTreeMap::new();
     for row in rows {
         let (key, bucket) = row?;
+        let key = if key.0 == UNATTRIBUTED_PROVIDER {
+            default_key.clone()
+        } else {
+            key
+        };
         map.entry(key).or_default().merge(&bucket);
     }
     Ok(map)
@@ -1040,7 +1054,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_reattributes_when_default_model_changes() {
+    fn cache_attributes_legacy_usage_per_caller_without_rebuilding() {
         let dir = tempfile::tempdir().unwrap();
         let threads = dir.path().join("threads");
         std::fs::create_dir_all(&threads).unwrap();
@@ -1052,7 +1066,23 @@ mod tests {
 
         let (m1, m2) = ("claude-opus-4-8", "gpt-5.5");
         let s1 = aggregate_usage_at(&threads, &cache, m1, None).unwrap();
+        // Same size and mtime, different content: only a rescan would see it.
+        let path = threads.join("legacy.jsonl");
+        let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        write_thread(&threads, "legacy", &[usage_line(900, 50, None, None)]);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
         let s2 = aggregate_usage_at(&threads, &cache, m2, None).unwrap();
+        let s1_again = aggregate_usage_at(&threads, &cache, m1, None).unwrap();
+        assert_eq!(
+            (s2.totals.input, s1_again.totals.input),
+            (100, 100),
+            "a caller with another default_model must not rebuild the cache"
+        );
 
         let expect1 = providers::resolve_provider(m1).model;
         let expect2 = providers::resolve_provider(m2).model;
@@ -1061,8 +1091,9 @@ mod tests {
         assert_eq!(
             s2.by_model[0].model.as_deref(),
             Some(expect2.as_str()),
-            "changing default_model must wipe the cache and re-attribute legacy usage"
+            "legacy usage follows each caller's default_model"
         );
+        assert_eq!(s1_again.by_model[0].model, s1.by_model[0].model);
     }
 
     #[test]
