@@ -133,8 +133,8 @@ pub struct Message {
     /// expired or already used), it is re-dispatched as an ordinary message.
     #[serde(skip)]
     pub routed_as_btw_input: bool,
-    /// Internal marker for a bot-generated prompt (worker update, `/goal`
-    /// continuation). Staged commands wait for the user, so these never start
+    /// Internal marker for a bot-generated prompt (worker update).
+    /// Staged commands wait for the user, so these never start
     /// or complete one. Consecutive pending worker updates are merged into a
     /// single orchestrator turn by the queue.
     #[serde(skip)]

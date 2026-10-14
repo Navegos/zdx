@@ -10,7 +10,6 @@ use zdx_engine::core::workers::WorkerManager;
 
 use crate::command_picker::CommandPickerMap;
 use crate::followups::FollowupMap;
-use crate::goal::GoalMap;
 use crate::handlers::message::LauncherMap;
 use crate::retry::RetryMap;
 use crate::staging::StagingMap;
@@ -76,7 +75,6 @@ pub(crate) struct BotContext {
     followup_map: FollowupMap,
     retry_map: RetryMap,
     staging_map: StagingMap,
-    goal_map: GoalMap,
     command_picker_map: CommandPickerMap,
     launcher_map: LauncherMap,
     /// Shared worker manager (also bound into the tool registry); used to
@@ -108,7 +106,6 @@ pub(crate) struct BotContextDeps {
     pub followup_map: FollowupMap,
     pub retry_map: RetryMap,
     pub staging_map: StagingMap,
-    pub goal_map: GoalMap,
     pub command_picker_map: CommandPickerMap,
     pub launcher_map: LauncherMap,
 }
@@ -127,7 +124,6 @@ impl BotContext {
             followup_map,
             retry_map,
             staging_map,
-            goal_map,
             command_picker_map,
             launcher_map,
         } = deps;
@@ -153,7 +149,6 @@ impl BotContext {
             followup_map,
             retry_map,
             staging_map,
-            goal_map,
             command_picker_map,
             launcher_map,
             orchestrator_routes: RwLock::new(HashMap::new()),
@@ -323,10 +318,6 @@ impl BotContext {
 
     pub(crate) fn staging_map(&self) -> &StagingMap {
         &self.staging_map
-    }
-
-    pub(crate) fn goal_map(&self) -> &GoalMap {
-        &self.goal_map
     }
 
     pub(crate) fn command_picker_map(&self) -> &CommandPickerMap {
@@ -705,7 +696,6 @@ mod tests {
             TelegramClient::new("token".to_string()),
             config,
             BotContextDeps {
-                goal_map: crate::goal::new_goal_map(),
                 allowlist_user_ids: HashSet::new(),
                 allowlist_chat_ids: HashSet::new(),
                 root,

@@ -352,8 +352,8 @@ export const demoThread: ThreadResponse = {
       sequence: 14,
       time: "5:15 PM",
       ts: "2026-09-20T17:15:01.000Z",
-      kind: "goal",
-      message: "Ship the Svelte Mini App at visual parity before cutover.",
+      kind: "output_limit",
+      message: "Generation stopped at the output token limit, so this answer may be incomplete.",
     },
     {
       type: "message",

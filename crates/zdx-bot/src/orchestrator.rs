@@ -7,8 +7,7 @@
 //!
 //! - `Created` refreshes the owner's pinned card.
 //! - `Completed` posts a one-line notice in the orchestrator topic and wakes
-//!   it with a synthetic queued turn, reusing the same dispatch path as
-//!   `/goal` continuations. Updates that arrive while the orchestrator is busy
+//!   it with a synthetic queued turn. Updates that arrive while the orchestrator is busy
 //!   are merged by the topic queue into one turn (see
 //!   `bot::queue::drain_worker_updates`), so a burst of completions is
 //!   reviewed once with all of them in context.

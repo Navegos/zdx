@@ -24,7 +24,6 @@ mod bot;
 mod command_picker;
 mod commands;
 mod followups;
-mod goal;
 mod handlers;
 mod ingest;
 mod orchestrator;
@@ -151,7 +150,6 @@ fn build_bot_context(
             followup_map: followups::new_followup_map(),
             retry_map: retry::new_retry_map(),
             staging_map: staging::new_staging_map(),
-            goal_map: goal::new_goal_map(),
             command_picker_map: command_picker::new_command_picker_map(),
             launcher_map: crate::handlers::message::new_launcher_map(),
         },

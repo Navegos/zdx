@@ -63,14 +63,6 @@ pub(super) async fn handle_thread_setup_commands(
             reply_ctx.topic_id,
         )
         .await?
-        || handle_goal_clear_command(
-            context,
-            incoming,
-            thread_id,
-            reply_ctx.reply_to_message_id,
-            reply_ctx.topic_id,
-        )
-        .await?
         || handle_threads_command(
             context,
             incoming,
@@ -220,8 +212,6 @@ pub(super) async fn handle_general_forum_commands(
         BotCommand::Tldr => unreachable!("tldr is handled by handle_tldr_command"),
         BotCommand::ThreadId => unreachable!("threadid is handled by handle_threadid_command"),
         BotCommand::Threads => unreachable!("threads is handled by handle_threads_command"),
-        BotCommand::Goal => unreachable!("goal is staged by handle_staging_flow"),
-        BotCommand::GoalClear => unreachable!("goal_clear is handled by handle_goal_clear_command"),
     };
     context
         .client()
@@ -544,44 +534,6 @@ async fn handle_threadid_command(
         "<b>Thread ID</b> <i>(tap to copy)</i>\n<code>{}</code>",
         escape_html(thread_id)
     );
-    context
-        .client()
-        .send_message(incoming.chat_id, &message, reply_to_message_id, topic_id)
-        .await?;
-
-    Ok(true)
-}
-
-/// `/goal_clear` — stops the active goal for this thread.
-///
-/// Dropping the goal also invalidates any verification already in flight, so a
-/// verdict that arrives afterwards cannot start another continuation.
-async fn handle_goal_clear_command(
-    context: &BotContext,
-    incoming: &crate::types::IncomingMessage,
-    thread_id: &str,
-    reply_to_message_id: Option<i64>,
-    topic_id: Option<i64>,
-) -> Result<bool> {
-    if !incoming.images.is_empty() || !incoming.audios.is_empty() {
-        return Ok(false);
-    }
-    if !incoming
-        .text
-        .as_deref()
-        .is_some_and(|text| matches!(parse_command(text), Some(BotCommand::GoalClear)))
-    {
-        return Ok(false);
-    }
-
-    let message = match crate::goal::clear_goal(context.goal_map(), thread_id) {
-        Some(goal) => format!(
-            "🎯 Goal cleared after {} continuation(s): {}",
-            goal.continuations(),
-            escape_html(goal.objective())
-        ),
-        None => "No goal is active in this topic.".to_string(),
-    };
     context
         .client()
         .send_message(incoming.chat_id, &message, reply_to_message_id, topic_id)
@@ -979,9 +931,8 @@ async fn handle_thread_commands(
                 .await?;
             return Ok(true);
         }
-        // Handoff/Btw/PromptBuilder/Goal run via the staging flow; Commands via
-        // the picker handler; Tldr via handle_tldr_command; GoalClear via
-        // handle_goal_clear_command.
+        // Handoff/Btw/PromptBuilder run via the staging flow; Commands via
+        // the picker handler; Tldr via handle_tldr_command.
         BotCommand::Restart
         | BotCommand::Status
         | BotCommand::WhereAmI
@@ -991,8 +942,6 @@ async fn handle_thread_commands(
         | BotCommand::Tldr
         | BotCommand::ThreadId
         | BotCommand::Threads
-        | BotCommand::Goal
-        | BotCommand::GoalClear
         | BotCommand::PromptBuilder => {
             return Ok(false);
         }

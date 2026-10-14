@@ -4,9 +4,7 @@ use zdx_engine::core::thread_persistence;
 
 use super::response::send_final_response;
 use super::status::{STATUS_DEBOUNCE, cleanup_turn_status, setup_turn_status, update_status};
-use super::{
-    ReplyContext, SpawnRequest, TurnOutcome, TurnResult, TurnStatus, format_user_error_message,
-};
+use super::{ReplyContext, SpawnRequest, TurnResult, TurnStatus, format_user_error_message};
 use crate::agent;
 use crate::bot::context::BotContext;
 use crate::telegram::InlineKeyboardMarkup;
@@ -20,7 +18,7 @@ pub(super) async fn run_agent_turn(
     synthetic_topic_routed_from_general: bool,
     provisional_status: Option<TurnStatus>,
     record_user: bool,
-) -> Result<TurnOutcome> {
+) -> Result<()> {
     // Queued turns can start long after the message arrived, so re-check the
     // config layers here too: this is what feeds model, thinking level, and
     // subagent overrides into the run.
@@ -318,7 +316,7 @@ async fn finalize_turn(
     status: &TurnStatus,
     result: TurnResult,
     is_orchestrator: bool,
-) -> Result<TurnOutcome> {
+) -> Result<()> {
     if status.token.is_cancelled() {
         tracing::info!(
             chat_id = incoming.chat_id,
@@ -336,7 +334,7 @@ async fn finalize_turn(
                 )
                 .await;
         }
-        return Ok(TurnOutcome::Cancelled);
+        return Ok(());
     }
 
     if result.had_error && !result.got_result {
@@ -365,11 +363,7 @@ async fn finalize_turn(
             )
             .await;
         }
-        return Ok(TurnOutcome::Failed(
-            result
-                .error_message
-                .unwrap_or_else(|| "the turn failed".to_string()),
-        ));
+        return Ok(());
     }
 
     send_final_response(
@@ -383,5 +377,5 @@ async fn finalize_turn(
     )
     .await?;
 
-    Ok(TurnOutcome::Completed)
+    Ok(())
 }

@@ -1,9 +1,8 @@
 //! Synthetic Telegram messages.
 //!
 //! Bot-generated prompts dispatched through a topic's normal per-topic queue,
-//! exactly like a real user message. Shared by `/goal` continuations and by
-//! orchestrator worker-completion callbacks so both use one id counter and one
-//! dispatch path.
+//! exactly like a real user message. Used by orchestrator worker-completion
+//! callbacks, with one id counter and one dispatch path.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -21,11 +20,9 @@ static SYNTHETIC_MESSAGE_ID: AtomicI64 = AtomicI64::new(i64::MAX);
 /// What produced a synthetic prompt.
 ///
 /// Worker updates are mergeable: several of them waiting behind a running turn
-/// are handled together in one turn instead of one turn each. `/goal`
-/// continuations always run on their own.
+/// are handled together in one turn instead of one turn each.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SyntheticKind {
-    GoalContinuation,
     WorkerUpdate,
 }
 

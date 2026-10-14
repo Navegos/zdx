@@ -49,7 +49,6 @@ pub(crate) enum StagingCommand {
     Handoff,
     Btw,
     PromptBuilder,
-    Goal,
 }
 
 impl StagingCommand {
@@ -189,7 +188,7 @@ fn classify_session_input(
     synthetic_prompt: bool,
 ) -> SessionInput {
     // Staged commands wait for the user. A bot-generated prompt (a worker
-    // update, a goal continuation) runs as its own turn and leaves the session
+    // update) runs as its own turn and leaves the session
     // waiting; its synthetic id is always newer than the command's.
     if synthetic_prompt {
         return SessionInput::NotInput;
@@ -273,7 +272,6 @@ fn staged_command_request(incoming: &IncomingMessage) -> Option<StagingCommand> 
         BotCommand::Handoff => Some(StagingCommand::Handoff),
         BotCommand::Btw => Some(StagingCommand::Btw),
         BotCommand::PromptBuilder => Some(StagingCommand::PromptBuilder),
-        BotCommand::Goal => Some(StagingCommand::Goal),
         _ => None,
     }
 }
@@ -395,9 +393,6 @@ async fn process_staged_input(
             StagingCommand::PromptBuilder => {
                 "Send text or a voice note describing the prompt you want, or /cancel to abort."
             }
-            StagingCommand::Goal => {
-                "Send text or a voice note describing the objective, or /cancel to abort."
-            }
         };
         let hint = context
             .client()
@@ -412,12 +407,6 @@ async fn process_staged_input(
         track_bot_message(context, thread_id, hint.id);
         return Ok(());
     };
-
-    // A goal needs no LLM call and no preview: store the objective and start
-    // the first turn in this same topic.
-    if command == StagingCommand::Goal {
-        return start_goal(context, queues, incoming, topic_id, thread_id, input).await;
-    }
 
     // btw needs no LLM call, so there is nothing to preview or accept: open the
     // side topic straight away.
@@ -622,7 +611,7 @@ pub(crate) async fn handle_callback(
             // Only prompt-builder stages an Accept button, because accepting it
             // runs a prompt in this thread. Telegram can still redeliver a stale
             // callback, so answer politely.
-            StagingCommand::Handoff | StagingCommand::Btw | StagingCommand::Goal => {
+            StagingCommand::Handoff | StagingCommand::Btw => {
                 let _ = client
                     .answer_callback_query(&callback.id, Some("Nothing to accept"))
                     .await;
@@ -633,90 +622,6 @@ pub(crate) async fn handle_callback(
             tracing::warn!(?data, "Unknown staging callback");
         }
     }
-}
-
-/// Accepts a goal objective: stores it in memory and runs it as the first
-/// ordinary turn in this same topic.
-///
-/// Unlike the other staged commands, the user's objective message is kept.
-/// It is the visible record of what was asked for — deleting it would leave a
-/// topic that starts working with nothing on screen explaining why.
-async fn start_goal(
-    context: &Arc<BotContext>,
-    queues: &ChatQueueMap,
-    incoming: &IncomingMessage,
-    topic_id: Option<i64>,
-    thread_id: &str,
-    input: &str,
-) -> Result<()> {
-    let max_continuations = context
-        .config_for_chat(incoming.chat_id)
-        .goals
-        .max_continuations;
-
-    let goal = match zdx_engine::core::goal::Goal::new(input, max_continuations) {
-        Ok(goal) => goal,
-        Err(err) => {
-            context
-                .client()
-                .send_message(
-                    incoming.chat_id,
-                    &format!("Could not set that goal: {err}"),
-                    Some(incoming.message_id),
-                    topic_id,
-                )
-                .await?;
-            return Ok(());
-        }
-    };
-
-    // The session is done either way; drop the objective from its cleanup list
-    // so only the command and prompt artifacts are removed.
-    let session = {
-        let mut map = context.staging_map().lock().expect("staging lock poisoned");
-        map.remove(thread_id).map(|mut session| {
-            session
-                .user_message_ids
-                .retain(|&id| id != incoming.message_id);
-            session
-        })
-    };
-    if let Some(session) = session {
-        cleanup_session_messages(context, incoming.chat_id, &session).await;
-    }
-
-    crate::goal::set_goal(context.goal_map(), thread_id, goal);
-
-    let confirmation = context
-        .client()
-        .send_message(
-            incoming.chat_id,
-            &format!(
-                "🎯 Goal set. Working until a verifier confirms it, or {max_continuations} continuations."
-            ),
-            Some(incoming.message_id),
-            topic_id,
-        )
-        .await;
-    if let Err(err) = confirmation {
-        tracing::warn!(err = %format!("{err:#}"), "Failed to confirm goal");
-    }
-
-    // Re-dispatch the objective as an ordinary turn. Reusing the real
-    // `message_id` keeps the status and cancel machinery anchored to a message
-    // Telegram actually has.
-    let mut synthetic = json!({
-        "message_id": incoming.message_id,
-        "chat": { "id": incoming.chat_id, "type": if incoming.is_forum { "supergroup" } else { "private" }, "is_forum": incoming.is_forum },
-        "from": { "id": incoming.user_id, "is_bot": false },
-        "text": input,
-    });
-    if let Some(topic_id) = topic_id {
-        synthetic["message_thread_id"] = json!(topic_id);
-    }
-    let synthetic: crate::telegram::Message = serde_json::from_value(synthetic)?;
-    dispatch_message(queues, context, synthetic).await;
-    Ok(())
 }
 
 /// Opens the side topic for `/btw` immediately — no preview, no Accept tap.
@@ -1241,9 +1146,6 @@ fn ask_text(command: StagingCommand, model_override: Option<&str>) -> String {
         StagingCommand::PromptBuilder => {
             "🛠 <b>Prompt builder</b>\nSend your intent (text or voice) — I'll draft a prompt you can accept to run here, or discard. Send /cancel to abort."
         }
-        StagingCommand::Goal => {
-            "🎯 <b>Goal</b>\nSend the objective (text or voice) — I'll keep working on it here until a verifier agent confirms it's done, or the continuation limit is hit. Send /cancel to abort."
-        }
     };
     match model_override {
         Some(model) if command.opens_new_topic() => format!(
@@ -1442,7 +1344,6 @@ mod tests {
             StagingCommand::Handoff,
             StagingCommand::Btw,
             StagingCommand::PromptBuilder,
-            StagingCommand::Goal,
         ] {
             let mut sessions = live_sessions(command);
             let input = classify_session_input(&mut sessions, THREAD, i64::MAX - 1, true);
@@ -1564,9 +1465,10 @@ mod tests {
                 .iter()
                 .any(|text| text.contains("Model"))
         );
-        for command in [StagingCommand::PromptBuilder, StagingCommand::Goal] {
-            assert_eq!(labels(command, None), vec!["🗑 Discard".to_string()]);
-        }
+        assert_eq!(
+            labels(StagingCommand::PromptBuilder, None),
+            vec!["🗑 Discard".to_string()]
+        );
     }
 
     /// `/handoff` offers the role its topic continues as right beside Model,
@@ -1674,7 +1576,8 @@ mod tests {
         assert!(text.contains("New topic model: <code>openai:gpt-6@high</code>"));
         assert!(!ask_text(StagingCommand::Btw, None).contains("New topic model"));
         assert!(
-            !ask_text(StagingCommand::Goal, Some("openai:gpt-6@high")).contains("New topic model")
+            !ask_text(StagingCommand::PromptBuilder, Some("openai:gpt-6@high"))
+                .contains("New topic model")
         );
     }
 

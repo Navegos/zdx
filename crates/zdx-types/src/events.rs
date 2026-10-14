@@ -223,9 +223,6 @@ pub enum NoticeKind {
     /// reasoning, in the answer, or by re-issuing the same tool call — instead
     /// of finishing it. `details` carries which loop was detected.
     OutputLoop,
-    /// Terminal outcome of a goal run: completion, continuation limit,
-    /// verifier failure, manual clear, or cancellation.
-    Goal,
 }
 
 /// Terminal status for a turn.
