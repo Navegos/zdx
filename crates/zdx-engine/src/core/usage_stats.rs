@@ -5,7 +5,7 @@
 //! This is the data source for `zdx stats` and the monitor Usage tab.
 //!
 //! To stay fast at thousands of threads, results are backed by a derived,
-//! disposable `SQLite` cache (`$ZDX_HOME/cache/usage.sqlite`) that stores each
+//! disposable `SQLite` cache (`$ZDX_HOME/cache/usage-v3.sqlite`) that stores each
 //! thread's partial aggregate keyed by `(thread_id, mtime, size)`; only
 //! changed or new threads are re-scanned on each run. JSONL stays canonical —
 //! the cache is rebuilt transparently if missing or corrupt, and the
@@ -24,10 +24,10 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior};
 
 use crate::config::paths;
 use crate::core::{thread_index, thread_persistence};
@@ -312,47 +312,97 @@ fn aggregate_cached(
     ensure_cache_valid(&conn)?;
 
     let cached_meta = load_thread_meta(&conn)?;
-    let mut current_ids: HashSet<&str> = HashSet::with_capacity(files.len());
+    let current_ids: HashSet<&str> = files.iter().map(|file| file.id.as_str()).collect();
+    let changed: Vec<&thread_index::IndexedThreadFile> = files
+        .iter()
+        .filter(|file| cached_meta.get(&file.id) != Some(&(file.mtime_ns, file.size)))
+        .collect();
+    let removed: Vec<&str> = cached_meta
+        .keys()
+        .map(String::as_str)
+        .filter(|id| !current_ids.contains(id))
+        .collect();
+    let mut threads_scanned = files.len() - changed.len();
     let mut warnings = Vec::new();
-    let mut threads_scanned = 0usize;
 
-    let tx = conn.unchecked_transaction()?;
-    for file in &files {
-        current_ids.insert(file.id.as_str());
-        let (mtime_ns, size) = (file.mtime_ns, file.size);
-        let unchanged = cached_meta
-            .get(&file.id)
-            .is_some_and(|(m, s)| *m == mtime_ns && *s == size);
-        if unchanged {
-            threads_scanned += 1;
+    // Transcripts are parsed with no lock held, and each chunk is written in
+    // its own short write transaction. Holding the write lock across the scan
+    // (a cold rebuild takes about a minute) made every concurrent caller fail
+    // with `SQLITE_BUSY` and fall back to a full uncached scan.
+    let chunks: Vec<_> = changed.chunks(SYNC_CHUNK).collect();
+    // Concurrent rebuilds start at different chunks, so each one skips what
+    // the others finished instead of scanning the same chunks in lockstep.
+    let start = rotation_start(chunks.len());
+    for chunk in chunks[start..].iter().chain(&chunks[..start]).copied() {
+        // Another caller may have synced these since `cached_meta` was read
+        // (it started its rebuild first); skip what is already current.
+        let mut stale = Vec::with_capacity(chunk.len());
+        for file in chunk {
+            if cached_token(&conn, &file.id)? == Some((file.mtime_ns, file.size)) {
+                threads_scanned += 1;
+            } else {
+                stale.push(*file);
+            }
+        }
+        if stale.is_empty() {
             continue;
         }
-        let path = threads_dir.join(format!("{}.jsonl", file.id));
-        match scan_thread_file(&path) {
-            Ok(scan) => {
-                let buckets = resolve_thread_buckets(&scan, None);
-                replace_thread_rows(&tx, &file.id, mtime_ns, size, &buckets)?;
-                threads_scanned += 1;
-            }
-            Err(err) => {
-                // Drop any now-stale cached rows so the aggregate matches a
-                // full scan (which omits unreadable threads), then warn.
-                delete_thread_rows(&tx, &file.id)?;
-                warnings.push(format!("skipped thread {}: {err}", file.id));
+        let scanned: Vec<_> = stale
+            .into_iter()
+            .map(|file| {
+                let path = threads_dir.join(format!("{}.jsonl", file.id));
+                let buckets =
+                    scan_thread_file(&path).map(|scan| resolve_thread_buckets(&scan, None));
+                (file, buckets)
+            })
+            .collect();
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
+        for (file, buckets) in scanned {
+            match buckets {
+                Ok(buckets) => {
+                    replace_thread_rows(&tx, &file.id, file.mtime_ns, file.size, &buckets)?;
+                    threads_scanned += 1;
+                }
+                Err(err) => {
+                    // Drop any now-stale cached rows so the aggregate matches a
+                    // full scan (which omits unreadable threads), then warn.
+                    delete_thread_rows(&tx, &file.id)?;
+                    warnings.push(format!("skipped thread {}: {err}", file.id));
+                }
             }
         }
+        tx.commit()?;
     }
     // Drop cache rows for threads that no longer exist on disk.
-    for id in cached_meta.keys() {
-        if !current_ids.contains(id.as_str()) {
+    if !removed.is_empty() {
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
+        for id in removed {
             delete_thread_rows(&tx, id)?;
         }
+        tx.commit()?;
     }
-    tx.commit()?;
 
-    let raw = load_all_buckets(&conn, since_day, &default_attribution(default_model))?;
-    let daily = load_daily(&conn, since_day)?;
+    // One read transaction, so totals and the daily series come from the same
+    // snapshot even while another caller commits.
+    let tx = conn.unchecked_transaction()?;
+    let raw = load_all_buckets(&tx, since_day, &default_attribution(default_model))?;
+    let daily = load_daily(&tx, since_day)?;
+    tx.commit()?;
     Ok(finalize(raw, daily, threads_scanned, warnings))
+}
+
+/// Changed threads parsed and written per write transaction during a sync.
+const SYNC_CHUNK: usize = 256;
+
+/// A random index below `len` (0 when empty).
+fn rotation_start(len: usize) -> usize {
+    let seed =
+        std::hash::BuildHasher::hash_one(&std::collections::hash_map::RandomState::new(), ());
+    u64::try_from(len)
+        .ok()
+        .filter(|len| *len > 0)
+        .and_then(|len| usize::try_from(seed % len).ok())
+        .unwrap_or(0)
 }
 
 /// Provider of cached rows whose usage falls back to the caller's
@@ -517,9 +567,9 @@ fn is_cache_corruption(err: &anyhow::Error) -> bool {
 
 fn try_open_cache(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path)?;
-    conn.execute_batch(
-        "PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;",
-    )?;
+    conn.busy_timeout(CACHE_BUSY_TIMEOUT)?;
+    enable_wal(&conn)?;
+    conn.execute_batch("PRAGMA synchronous=NORMAL;")?;
     // No `integrity_check` here: it scans every page, so the cost grows with
     // the cache and every open pays it. The schema statement below fails with
     // a corruption code on a broken file, which is what `is_cache_corruption`
@@ -528,18 +578,47 @@ fn try_open_cache(path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
+const CACHE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Switches the cache to WAL. The switch does not wait on the busy handler, so
+/// callers that open a new cache file at the same time get `SQLITE_BUSY` here
+/// (verified 2026-10-14); retry until one of them has switched the file.
+fn enable_wal(conn: &Connection) -> Result<()> {
+    let deadline = Instant::now() + CACHE_BUSY_TIMEOUT;
+    loop {
+        match conn.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(())) {
+            Err(rusqlite::Error::SqliteFailure(ffi, _))
+                if ffi.code == rusqlite::ErrorCode::DatabaseBusy && Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            result => return result.map_err(Into::into),
+        }
+    }
+}
+
 /// Ensures the cache matches the current schema version; a mismatch drops and
 /// recreates the data tables.
+///
+/// A current cache takes no lock. Otherwise the version is checked again under
+/// the write lock, so a caller that lost the race does not drop the tables that
+/// another caller has just created and started to fill.
 fn ensure_cache_valid(conn: &Connection) -> Result<()> {
-    let version_ok = read_meta(conn, "schema_version")?.as_deref() == Some(CACHE_SCHEMA_VERSION);
-    if !version_ok {
-        conn.execute_batch("DROP TABLE IF EXISTS thread_meta; DROP TABLE IF EXISTS thread_usage;")?;
+    if schema_is_current(conn)? {
+        return Ok(());
     }
-    conn.execute_batch(CREATE_DATA_SQL)?;
-    if !version_ok {
-        write_meta(conn, "schema_version", CACHE_SCHEMA_VERSION)?;
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    if !schema_is_current(&tx)? {
+        tx.execute_batch("DROP TABLE IF EXISTS thread_meta; DROP TABLE IF EXISTS thread_usage;")?;
+        tx.execute_batch(CREATE_DATA_SQL)?;
+        write_meta(&tx, "schema_version", CACHE_SCHEMA_VERSION)?;
     }
+    tx.commit()?;
     Ok(())
+}
+
+fn schema_is_current(conn: &Connection) -> Result<bool> {
+    Ok(read_meta(conn, "schema_version")?.as_deref() == Some(CACHE_SCHEMA_VERSION))
 }
 
 fn read_meta(conn: &Connection, key: &str) -> Result<Option<String>> {
@@ -573,6 +652,13 @@ fn load_thread_meta(conn: &Connection) -> Result<HashMap<String, (i64, i64)>> {
         map.insert(id, meta);
     }
     Ok(map)
+}
+
+fn cached_token(conn: &Connection, id: &str) -> Result<Option<(i64, i64)>> {
+    conn.prepare_cached("SELECT mtime_ns, size FROM thread_meta WHERE thread_id = ?1")?
+        .query_row([id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))
+        .optional()
+        .map_err(Into::into)
 }
 
 fn replace_thread_rows(
@@ -1097,6 +1183,146 @@ mod tests {
     }
 
     #[test]
+    fn cached_attribution_follows_caller_provider_and_span() {
+        let dir = tempfile::tempdir().unwrap();
+        let threads = dir.path().join("threads");
+        std::fs::create_dir_all(&threads).unwrap();
+        let cache = dir.path().join("cache/usage.sqlite");
+        let (today, old) = (ts_days_ago(0), ts_days_ago(60));
+
+        write_thread(
+            &threads,
+            "mixed",
+            &[
+                usage_line_at(100, 10, Some("gpt-5.5"), Some("openai"), &today),
+                usage_line_at(20, 2, None, None, &today),
+                usage_line_at(1000, 100, None, None, &old),
+            ],
+        );
+        write_thread(
+            &threads,
+            "explicit",
+            &[usage_line_at(
+                7,
+                3,
+                Some("claude-opus-4-8"),
+                Some("claude-cli"),
+                &today,
+            )],
+        );
+
+        let billed = "openai:gpt-5.5";
+        let subscription = "claude-cli:claude-opus-4-8";
+        let since = Some(today_utc() - 6);
+        let row = |stats: &UsageStats, provider: &str| {
+            stats
+                .by_model
+                .iter()
+                .find(|row| row.provider == provider)
+                .cloned()
+                .unwrap()
+        };
+
+        // Unattributed usage merges into the caller's explicit row, which
+        // then counts as estimated; the other provider's row stays exact.
+        let a = aggregate_usage_at(&threads, &cache, billed, since).unwrap();
+        let (openai, claude) = (row(&a, "openai"), row(&a, "claude-cli"));
+        assert_eq!((openai.requests, openai.input, openai.output), (2, 120, 12));
+        assert!(openai.estimated && !openai.subscription);
+        assert_eq!((claude.input, claude.output), (7, 3));
+        assert!(!claude.estimated && claude.subscription);
+        assert_eq!(a.totals.subscription_tokens, 10);
+
+        let b = aggregate_usage_at(&threads, &cache, subscription, since).unwrap();
+        let (openai, claude) = (row(&b, "openai"), row(&b, "claude-cli"));
+        assert_eq!((openai.input, openai.output), (100, 10));
+        assert!(!openai.estimated);
+        assert_eq!((claude.requests, claude.input, claude.output), (2, 27, 5));
+        assert!(claude.estimated && claude.subscription);
+        assert!(claude.cost_usd.abs() < f64::EPSILON);
+        assert_eq!(b.totals.subscription_tokens, 32);
+        let claude_provider = b
+            .by_provider
+            .iter()
+            .find(|row| row.provider == "claude-cli")
+            .unwrap();
+        assert!(claude_provider.estimated && claude_provider.subscription);
+
+        // The bounded span drops the old unattributed usage; all time keeps it.
+        let all = aggregate_usage_at(&threads, &cache, subscription, None).unwrap();
+        assert_eq!(row(&all, "claude-cli").input, 1027);
+        assert_eq!(all.totals.tokens(), b.totals.tokens() + 1100);
+
+        // Attribution never changes the daily series.
+        let days = |stats: &UsageStats| {
+            stats
+                .daily
+                .iter()
+                .map(|d| (d.day, d.tokens))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(days(&a), vec![(today_utc(), 142)]);
+        assert_eq!(days(&a), days(&b));
+        assert_eq!(all.daily.len(), 2);
+    }
+
+    #[test]
+    fn concurrent_callers_sync_a_fresh_cache_without_falling_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let threads = dir.path().join("threads");
+        std::fs::create_dir_all(&threads).unwrap();
+        let cache = dir.path().join("cache/usage.sqlite");
+        let count: u64 = 3 * SYNC_CHUNK as u64;
+        for i in 0..count {
+            write_thread(
+                &threads,
+                &format!("t{i}"),
+                &[
+                    usage_line(1, 0, Some("gpt-5.5"), Some("openai")),
+                    usage_line(1, 0, None, None),
+                ],
+            );
+        }
+
+        let models = [
+            "claude-opus-4-8",
+            "claude-cli:claude-opus-4-8",
+            "gemini:gemini-3-pro",
+        ];
+        let barrier = std::sync::Barrier::new(models.len() * 2);
+        std::thread::scope(|scope| {
+            let callers: Vec<_> = models
+                .iter()
+                .chain(models.iter())
+                .map(|model| {
+                    let (threads, cache, barrier) = (&threads, &cache, &barrier);
+                    scope.spawn(move || {
+                        barrier.wait();
+                        // Not `aggregate_usage_at`: a fallback scan would hide a
+                        // cache failure behind a correct result.
+                        let stats = aggregate_cached(threads, cache, model, None)
+                            .unwrap_or_else(|err| panic!("{model}: {err:#}"));
+                        (
+                            stats.totals.input,
+                            stats.threads_scanned,
+                            stats.by_provider.len(),
+                        )
+                    })
+                })
+                .collect();
+            for caller in callers {
+                assert_eq!(caller.join().unwrap(), (2 * count, 3 * SYNC_CHUNK, 2));
+            }
+        });
+
+        let conn = open_cache(&cache).unwrap();
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM thread_meta", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, i64::try_from(count).unwrap());
+    }
+
+    #[test]
     fn since_day_filters_usage_by_span() {
         let dir = tempfile::tempdir().unwrap();
         let threads = dir.path().join("threads");
@@ -1310,5 +1536,56 @@ mod tests {
         assert_eq!(stats.totals.subscription_tokens, 3_500);
         assert_eq!(stats.totals.billed_usd, 0.0);
         assert_eq!(stats.totals.unknown_pricing_rows, 0);
+    }
+
+    /// Manual benchmark against a real thread corpus (read-only). Run with
+    /// `ZDX_USAGE_BENCH_THREADS=<dir>` and `--ignored --nocapture`.
+    #[test]
+    #[ignore = "manual benchmark over a real thread corpus"]
+    fn bench_concurrent_callers_on_real_corpus() {
+        let Ok(threads) = std::env::var("ZDX_USAGE_BENCH_THREADS") else {
+            return;
+        };
+        let threads = PathBuf::from(threads);
+        // A temp home keeps the corpus off the live thread index: callers then
+        // walk the directory instead of syncing the index.
+        let dir = crate::test_support::temp_zdx_home();
+        let models = [
+            "claude-opus-4-8",
+            "openai:gpt-5.5",
+            "claude-cli:claude-opus-4-8",
+        ];
+        // (phase, cache file, start delay in seconds for each caller)
+        let phases: [(&str, &str, &[u64]); 4] = [
+            ("solo-cold", "solo.sqlite", &[0]),
+            ("cold", "a.sqlite", &[0, 0, 0]),
+            ("warm", "a.sqlite", &[0, 0, 0]),
+            ("staggered-cold", "b.sqlite", &[0, 15, 30]),
+        ];
+        for (phase, cache, delays) in phases {
+            let cache = dir.path().join("cache").join(cache);
+            let barrier = std::sync::Barrier::new(delays.len());
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = models
+                    .iter()
+                    .zip(delays.iter().copied())
+                    .map(|(model, delay)| {
+                        let (threads, cache, barrier) = (&threads, &cache, &barrier);
+                        scope.spawn(move || {
+                            barrier.wait();
+                            std::thread::sleep(std::time::Duration::from_secs(delay));
+                            let start = std::time::Instant::now();
+                            let result =
+                                aggregate_cached(threads, cache, model, Some(today_utc() - 29));
+                            (model, start.elapsed(), result.map(|s| s.totals.tokens()))
+                        })
+                    })
+                    .collect();
+                for handle in handles {
+                    let (model, elapsed, result) = handle.join().unwrap();
+                    eprintln!("{phase} {model}: {elapsed:.2?} {result:?}");
+                }
+            });
+        }
     }
 }

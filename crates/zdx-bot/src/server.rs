@@ -579,6 +579,8 @@ pub(crate) struct ServerState {
     /// is why worker listings merge it with persisted lineage.
     workers: Arc<WorkerManager>,
     monitor_cache: RwLock<Option<CachedMonitor>>,
+    /// Single-flight guard for building `monitor_cache`; see `monitor_snapshot`.
+    monitor_build: Mutex<()>,
     subscription_cache: Mutex<Option<CachedSubscriptions>>,
     /// Single-flight guard for the background quota refresh, held for the whole
     /// fetch. Every open Mini App polls `/api/monitor` every 30s, so without it
@@ -599,6 +601,7 @@ impl ServerState {
             root,
             workers,
             monitor_cache: RwLock::new(None),
+            monitor_build: Mutex::new(()),
             subscription_cache: Mutex::new(None),
             subscription_refresh: Arc::new(Mutex::new(())),
         }
@@ -2404,14 +2407,26 @@ async fn get_monitor(
 /// by [`attach_subscriptions`], so a refresh that lands mid-window is served
 /// immediately instead of waiting for this cache to expire.
 async fn monitor_snapshot(state: &Arc<ServerState>) -> Result<MonitorResponse, ApiError> {
-    if let Some(cached) = state.monitor_cache.read().await.as_ref()
-        && cached.cached_at.elapsed() < MONITOR_CACHE_TTL
-    {
-        return Ok(cached.response.clone());
+    let root = state.root.clone();
+    cached_monitor_or_build(state, move || build_monitor_response(&root)).await
+}
+
+async fn cached_monitor_or_build(
+    state: &ServerState,
+    build: impl FnOnce() -> anyhow::Result<MonitorResponse> + Send + 'static,
+) -> Result<MonitorResponse, ApiError> {
+    if let Some(cached) = fresh_monitor(state).await {
+        return Ok(cached);
+    }
+    // Single-flight: the Mini App opens several views on `/api/monitor` at
+    // once, and each build may sync the usage cache. Later callers wait for
+    // the first build and reuse it.
+    let _build = state.monitor_build.lock().await;
+    if let Some(cached) = fresh_monitor(state).await {
+        return Ok(cached);
     }
 
-    let root = state.root.clone();
-    let response = tokio::task::spawn_blocking(move || build_monitor_response(&root))
+    let response = tokio::task::spawn_blocking(build)
         .await
         .map_err(|error| {
             tracing::warn!(%error, "Mini App monitor snapshot task failed");
@@ -2433,6 +2448,16 @@ async fn monitor_snapshot(state: &Arc<ServerState>) -> Result<MonitorResponse, A
         response: response.clone(),
     });
     Ok(response)
+}
+
+async fn fresh_monitor(state: &ServerState) -> Option<MonitorResponse> {
+    state
+        .monitor_cache
+        .read()
+        .await
+        .as_ref()
+        .filter(|cached| cached.cached_at.elapsed() < MONITOR_CACHE_TTL)
+        .map(|cached| cached.response.clone())
 }
 
 fn build_monitor_response(root: &FilePath) -> anyhow::Result<MonitorResponse> {
@@ -3727,5 +3752,44 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn concurrent_monitor_requests_share_one_build() {
+        let state = Arc::new(ServerState::new(
+            SAMPLE_BOT_TOKEN.to_string(),
+            sample_allowlist(),
+            PathBuf::from("."),
+            WorkerManager::new().0,
+        ));
+        let builds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let requests = (0..4).map(|_| {
+            let (state, builds) = (Arc::clone(&state), Arc::clone(&builds));
+            tokio::spawn(async move {
+                cached_monitor_or_build(&state, move || {
+                    builds.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(200));
+                    Ok(MonitorResponse {
+                        generated_at: String::new(),
+                        services: Vec::new(),
+                        active_agents: Vec::new(),
+                        background_processes: Vec::new(),
+                        jobs: Vec::new(),
+                        jobs_error: None,
+                        config: monitor_config(&Config::default()),
+                        usage: None,
+                        subscriptions: Vec::new(),
+                        subscriptions_status: "pending",
+                        subscriptions_age: None,
+                    })
+                })
+                .await
+                .is_ok()
+            })
+        });
+        for request in requests.collect::<Vec<_>>() {
+            assert!(request.await.expect("join monitor request"));
+        }
+        assert_eq!(builds.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }
