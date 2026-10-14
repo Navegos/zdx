@@ -25,7 +25,7 @@
     "usage",
     "config",
     "workspaces",
-    "automations",
+    "jobs",
   ];
 
   function goThread(tab: ThreadTab) {

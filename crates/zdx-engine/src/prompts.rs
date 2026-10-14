@@ -1,7 +1,5 @@
 //! Prompt file helpers (re-exports from `zdx-assets`).
 
-/// Built-in instruction layer for headless automation behavior.
-pub use zdx_assets::AUTOMATION_INSTRUCTION_LAYER;
 /// Instruction layer for interactive TUI chat.
 pub use zdx_assets::CHAT_INSTRUCTION_LAYER;
 /// Instruction layer for non-interactive exec mode.
@@ -10,6 +8,8 @@ pub use zdx_assets::EXEC_INSTRUCTION_LAYER;
 pub use zdx_assets::HANDOFF_PROMPT_TEMPLATE;
 /// Shared identity prompt for ZDX-coded agent surfaces.
 pub use zdx_assets::IDENTITY_PROMPT_TEMPLATE;
+/// Built-in instruction layer for headless job behavior.
+pub use zdx_assets::JOB_INSTRUCTION_LAYER;
 /// Prompt template for the `/prompt-builder` slash command (shared with TUI).
 pub use zdx_assets::PROMPT_BUILDER_PROMPT_TEMPLATE;
 /// Prompt template for read thread tool (shared with tool execution).

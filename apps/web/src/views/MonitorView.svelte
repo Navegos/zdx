@@ -1,6 +1,6 @@
 <script lang="ts">
   import { api, ApiError } from "$lib/api";
-  import type { MonitorResponse, WorkspacesResponse } from "$lib/types";
+  import type { MonitorJob, MonitorResponse, WorkspacesResponse } from "$lib/types";
   import { router, MONITOR_SECTION_LABELS, type MonitorSection } from "$lib/router.svelte";
   import { haptic } from "$lib/telegram";
   import { resetClock, resetCountdown } from "$lib/time";
@@ -57,6 +57,28 @@
     if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
     if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
     return String(n);
+  }
+
+  // Jobs: presentation only; status, next run, and outcome come from the
+  // shared engine summary.
+  function scheduleLabel(job: MonitorJob): string {
+    if (!job.schedule) return "invalid file";
+    if (job.schedule.kind === "recurring") return job.schedule.cron;
+    if (job.schedule.kind === "once") return `once ${resetClock(new Date(job.schedule.run_at), now)}`;
+    return "manual";
+  }
+
+  function jobFailed(job: MonitorJob): boolean {
+    const outcome = job.last_run?.outcome;
+    return outcome === "failed" || outcome === "missed" || outcome === "interrupted";
+  }
+
+  function statusClass(job: MonitorJob): string {
+    if (job.status === "invalid" || job.status === "expired" || job.status === "interrupted") {
+      return "text-destructive";
+    }
+    if (job.status === "running" || job.status === "due") return "text-warning";
+    return jobFailed(job) ? "text-destructive" : "text-muted-foreground";
   }
 
   // Quotas are fetched off the request path and land on a later poll, so an
@@ -331,24 +353,53 @@
         {/if}
       {/if}
 
-      {#if show("automations")}
+      {#if show("jobs")}
         <section>
-          <h2 class="sec">Automations</h2>
-          {#if data.automations.length === 0}
+          <h2 class="sec">Jobs</h2>
+          {#if data.jobs_error}
+            <p class="rounded-md border border-destructive px-2.5 py-2 text-xs text-destructive">
+              {data.jobs_error}
+            </p>
+          {:else if data.jobs.length === 0}
             <p class="rounded-md border border-border bg-card px-2.5 py-2 text-xs text-muted-foreground">
               None configured.
             </p>
           {:else}
-            <div class="flex flex-col gap-1">
-              {#each data.automations as a (a.name)}
-                <div
-                  class="flex items-center gap-2 rounded-md border border-border bg-card px-2.5 py-1.5"
+            <div class="flex flex-col gap-1.5">
+              {#each data.jobs as job (job.name)}
+                {@const threadId = job.last_run?.thread_id ?? null}
+                {@const problem = job.error ?? (jobFailed(job) ? job.last_run?.error : null)}
+                <button
+                  type="button"
+                  disabled={!threadId}
+                  onclick={() => threadId && router.openThread(threadId, "transcript")}
+                  class="w-full rounded-md border border-border bg-card px-2.5 py-2 text-left disabled:cursor-default"
                 >
-                  <span class="truncate font-mono text-xs">{a.name}</span>
-                  <span class="ml-auto font-mono text-xxs text-muted-foreground">
-                    {a.schedule ?? "manual"}
-                  </span>
-                </div>
+                  <div class="flex items-baseline gap-2">
+                    <span class="truncate font-mono text-xs font-medium">{job.name}</span>
+                    <span class="ml-auto shrink-0 font-mono text-xxs {statusClass(job)}">
+                      {job.status}
+                    </span>
+                  </div>
+                  <p class="m-0 truncate font-mono text-xxs text-muted-foreground">
+                    {scheduleLabel(job)}{job.next_run_at && job.schedule?.kind === "recurring"
+                      ? ` · next ${resetClock(new Date(job.next_run_at), now)}`
+                      : ""}
+                  </p>
+                  {#if job.last_run}
+                    <p
+                      class="m-0 truncate font-mono text-xxs {jobFailed(job)
+                        ? 'text-destructive'
+                        : 'text-muted-foreground'}"
+                    >
+                      last {job.last_run.outcome} {resetClock(new Date(job.last_run.finished_at), now)}
+                      · {job.last_run.trigger}
+                    </p>
+                  {/if}
+                  {#if problem}
+                    <p class="m-0 mt-0.5 line-clamp-2 text-xxs text-destructive">{problem}</p>
+                  {/if}
+                </button>
               {/each}
             </div>
           {/if}

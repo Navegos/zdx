@@ -1,5 +1,5 @@
-//! Where the scheduled automations daemon runs, and the settings it
-//! resolves for each automation.
+//! Where the scheduled jobs daemon runs, and the settings it
+//! resolves for each job.
 //!
 //! Surfaces must show the daemon's context, never their own working
 //! directory. The context comes from one of two sources, reported as-is:
@@ -9,7 +9,7 @@
 //!   the daemon is stopped, or running without a context record (an older
 //!   build).
 //!
-//! Otherwise the context is `Unavailable` with a reason, and automations that
+//! Otherwise the context is `Unavailable` with a reason, and jobs that
 //! do not declare their own `root` stay unresolved instead of falling back to
 //! the caller's root.
 
@@ -20,8 +20,8 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::automations::{self, AutomationOverview, InheritedContext, SettingOrigin};
 use crate::config::{Config, paths};
+use crate::jobs::{self, InheritedContext, JobOverview, JobsHome, SettingOrigin};
 use crate::pidfile::{self, ServiceStatus};
 use crate::service::{self, InstalledLaunch, Service};
 
@@ -31,7 +31,7 @@ const RECORD_FILE: &str = "daemon.context.json";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonRecord {
     pub pid: u32,
-    /// `--root` the daemon resolves inherited automations against.
+    /// `--root` the daemon resolves inherited jobs against.
     pub root: PathBuf,
     /// Working directory the daemon loads config layers from.
     pub config_dir: PathBuf,
@@ -91,7 +91,7 @@ pub enum DaemonContextSource {
     Installed,
 }
 
-/// The root and config directory the daemon resolves automations with.
+/// The root and config directory the daemon resolves jobs with.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DaemonContext {
     pub source: DaemonContextSource,
@@ -113,12 +113,12 @@ pub enum DaemonContextState {
     Unavailable { reason: String },
 }
 
-/// Automations resolved the way the scheduled daemon resolves them.
+/// Jobs resolved the way the scheduled daemon resolves them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct DaemonAutomations {
+pub struct DaemonJobs {
     pub daemon: DaemonContextState,
-    pub automations: Vec<AutomationOverview>,
-    /// Set when automations could not be listed at all.
+    pub jobs: Vec<JobOverview>,
+    /// Set when jobs could not be listed at all.
     pub error: Option<String>,
 }
 
@@ -214,22 +214,23 @@ pub fn discover_from(inputs: DiscoveryInputs) -> DaemonContextState {
     }
 }
 
-/// Lists automations resolved with the daemon's context.
+/// Lists jobs resolved with the daemon's context.
 #[must_use]
-pub fn automations() -> DaemonAutomations {
-    automations_for(discover(), &paths::zdx_home().join("automations"))
+pub fn jobs() -> DaemonJobs {
+    jobs_for(discover(), &JobsHome::current())
 }
 
-/// Like [`automations`], with an explicit context and automations directory.
+/// Like [`jobs`], with an explicit context and jobs home. Invalid job files
+/// are listed with their error.
 #[must_use]
-pub fn automations_for(daemon: DaemonContextState, automations_dir: &Path) -> DaemonAutomations {
-    let definitions = match automations::discover_with_user_dir(Path::new(""), automations_dir) {
-        Ok(definitions) => definitions,
+pub fn jobs_for(daemon: DaemonContextState, home: &JobsHome) -> DaemonJobs {
+    let catalog = match jobs::catalog(home) {
+        Ok(catalog) => catalog,
         Err(err) => {
-            return DaemonAutomations {
+            return DaemonJobs {
                 daemon,
-                automations: Vec::new(),
-                error: Some(format!("discover automations: {err:#}")),
+                jobs: Vec::new(),
+                error: Some(format!("discover jobs: {err:#}")),
             };
         }
     };
@@ -249,7 +250,9 @@ pub fn automations_for(daemon: DaemonContextState, automations_dir: &Path) -> Da
         _ => None,
     };
 
-    let overviews = definitions
+    let now = Utc::now();
+    let mut overviews: Vec<JobOverview> = catalog
+        .jobs
         .iter()
         .map(|definition| {
             let inherited = match (&daemon, &config, &missing) {
@@ -262,13 +265,19 @@ pub fn automations_for(daemon: DaemonContextState, automations_dir: &Path) -> Da
                 }
                 (_, _, reason) => Err(reason.as_deref().unwrap_or("daemon settings unavailable")),
             };
-            automations::overview_from(inherited, definition)
+            jobs::overview_from(
+                inherited,
+                definition,
+                jobs::job_state(home, definition, now, &chrono::Local),
+            )
         })
+        .chain(catalog.invalid.iter().map(jobs::invalid_overview))
         .collect();
+    overviews.sort_by(|a, b| a.name.cmp(&b.name));
 
-    DaemonAutomations {
+    DaemonJobs {
         daemon,
-        automations: overviews,
+        jobs: overviews,
         error: None,
     }
 }
@@ -280,9 +289,9 @@ pub fn automations_for(daemon: DaemonContextState, automations_dir: &Path) -> Da
 ///
 /// # Errors
 /// Returns an error if the chosen config layers fail to load.
-pub fn job_config(daemon: &DaemonContextState, overview: &AutomationOverview) -> Result<Config> {
+pub fn job_config(daemon: &DaemonContextState, overview: &JobOverview) -> Result<Config> {
     let dir = match (&overview.settings, daemon) {
-        (Some(settings), _) if settings.root.origin == SettingOrigin::Automation => {
+        (Some(settings), _) if settings.root.origin == SettingOrigin::Job => {
             Some(settings.root.path.clone())
         }
         (Some(_), DaemonContextState::Available { context }) => Some(context.config_dir.clone()),
@@ -424,7 +433,7 @@ mod tests {
         assert!(read_record_at(&record_path()).is_none());
     }
 
-    fn write_automation(dir: &Path, name: &str, frontmatter: &str) {
+    fn write_job(dir: &Path, name: &str, frontmatter: &str) {
         fs::create_dir_all(dir).unwrap();
         fs::write(
             dir.join(format!("{name}.md")),
@@ -452,7 +461,7 @@ mod tests {
     }
 
     #[test]
-    fn automations_resolve_against_daemon_root_and_config() {
+    fn jobs_resolve_against_daemon_root_and_config() {
         let home = crate::test_support::temp_zdx_home();
         let daemon_root = tempdir().unwrap();
         write_config(
@@ -462,26 +471,26 @@ mod tests {
         let own_root = tempdir().unwrap();
         write_config(own_root.path(), "model = \"openai-codex:gpt-5.4@low\"\n");
 
-        let dir = home.path().join("automations");
-        write_automation(&dir, "inherited", "");
-        write_automation(
+        let dir = home.path().join("jobs");
+        write_job(&dir, "inherited", "");
+        write_job(
             &dir,
             "suffixless",
             "model: \"claude-cli:claude-sonnet-5\"\n",
         );
-        write_automation(
+        write_job(
             &dir,
             "scoped",
             &format!("root: \"{}\"\n", own_root.path().display()),
         );
 
-        let view = automations_for(
+        let view = jobs_for(
             available(daemon_root.path(), DaemonContextSource::Running),
-            &dir,
+            &JobsHome::at(home.path()),
         );
         assert!(view.error.is_none());
         let get = |name: &str| {
-            view.automations
+            view.jobs
                 .iter()
                 .find(|item| item.name == name)
                 .and_then(|item| item.settings.clone())
@@ -499,12 +508,12 @@ mod tests {
         let suffixless = get("suffixless");
         assert_eq!(suffixless.model.spec, "claude-cli:claude-sonnet-5@high");
         assert_eq!(suffixless.model.account, None);
-        assert_eq!(suffixless.model.origin, SettingOrigin::Automation);
+        assert_eq!(suffixless.model.origin, SettingOrigin::Job);
         assert_eq!(suffixless.model.thinking_origin, SettingOrigin::Config);
 
         let scoped = get("scoped");
         assert_eq!(scoped.root.path, own_root.path());
-        assert_eq!(scoped.root.origin, SettingOrigin::Automation);
+        assert_eq!(scoped.root.origin, SettingOrigin::Job);
         assert_eq!(scoped.model.spec, "openai-codex:gpt-5.4@low");
     }
 
@@ -512,9 +521,9 @@ mod tests {
     fn unavailable_or_broken_daemon_leaves_only_inherited_jobs_unresolved() {
         let home = crate::test_support::temp_zdx_home();
         let own_root = tempdir().unwrap();
-        let dir = home.path().join("automations");
-        write_automation(&dir, "inherited", "");
-        write_automation(
+        let dir = home.path().join("jobs");
+        write_job(&dir, "inherited", "");
+        write_job(
             &dir,
             "scoped",
             &format!("root: \"{}\"\n", own_root.path().display()),
@@ -535,19 +544,11 @@ mod tests {
             ),
         ];
         for (state, expected) in states {
-            let view = automations_for(state, &dir);
-            let inherited = view
-                .automations
-                .iter()
-                .find(|a| a.name == "inherited")
-                .unwrap();
+            let view = jobs_for(state, &JobsHome::at(home.path()));
+            let inherited = view.jobs.iter().find(|a| a.name == "inherited").unwrap();
             assert!(inherited.settings.is_none());
             assert!(inherited.error.as_deref().unwrap().contains(expected));
-            let scoped = view
-                .automations
-                .iter()
-                .find(|a| a.name == "scoped")
-                .unwrap();
+            let scoped = view.jobs.iter().find(|a| a.name == "scoped").unwrap();
             assert_eq!(scoped.settings.as_ref().unwrap().root.path, own_root.path());
         }
     }
@@ -564,25 +565,20 @@ mod tests {
         write_config(daemon_root.path(), "model = \"daemon:model@high\"\n");
         let own_root = tempdir().unwrap();
         write_config(own_root.path(), "model = \"own:model@medium\"\n");
-        let dir = home.path().join("automations");
-        write_automation(&dir, "inherited", "");
-        write_automation(
+        let dir = home.path().join("jobs");
+        write_job(&dir, "inherited", "");
+        write_job(
             &dir,
             "scoped",
             &format!("root: \"{}\"\n", own_root.path().display()),
         );
 
         let running = available(daemon_root.path(), DaemonContextSource::Running);
-        let view = automations_for(running.clone(), &dir);
-        let model_for = |state: &DaemonContextState, item: &AutomationOverview| {
-            job_config(state, item).unwrap().model
-        };
-        let find = |view: &DaemonAutomations, name: &str| {
-            view.automations
-                .iter()
-                .find(|a| a.name == name)
-                .unwrap()
-                .clone()
+        let view = jobs_for(running.clone(), &JobsHome::at(home.path()));
+        let model_for =
+            |state: &DaemonContextState, item: &JobOverview| job_config(state, item).unwrap().model;
+        let find = |view: &DaemonJobs, name: &str| {
+            view.jobs.iter().find(|a| a.name == name).unwrap().clone()
         };
         assert_eq!(
             model_for(&running, &find(&view, "inherited")),
@@ -596,7 +592,7 @@ mod tests {
         let unknown = DaemonContextState::Unavailable {
             reason: "daemon is not running".to_string(),
         };
-        let view = automations_for(unknown.clone(), &dir);
+        let view = jobs_for(unknown.clone(), &JobsHome::at(home.path()));
         assert_eq!(
             model_for(&unknown, &find(&view, "inherited")),
             "global:model@low"

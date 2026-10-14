@@ -203,7 +203,7 @@ pub fn fallback_capability_catalog(delegation_enabled: bool) -> Vec<CapabilityDe
 /// persistent home-base profile, not a delegable subagent, and is resolved
 /// only through [`load_builtin_orchestrator`]. Rejecting it at this chokepoint
 /// makes it uninvokable through `invoke_subagent`, `zdx exec --subagent`, and
-/// automation `subagent:` frontmatter alike, rather than merely hidden from
+/// job `subagent:` frontmatter alike, rather than merely hidden from
 /// the advertised catalog.
 ///
 /// # Errors
@@ -241,7 +241,7 @@ pub fn render_prompt(
     render_prompt_inner(config, root, definition, model, inclusion, None).map(|(prompt, _)| prompt)
 }
 
-/// Renders a subagent prompt for a non-interactive run (automations), plus the
+/// Renders a subagent prompt for a non-interactive run (jobs), plus the
 /// runtime-context snapshot for the first user turn.
 ///
 /// The subagent body replaces the default system prompt, so the canonical
@@ -880,7 +880,7 @@ mod tests {
         let root = tempdir().unwrap();
 
         // Reserved at the load chokepoint, so `invoke_subagent`, `zdx exec
-        // --subagent`, and automation frontmatter are all covered.
+        // --subagent`, and job frontmatter are all covered.
         let err = load_by_name(root.path(), "orchestrator").unwrap_err();
         assert!(
             format!("{err:#}").contains("reserved persistent profile"),

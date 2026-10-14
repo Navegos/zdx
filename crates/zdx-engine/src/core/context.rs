@@ -880,7 +880,7 @@ pub fn render_standalone_prompt_template_with_context(
 }
 
 /// Like [`render_standalone_prompt_template_with_context`], for a standalone
-/// profile that runs non-interactively (an automation with `subagent:`).
+/// profile that runs non-interactively (a job with `subagent:`).
 ///
 /// The profile body replaces the default system prompt, so the canonical
 /// project-instructions, Safety/Git, and runtime-layer blocks are appended
@@ -1651,7 +1651,7 @@ pub fn build_effective_system_prompt_with_paths(
 
 /// Builds the effective system prompt by combining config, inline project context,
 /// an optional memory index, template-driven sections, and additive
-/// instruction layers (for example surfaces or automation harnesses).
+/// instruction layers (for example surfaces or job harnesses).
 ///
 /// # Errors
 /// Returns an error if the operation fails.

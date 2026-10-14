@@ -1,4 +1,4 @@
-# Automation Examples
+# Job Examples
 
 ## Daily thread summary (report, scheduled)
 
@@ -108,7 +108,7 @@ If no completed and no upcoming reminders, send email with:
 # Delivery
 - Channel: email (use `gog` skill)
 - Target: user's primary Gmail
-- If delivery fails: report error clearly; digest remains in automation thread.
+- If delivery fails: report error clearly; digest remains in job thread.
 
 # Failure Policy
 - If reminders fetch fails, report error and skip that section.

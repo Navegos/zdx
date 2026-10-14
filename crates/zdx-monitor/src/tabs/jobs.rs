@@ -1,66 +1,81 @@
 use std::path::{Path, PathBuf};
 
+use chrono::{DateTime, Local, Utc};
 use crossterm::event::KeyCode;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
-use zdx_engine::automation_daemon::{
-    self, DaemonAutomations, DaemonContext, DaemonContextSource, DaemonContextState,
-};
-use zdx_engine::automations::{self, AutomationOverview, ModelEdit, SettingOrigin};
 use zdx_engine::config::paths;
+use zdx_engine::job_daemon::{
+    self, DaemonContext, DaemonContextSource, DaemonContextState, DaemonJobs,
+};
+use zdx_engine::jobs::{
+    self, ArchivedJob, JobOverview, JobSchedule, JobStatus, JobsHome, ModelEdit, Outcome,
+    SettingOrigin,
+};
 
 use crate::app::MonitorApp;
 use crate::tabs::config::{ModelFieldKind, ModelPickerState, PickerTarget};
 use crate::ui::{SELECTED_BG, truncate_chars};
 
-/// Automations resolved the way the scheduled daemon resolves them, through
+/// Jobs resolved the way the scheduled daemon resolves them, through
 /// the shared engine view. Never uses the Monitor's own root. Reads the
 /// daemon record, service plist, config, and subagent files, so call it on
 /// tab entry, not on the refresh tick.
-pub(crate) fn load_automations() -> DaemonAutomations {
-    automation_daemon::automations()
+pub(crate) fn load_jobs() -> DaemonJobs {
+    job_daemon::jobs()
 }
 
 /// Replaces the tab's snapshot, keeping the selection on `keep` (by name)
 /// when it is still listed.
-pub(crate) fn apply_snapshot(
-    app: &mut MonitorApp,
-    snapshot: DaemonAutomations,
-    keep: Option<&str>,
-) {
-    app.automations = snapshot.automations;
-    app.automations_daemon = Some(snapshot.daemon);
-    app.automations_error = snapshot.error;
-    let last = app.automations.len().saturating_sub(1);
+pub(crate) fn apply_snapshot(app: &mut MonitorApp, snapshot: DaemonJobs, keep: Option<&str>) {
+    app.jobs = snapshot.jobs;
+    app.jobs_daemon = Some(snapshot.daemon);
+    app.jobs_error = snapshot.error;
+    let last = app.jobs.len().saturating_sub(1);
     app.selected_index = keep
-        .and_then(|name| app.automations.iter().position(|item| item.name == name))
+        .and_then(|name| app.jobs.iter().position(|item| item.name == name))
         .unwrap_or(app.selected_index)
         .min(last);
 }
 
-/// Automations-tab keys: `Enter` edits the selected job's model in the shared
-/// model picker, `d`/`Delete` removes its model override. Returns whether
-/// the key was handled.
-pub(crate) fn handle_automations_key(app: &mut MonitorApp, key: KeyCode) -> bool {
+/// Jobs-tab keys: `Enter` edits the selected job's model in the shared
+/// model picker, `d`/`Delete` removes its model override, `a` switches
+/// between jobs and archived once jobs (read-only). Returns whether the key
+/// was handled.
+pub(crate) fn handle_jobs_key(app: &mut MonitorApp, key: KeyCode) -> bool {
     match key {
-        KeyCode::Enter => open_automation_model_picker(app),
+        KeyCode::Char('a') => toggle_archived(app, || JobsHome::current().archived()),
+        KeyCode::Enter | KeyCode::Char('d') | KeyCode::Delete if app.jobs_archived.is_some() => {
+            app.set_status("Archived jobs are read-only; press a to go back".to_string());
+        }
+        KeyCode::Enter => open_job_model_picker(app),
         KeyCode::Char('d') | KeyCode::Delete => clear_selected_model(app),
         _ => return false,
     }
     true
 }
 
-/// Opens the Config tab's model picker for the selected automation, seeded
+/// Shows the archive (loaded now, through the shared engine listing) or
+/// goes back to the jobs list.
+fn toggle_archived(app: &mut MonitorApp, load: impl FnOnce() -> anyhow::Result<Vec<ArchivedJob>>) {
+    app.selected_index = 0;
+    app.jobs_archived = match app.jobs_archived {
+        Some(_) => None,
+        None => Some(load().map_err(|err| format!("{err:#}"))),
+    };
+}
+
+/// Opens the Config tab's model picker for the selected job, seeded
 /// with the model the job resolves to now.
-pub(crate) fn open_automation_model_picker(app: &mut MonitorApp) {
-    let Some(item) = app.automations.get(app.selected_index) else {
+pub(crate) fn open_job_model_picker(app: &mut MonitorApp) {
+    let Some(item) = app.jobs.get(app.selected_index) else {
         return;
     };
     let unknown = DaemonContextState::Unavailable {
         reason: "daemon settings not checked".to_string(),
     };
-    let daemon = app.automations_daemon.as_ref().unwrap_or(&unknown);
-    let config = match automation_daemon::job_config(daemon, item) {
+    let daemon = app.jobs_daemon.as_ref().unwrap_or(&unknown);
+    let config = match job_daemon::job_config(daemon, item) {
         Ok(config) => config,
         Err(err) => {
             let message = format!("Cannot edit {}: {err:#}", item.name);
@@ -75,13 +90,13 @@ pub(crate) fn open_automation_model_picker(app: &mut MonitorApp) {
         .or_else(|| item.declared_model.clone())
         .unwrap_or_default();
     let mut picker = ModelPickerState::new(
-        format!("automation {}", item.name),
+        format!("job {}", item.name),
         ModelFieldKind::Chat,
         &current,
         &config.providers,
         &config.model_modes,
     );
-    picker.target = PickerTarget::Automation {
+    picker.target = PickerTarget::Job {
         name: item.name.clone(),
         path: item.path.clone(),
         declared: item.declared_model.clone(),
@@ -89,13 +104,13 @@ pub(crate) fn open_automation_model_picker(app: &mut MonitorApp) {
     app.model_picker = Some(picker);
 }
 
-/// Saves the picker's choice as the automation's `model:`.
+/// Saves the picker's choice as the job's `model:`.
 pub(crate) fn save_picked_model(app: &mut MonitorApp, spec: &str) {
-    save_model_with(app, ModelEdit::Set(spec), load_automations);
+    save_model_with(app, ModelEdit::Set(spec), load_jobs);
 }
 
 fn clear_selected_model(app: &mut MonitorApp) {
-    let Some(item) = app.automations.get(app.selected_index) else {
+    let Some(item) = app.jobs.get(app.selected_index) else {
         return;
     };
     if item.declared_model.is_none() {
@@ -103,19 +118,15 @@ fn clear_selected_model(app: &mut MonitorApp) {
         app.set_status(message);
         return;
     }
-    let target = PickerTarget::Automation {
+    let target = PickerTarget::Job {
         name: item.name.clone(),
         path: item.path.clone(),
         declared: item.declared_model.clone(),
     };
-    edit_model_with(app, &target, ModelEdit::Clear, load_automations);
+    edit_model_with(app, &target, ModelEdit::Clear, load_jobs);
 }
 
-fn save_model_with(
-    app: &mut MonitorApp,
-    edit: ModelEdit<'_>,
-    load: impl FnOnce() -> DaemonAutomations,
-) {
+fn save_model_with(app: &mut MonitorApp, edit: ModelEdit<'_>, load: impl FnOnce() -> DaemonJobs) {
     let Some(target) = app.model_picker.take().map(|picker| picker.target) else {
         return;
     };
@@ -128,9 +139,9 @@ fn edit_model_with(
     app: &mut MonitorApp,
     target: &PickerTarget,
     edit: ModelEdit<'_>,
-    load: impl FnOnce() -> DaemonAutomations,
+    load: impl FnOnce() -> DaemonJobs,
 ) {
-    let PickerTarget::Automation {
+    let PickerTarget::Job {
         name,
         path,
         declared,
@@ -138,7 +149,7 @@ fn edit_model_with(
     else {
         return;
     };
-    let result = automations::set_model(path, Some(declared.as_deref()), edit);
+    let result = jobs::set_model(path, Some(declared.as_deref()), edit);
     apply_snapshot(app, load(), Some(name));
     let message = match result {
         Ok(_) => {
@@ -147,7 +158,7 @@ fn edit_model_with(
                 ModelEdit::Clear => format!("Cleared {name} model override"),
             };
             let now = app
-                .automations
+                .jobs
                 .iter()
                 .find(|item| &item.name == name)
                 .map(|item| match &item.settings {
@@ -169,21 +180,25 @@ fn edit_model_with(
     app.set_status(message);
 }
 
-struct AutomationsView<'a> {
-    items: &'a [AutomationOverview],
+struct JobsView<'a> {
+    items: &'a [JobOverview],
     error: Option<&'a str>,
     selected: usize,
     daemon: Option<&'a DaemonContextState>,
     home: Option<&'a Path>,
 }
 
-pub(crate) fn render_automations(f: &mut Frame, app: &MonitorApp, area: Rect) {
+pub(crate) fn render_jobs(f: &mut Frame, app: &MonitorApp, area: Rect) {
     let home = paths::home_dir();
-    let view = AutomationsView {
-        items: &app.automations,
-        error: app.automations_error.as_deref(),
+    if let Some(archived) = &app.jobs_archived {
+        render_archived(f, archived, app.selected_index, home.as_deref(), area);
+        return;
+    }
+    let view = JobsView {
+        items: &app.jobs,
+        error: app.jobs_error.as_deref(),
         selected: app.selected_index,
-        daemon: app.automations_daemon.as_ref(),
+        daemon: app.jobs_daemon.as_ref(),
         home: home.as_deref(),
     };
     render_view(f, &view, area);
@@ -235,10 +250,10 @@ fn daemon_note(daemon: Option<&DaemonContextState>, home: Option<&Path>) -> Stri
 
 /// Rows below which the detail pane is dropped so the list stays usable.
 const MIN_HEIGHT_FOR_DETAIL: u16 = 14;
-const MAX_DETAIL_HEIGHT: u16 = 11;
+const MAX_DETAIL_HEIGHT: u16 = 13;
 const LABEL_WIDTH: usize = 10;
 
-fn render_view(f: &mut Frame, view: &AutomationsView, area: Rect) {
+fn render_view(f: &mut Frame, view: &JobsView, area: Rect) {
     let detail_height = if area.height >= MIN_HEIGHT_FOR_DETAIL && !view.items.is_empty() {
         (area.height / 2).min(MAX_DETAIL_HEIGHT)
     } else {
@@ -251,11 +266,11 @@ fn render_view(f: &mut Frame, view: &AutomationsView, area: Rect) {
 
     let title = if area.width >= 60 {
         format!(
-            " Automations · * inherited · {} ",
+            " Jobs · * inherited · {} ",
             daemon_title(view.daemon, view.home)
         )
     } else {
-        " Automations · * inherited ".to_string()
+        " Jobs · * inherited ".to_string()
     };
     let block = Block::default().borders(Borders::ALL).title(title);
 
@@ -268,7 +283,7 @@ fn render_view(f: &mut Frame, view: &AutomationsView, area: Rect) {
         return;
     }
     if view.items.is_empty() {
-        let text = Paragraph::new("No automations found.")
+        let text = Paragraph::new("No jobs found.")
             .style(Style::default().fg(Color::DarkGray))
             .block(block);
         f.render_widget(text, chunks[0]);
@@ -306,32 +321,155 @@ fn render_view(f: &mut Frame, view: &AutomationsView, area: Rect) {
     }
 }
 
-/// One list row, laid out for `width` columns: name, then schedule, model,
-/// and root as space allows. Inherited values end in `*`.
-fn row_line(overview: &AutomationOverview, width: usize, home: Option<&Path>) -> Line<'static> {
+fn render_archived(
+    f: &mut Frame,
+    archived: &Result<Vec<ArchivedJob>, String>,
+    selected: usize,
+    home: Option<&Path>,
+    area: Rect,
+) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Archived once jobs · newest first · a back ");
+    let items = match archived {
+        Err(error) => {
+            let text = Paragraph::new(format!("error: {error}"))
+                .style(Style::default().fg(Color::Red))
+                .wrap(Wrap { trim: false })
+                .block(block);
+            f.render_widget(text, area);
+            return;
+        }
+        Ok(items) if items.is_empty() => {
+            let text = Paragraph::new("No archived jobs.")
+                .style(Style::default().fg(Color::DarkGray))
+                .block(block);
+            f.render_widget(text, area);
+            return;
+        }
+        Ok(items) => items,
+    };
+    let detail_height = if area.height >= MIN_HEIGHT_FOR_DETAIL {
+        8
+    } else {
+        0
+    };
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(detail_height)])
+        .split(area);
+    let width = chunks[0].width.saturating_sub(2) as usize;
+    let rows: Vec<ListItem> = items
+        .iter()
+        .enumerate()
+        .map(|(i, item)| {
+            let row = ListItem::new(archived_row(item, width));
+            if i == selected {
+                row.style(Style::default().bg(SELECTED_BG))
+            } else {
+                row
+            }
+        })
+        .collect();
+    let mut state = ListState::default().with_selected(Some(selected));
+    f.render_stateful_widget(List::new(rows).block(block), chunks[0], &mut state);
+
+    if detail_height > 0
+        && let Some(item) = items.get(selected)
+    {
+        let mut lines = vec![labeled(
+            "file",
+            vec![Span::raw(display_path(&item.path, home))],
+        )];
+        if let Some(last) = &item.last_run {
+            lines.push(labeled(
+                "finished",
+                vec![Span::raw(format!(
+                    "{} ({})",
+                    local_time(last.finished_at),
+                    last.trigger.as_str()
+                ))],
+            ));
+            if let Some(thread) = &last.thread_id {
+                lines.push(labeled("thread", vec![Span::raw(thread.clone())]));
+            }
+            if let Some(error) = &last.error {
+                lines.push(labeled(
+                    "failure",
+                    vec![Span::styled(error.clone(), Style::default().fg(Color::Red))],
+                ));
+            }
+        }
+        let detail = Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(Block::default().borders(Borders::ALL));
+        f.render_widget(detail, chunks[1]);
+    }
+}
+
+/// `name  outcome  run_at` for one archived job.
+fn archived_row(item: &ArchivedJob, width: usize) -> Line<'static> {
+    let name_width = (width * 2 / 5).clamp(1, 28);
+    let (outcome, style) = match &item.last_run {
+        Some(last) if last.outcome == Outcome::Succeeded => {
+            (last.outcome.as_str(), Style::default().fg(Color::DarkGray))
+        }
+        Some(last) => (last.outcome.as_str(), Style::default().fg(Color::Red)),
+        None => ("unknown", Style::default().fg(Color::Yellow)),
+    };
+    let when = item
+        .scheduled_for
+        .map_or_else(|| "unknown run_at".to_string(), local_time);
+    let rest = width.saturating_sub(1 + name_width + 2 + 13);
+    Line::from(vec![
+        Span::raw(format!(
+            " {}  ",
+            pad(&truncate_chars(&item.name, name_width), name_width)
+        )),
+        Span::styled(format!("{}  ", pad(outcome, 11)), style),
+        Span::styled(
+            truncate_chars(&when, rest),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ])
+}
+
+/// One list row, laid out for `width` columns: name, then status, schedule,
+/// model, and root as space allows. Inherited values end in `*`.
+fn row_line(overview: &JobOverview, width: usize, home: Option<&Path>) -> Line<'static> {
     let name_width = if width >= 60 {
         22
     } else {
         (width * 2 / 5).max(1)
     };
-    let schedule_width = if width >= 70 { 14 } else { 0 };
-    let schedule_columns = if schedule_width > 0 {
-        schedule_width + 2
-    } else {
-        0
-    };
-    let rest = width.saturating_sub(1 + name_width + 2 + schedule_columns);
+    let status_width = if width >= 50 { 11 } else { 0 };
+    let schedule_width = if width >= 80 { 14 } else { 0 };
+    let column = |width: usize| if width > 0 { width + 2 } else { 0 };
+    let rest =
+        width.saturating_sub(1 + name_width + 2 + column(status_width) + column(schedule_width));
 
     let mut spans = vec![Span::raw(format!(
         " {}  ",
         pad(&truncate_chars(&overview.name, name_width), name_width)
     ))];
-    if schedule_width > 0 {
-        let schedule = overview.schedule.as_deref().unwrap_or("manual");
+    if status_width > 0 {
+        let (status, style) = status_label(overview);
         spans.push(Span::styled(
             format!(
                 "{}  ",
-                pad(&truncate_chars(schedule, schedule_width), schedule_width)
+                pad(&truncate_chars(&status, status_width), status_width)
+            ),
+            style,
+        ));
+    }
+    if schedule_width > 0 {
+        spans.push(Span::styled(
+            format!(
+                "{}  ",
+                pad(
+                    &truncate_chars(&schedule_label(overview), schedule_width),
+                    schedule_width
+                )
             ),
             Style::default().fg(Color::DarkGray),
         ));
@@ -377,17 +515,29 @@ fn row_line(overview: &AutomationOverview, width: usize, home: Option<&Path>) ->
     Line::from(spans)
 }
 
-/// Detail of the selected automation: declared and resolved settings with
+/// Detail of the selected job: declared and resolved settings with
 /// provenance, or the resolution error.
 fn detail_lines(
-    overview: &AutomationOverview,
+    overview: &JobOverview,
     daemon: Option<&DaemonContextState>,
     home: Option<&Path>,
 ) -> Vec<Line<'static>> {
     let mut lines = vec![
         labeled("file", vec![Span::raw(display_path(&overview.path, home))]),
         labeled("schedule", vec![Span::raw(schedule_text(overview))]),
+        labeled("status", status_spans(overview)),
     ];
+    if let Some(error) = overview
+        .state
+        .last_run
+        .as_ref()
+        .and_then(|last| last.error.as_ref())
+    {
+        lines.push(labeled(
+            "failure",
+            vec![Span::styled(error.clone(), Style::default().fg(Color::Red))],
+        ));
+    }
 
     let Some(settings) = &overview.settings else {
         lines.extend(unresolved_lines(overview));
@@ -459,13 +609,20 @@ fn note_line(text: String) -> Line<'static> {
     )
 }
 
-fn schedule_text(overview: &AutomationOverview) -> String {
-    let mut parts = vec![
-        overview
-            .schedule
-            .clone()
-            .unwrap_or_else(|| "manual only".to_string()),
-    ];
+fn schedule_text(overview: &JobOverview) -> String {
+    let Some(schedule) = &overview.schedule else {
+        return "invalid file".to_string();
+    };
+    let mut parts = vec![match schedule {
+        JobSchedule::Manual => "manual only".to_string(),
+        JobSchedule::Recurring { cron, .. } => format!("recurring {cron}"),
+        JobSchedule::Once { run_at } => {
+            format!("once at {}", local_time(run_at.with_timezone(&Utc)))
+        }
+    }];
+    if let Some(grace) = overview.grace_secs {
+        parts.push(format!("grace {grace}s"));
+    }
     if let Some(timeout) = overview.timeout_secs {
         parts.push(format!("timeout {timeout}s"));
     }
@@ -473,9 +630,84 @@ fn schedule_text(overview: &AutomationOverview) -> String {
     parts.join(" · ")
 }
 
-/// Declared values and the resolution error for an automation whose
+/// Compact schedule for the list: the cron expression, `once MM-DD HH:MM`
+/// in local time, or `manual`.
+fn schedule_label(overview: &JobOverview) -> String {
+    match &overview.schedule {
+        None => "invalid".to_string(),
+        Some(JobSchedule::Manual) => "manual".to_string(),
+        Some(JobSchedule::Recurring { cron, .. }) => cron.clone(),
+        Some(JobSchedule::Once { run_at }) => format!(
+            "once {}",
+            run_at.with_timezone(&Local).format("%m-%d %H:%M")
+        ),
+    }
+}
+
+/// Status word for the list, red when the job cannot run or its last run
+/// did not succeed.
+fn status_label(overview: &JobOverview) -> (String, Style) {
+    let status = overview.state.status;
+    let last_bad = overview.state.last_run.as_ref().is_some_and(|last| {
+        matches!(
+            last.outcome,
+            Outcome::Failed | Outcome::Missed | Outcome::Interrupted
+        )
+    });
+    let style = match status {
+        JobStatus::Invalid | JobStatus::Expired | JobStatus::Interrupted => {
+            Style::default().fg(Color::Red)
+        }
+        JobStatus::Running | JobStatus::Due => Style::default().fg(Color::Yellow),
+        _ if last_bad => Style::default().fg(Color::Red),
+        _ => Style::default().fg(Color::DarkGray),
+    };
+    let text = match (&overview.state.last_run, status) {
+        (Some(last), JobStatus::Scheduled | JobStatus::Manual) if last_bad => {
+            format!("{} ({})", status.as_str(), last.outcome.as_str())
+        }
+        _ => status.as_str().to_string(),
+    };
+    (text, style)
+}
+
+/// Status, next run, and last outcome for the detail pane.
+fn status_spans(overview: &JobOverview) -> Vec<Span<'static>> {
+    let (_, style) = status_label(overview);
+    let mut spans = vec![Span::styled(
+        overview.state.status.as_str().to_string(),
+        style,
+    )];
+    let mut rest = Vec::new();
+    if let Some(next) = overview.state.next_run_at {
+        rest.push(format!("next {}", local_time(next)));
+    }
+    if let Some(last) = &overview.state.last_run {
+        rest.push(format!(
+            "last {} {} ({})",
+            last.outcome.as_str(),
+            local_time(last.finished_at),
+            last.trigger.as_str()
+        ));
+    }
+    if !rest.is_empty() {
+        spans.push(Span::styled(
+            format!(" · {}", rest.join(" · ")),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    spans
+}
+
+fn local_time(at: DateTime<Utc>) -> String {
+    at.with_timezone(&Local)
+        .format("%Y-%m-%d %H:%M")
+        .to_string()
+}
+
+/// Declared values and the resolution error for a job whose
 /// settings could not be resolved.
-fn unresolved_lines(overview: &AutomationOverview) -> Vec<Line<'static>> {
+fn unresolved_lines(overview: &JobOverview) -> Vec<Line<'static>> {
     let declared = |value: Option<&String>, fallback: &str| {
         value.map_or_else(|| fallback.to_string(), |value| format!("declared {value}"))
     };
@@ -584,9 +816,7 @@ fn display_path(path: &Path, home: Option<&Path>) -> String {
 #[cfg(test)]
 mod tests {
     use ratatui::backend::TestBackend;
-    use zdx_engine::automations::{
-        AutomationRunSettings, ResolvedAutomationModel, ResolvedAutomationRoot,
-    };
+    use zdx_engine::jobs::{JobRunSettings, ResolvedJobModel, ResolvedJobRoot};
 
     use super::*;
 
@@ -611,7 +841,7 @@ mod tests {
         }
     }
 
-    fn detail_text(item: &AutomationOverview, state: &DaemonContextState) -> String {
+    fn detail_text(item: &JobOverview, state: &DaemonContextState) -> String {
         detail_lines(item, Some(state), Some(Path::new(HOME)))
             .iter()
             .map(line_text)
@@ -631,22 +861,28 @@ mod tests {
         model_origin: SettingOrigin,
         thinking_origin: SettingOrigin,
         root_origin: SettingOrigin,
-    ) -> AutomationOverview {
-        AutomationOverview {
+    ) -> JobOverview {
+        JobOverview {
             name: name.to_string(),
-            path: PathBuf::from(format!("{HOME}/.zdx/automations/{name}.md")),
-            schedule: Some("0 9 * * *".to_string()),
+            path: PathBuf::from(format!("{HOME}/.zdx/jobs/{name}.md")),
+            schedule: Some(JobSchedule::parse(Some("0 9 * * *"), None).unwrap()),
+            grace_secs: Some(600),
+            state: jobs::JobState {
+                status: JobStatus::Scheduled,
+                next_run_at: None,
+                last_run: None,
+            },
             declared_root: None,
             declared_model: None,
             subagent: None,
             timeout_secs: Some(600),
             max_retries: 1,
-            settings: Some(AutomationRunSettings {
-                root: ResolvedAutomationRoot {
+            settings: Some(JobRunSettings {
+                root: ResolvedJobRoot {
                     path: PathBuf::from(format!("{HOME}/projects/example")),
                     origin: root_origin,
                 },
-                model: ResolvedAutomationModel {
+                model: ResolvedJobModel {
                     spec: "provider-a@work:model-x@high".to_string(),
                     provider: "provider-a".to_string(),
                     account: Some("work".to_string()),
@@ -662,8 +898,8 @@ mod tests {
         }
     }
 
-    fn failed(name: &str) -> AutomationOverview {
-        AutomationOverview {
+    fn failed(name: &str) -> JobOverview {
+        JobOverview {
             declared_root: Some("~/missing".to_string()),
             settings: None,
             error: Some("root '/home/user/missing' does not exist or is not a directory".into()),
@@ -681,9 +917,9 @@ mod tests {
         let home = Path::new(HOME);
         let explicit = overview(
             "daily-report",
-            SettingOrigin::Automation,
-            SettingOrigin::Automation,
-            SettingOrigin::Automation,
+            SettingOrigin::Job,
+            SettingOrigin::Job,
+            SettingOrigin::Job,
         );
         let text = line_text(&row_line(&explicit, 120, Some(home)));
         assert!(text.contains("daily-report"));
@@ -703,6 +939,53 @@ mod tests {
     }
 
     #[test]
+    fn rows_show_status_once_schedule_and_failed_last_runs() {
+        let home = Path::new(HOME);
+        let mut once = overview(
+            "renew-domain",
+            SettingOrigin::Job,
+            SettingOrigin::Job,
+            SettingOrigin::Job,
+        );
+        once.schedule = Some(JobSchedule::parse(None, Some("2030-01-02T09:00:00-03:00")).unwrap());
+        once.state.status = JobStatus::Pending;
+        let text = line_text(&row_line(&once, 120, Some(home)));
+        assert!(text.contains("pending"), "{text}");
+        assert!(text.contains("once 01-0"), "{text}");
+
+        let mut failing = overview(
+            "weekly-digest",
+            SettingOrigin::Job,
+            SettingOrigin::Job,
+            SettingOrigin::Job,
+        );
+        failing.state.last_run = Some(jobs::LastRun {
+            run_id: "run-1".to_string(),
+            trigger: jobs::RunTrigger::Daemon,
+            outcome: Outcome::Failed,
+            scheduled_for: None,
+            finished_at: chrono::Utc::now(),
+            error: Some("HTTP 401: Invalid API Key".to_string()),
+            thread_id: None,
+        });
+        let (label, style) = status_label(&failing);
+        assert_eq!(label, "scheduled (failed)");
+        assert_eq!(style.fg, Some(Color::Red));
+        let detail = detail_text(&failing, &daemon(DaemonContextSource::Running, None));
+        assert!(detail.contains("last failed"), "{detail}");
+        assert!(detail.contains("failure   HTTP 401"), "{detail}");
+
+        let invalid = jobs::invalid_overview(&jobs::InvalidJob {
+            name: "typo".to_string(),
+            path: PathBuf::from(format!("{HOME}/.zdx/jobs/typo.md")),
+            error: "unknown field `schedul`".to_string(),
+        });
+        let text = line_text(&row_line(&invalid, 120, Some(home)));
+        assert!(text.contains("invalid"), "{text}");
+        assert!(text.contains("error: unknown field"), "{text}");
+    }
+
+    #[test]
     fn error_row_shows_error_instead_of_settings() {
         let text = line_text(&row_line(&failed("broken"), 120, Some(Path::new(HOME))));
         assert!(text.contains("broken"));
@@ -713,7 +996,7 @@ mod tests {
     #[test]
     fn narrow_row_fits_width_and_keeps_model() {
         let item = overview(
-            "a-very-long-automation-name",
+            "a-very-long-job-name",
             SettingOrigin::Config,
             SettingOrigin::Config,
             SettingOrigin::Daemon,
@@ -730,12 +1013,12 @@ mod tests {
     fn detail_shows_provenance_and_daemon_source() {
         let item = overview(
             "daily-report",
-            SettingOrigin::Automation,
+            SettingOrigin::Job,
             SettingOrigin::Config,
             SettingOrigin::Daemon,
         );
         let text = detail_text(&item, &daemon(DaemonContextSource::Running, None));
-        assert!(text.contains("provider-a@work:model-x@high  set by automation"));
+        assert!(text.contains("provider-a@work:model-x@high  set by job"));
         assert!(text.contains("account work"));
         assert!(text.contains("thinking high (inherited from config)"));
         assert!(text.contains("~/projects/example  inherited from daemon"));
@@ -755,7 +1038,7 @@ mod tests {
             "daily-report",
             SettingOrigin::SubagentOverride,
             SettingOrigin::SubagentOverride,
-            SettingOrigin::Automation,
+            SettingOrigin::Job,
         );
         let text = detail_text(&explicit_root, &daemon(DaemonContextSource::Running, None));
         assert!(text.contains("set by subagent override"));
@@ -776,7 +1059,7 @@ mod tests {
         assert!(text.contains("does not exist"));
         assert!(!text.contains("note"), "declared root needs no daemon note");
 
-        let inherited = AutomationOverview {
+        let inherited = JobOverview {
             declared_root: None,
             error: Some("daemon settings unavailable: daemon is not running".into()),
             ..failed("needs-daemon")
@@ -786,7 +1069,7 @@ mod tests {
         assert!(text.contains("Daemon settings unavailable: daemon is not running"));
     }
 
-    fn render_text(view: &AutomationsView, width: u16, height: u16) -> String {
+    fn render_text(view: &JobsView, width: u16, height: u16) -> String {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
             .draw(|frame| render_view(frame, view, frame.area()))
@@ -808,13 +1091,13 @@ mod tests {
         let items = vec![
             overview(
                 "daily-report",
-                SettingOrigin::Automation,
-                SettingOrigin::Automation,
-                SettingOrigin::Automation,
+                SettingOrigin::Job,
+                SettingOrigin::Job,
+                SettingOrigin::Job,
             ),
             failed("broken"),
         ];
-        let view = AutomationsView {
+        let view = JobsView {
             items: &items,
             error: None,
             selected: 1,
@@ -834,15 +1117,15 @@ mod tests {
 
     #[test]
     fn renders_listing_error() {
-        let view = AutomationsView {
+        let view = JobsView {
             items: &[],
-            error: Some("discover automations: duplicate name"),
+            error: Some("discover jobs: duplicate name"),
             selected: 0,
             daemon: None,
             home: None,
         };
         let text = render_text(&view, 80, 10);
-        assert!(text.contains("error: discover automations: duplicate name"));
+        assert!(text.contains("error: discover jobs: duplicate name"));
     }
 
     #[test]
@@ -869,7 +1152,7 @@ mod tests {
             SettingOrigin::Config,
             SettingOrigin::Daemon,
         )];
-        let view = AutomationsView {
+        let view = JobsView {
             items: &items,
             error: None,
             selected: 0,
@@ -881,11 +1164,64 @@ mod tests {
         assert!(text.contains("inherited from daemon"));
     }
 
+    #[test]
+    fn archive_toggle_lists_outcomes_read_only_and_goes_back() {
+        let home = zdx_engine::test_support::temp_zdx_home();
+        let mut app = crate::app::build_app(home.path()).unwrap();
+        app.active_section = crate::app::Section::Jobs;
+        app.jobs = vec![overview(
+            "daily-report",
+            SettingOrigin::Job,
+            SettingOrigin::Job,
+            SettingOrigin::Job,
+        )];
+        let archived = vec![ArchivedJob {
+            name: "renew-domain".to_string(),
+            path: PathBuf::from(format!(
+                "{HOME}/.zdx/jobs/archive/renew-domain--20301020T120000Z.md"
+            )),
+            key: Some("20301020T120000Z".to_string()),
+            scheduled_for: Some(chrono::Utc::now()),
+            last_run: Some(jobs::LastRun {
+                run_id: "run-1".to_string(),
+                trigger: jobs::RunTrigger::Daemon,
+                outcome: Outcome::Failed,
+                scheduled_for: None,
+                finished_at: chrono::Utc::now(),
+                error: Some("HTTP 401: Invalid API Key".to_string()),
+                thread_id: Some("job-renew-domain-20301020-120000".to_string()),
+            }),
+        }];
+
+        toggle_archived(&mut app, || Ok(archived.clone()));
+        assert!(matches!(&app.jobs_archived, Some(Ok(items)) if items.len() == 1));
+        assert!(handle_jobs_key(&mut app, KeyCode::Enter));
+        assert!(app.model_picker.is_none(), "archived jobs open no picker");
+        assert!(app.status_message.contains("read-only"));
+
+        let mut terminal = Terminal::new(TestBackend::new(70, 20)).unwrap();
+        terminal
+            .draw(|frame| render_jobs(frame, &app, frame.area()))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let text: String = (0..buffer.area.height)
+            .flat_map(|y| (0..buffer.area.width).map(move |x| (x, y)))
+            .map(|(x, y)| buffer.cell((x, y)).unwrap().symbol().to_string())
+            .collect();
+        assert!(text.contains("Archived once jobs"), "{text}");
+        assert!(text.contains("renew-domain"), "{text}");
+        assert!(text.contains("failed"), "{text}");
+        assert!(text.contains("HTTP 401"), "{text}");
+
+        toggle_archived(&mut app, || unreachable!("going back does not reload"));
+        assert!(app.jobs_archived.is_none());
+    }
+
     mod editing {
         use std::fs;
 
         use ratatui::backend::TestBackend;
-        use zdx_engine::automation_daemon::automations_for;
+        use zdx_engine::job_daemon::jobs_for;
 
         use super::super::*;
         use crate::tabs::config::{PickerPhase, handle_model_picker_key, render_model_picker};
@@ -904,7 +1240,7 @@ mod tests {
         impl Fixture {
             fn new() -> Self {
                 let home = zdx_engine::test_support::temp_zdx_home();
-                let dir = home.path().join("automations");
+                let dir = home.path().join("jobs");
                 fs::create_dir_all(&dir).unwrap();
                 fs::write(dir.join("explicit.md"), EXPLICIT).unwrap();
                 fs::write(dir.join("paused.md"), PAUSED).unwrap();
@@ -926,9 +1262,13 @@ mod tests {
                     },
                 };
                 let mut app = crate::app::build_app(home.path()).unwrap();
-                app.active_section = crate::app::Section::Automations;
-                app.status_section = crate::app::Section::Automations;
-                apply_snapshot(&mut app, automations_for(state.clone(), &dir), None);
+                app.active_section = crate::app::Section::Jobs;
+                app.status_section = crate::app::Section::Jobs;
+                apply_snapshot(
+                    &mut app,
+                    jobs_for(state.clone(), &jobs::JobsHome::at(home.path())),
+                    None,
+                );
                 Self {
                     _home: home,
                     app,
@@ -940,15 +1280,16 @@ mod tests {
             fn select(&mut self, name: &str) {
                 self.app.selected_index = self
                     .app
-                    .automations
+                    .jobs
                     .iter()
                     .position(|item| item.name == name)
                     .unwrap();
             }
 
-            fn loader(&self) -> impl FnOnce() -> DaemonAutomations + use<> {
+            fn loader(&self) -> impl FnOnce() -> DaemonJobs + use<> {
                 let (state, dir) = (self.state.clone(), self.dir.clone());
-                move || automations_for(state, &dir)
+                let home = jobs::JobsHome::at(dir.parent().unwrap());
+                move || jobs_for(state, &home)
             }
 
             fn file(&self, name: &str) -> String {
@@ -960,9 +1301,9 @@ mod tests {
         fn picker_opens_on_the_resolved_daemon_model() {
             let mut fx = Fixture::new();
             fx.select("paused");
-            open_automation_model_picker(&mut fx.app);
+            open_job_model_picker(&mut fx.app);
             let picker = fx.app.model_picker.as_ref().expect("picker opened");
-            assert_eq!(picker.field, "automation paused");
+            assert_eq!(picker.field, "job paused");
             assert_eq!(picker.chosen_model, "claude-cli@work:claude-opus-5");
             assert_eq!(
                 picker.thinking_current,
@@ -970,16 +1311,16 @@ mod tests {
             );
             assert!(matches!(
                 &picker.target,
-                PickerTarget::Automation { name, declared: None, .. } if name == "paused"
+                PickerTarget::Job { name, declared: None, .. } if name == "paused"
             ));
 
             fx.select("explicit");
-            open_automation_model_picker(&mut fx.app);
+            open_job_model_picker(&mut fx.app);
             let picker = fx.app.model_picker.as_ref().unwrap();
             assert_eq!(picker.chosen_model, "claude-cli:claude-sonnet-5");
             assert!(matches!(
                 &picker.target,
-                PickerTarget::Automation { declared: Some(model), .. }
+                PickerTarget::Job { declared: Some(model), .. }
                     if model == "claude-cli:claude-sonnet-5@low"
             ));
         }
@@ -988,7 +1329,7 @@ mod tests {
         fn cancel_writes_nothing() {
             let mut fx = Fixture::new();
             fx.select("paused");
-            open_automation_model_picker(&mut fx.app);
+            open_job_model_picker(&mut fx.app);
             handle_model_picker_key(&mut fx.app, KeyCode::Enter);
             assert!(fx.app.model_picker.as_ref().unwrap().phase == PickerPhase::Thinking);
             handle_model_picker_key(&mut fx.app, KeyCode::Esc);
@@ -1001,7 +1342,7 @@ mod tests {
         fn inherited_becomes_explicit_then_resets_keeping_the_file() {
             let mut fx = Fixture::new();
             fx.select("paused");
-            open_automation_model_picker(&mut fx.app);
+            open_job_model_picker(&mut fx.app);
             let loader = fx.loader();
             save_model_with(
                 &mut fx.app,
@@ -1016,21 +1357,25 @@ mod tests {
                     "timeout_secs: 60\nmodel: \"stepfun:step-3.7-flash@low\"\n---"
                 )
             );
-            let selected = &fx.app.automations[fx.app.selected_index];
+            let selected = &fx.app.jobs[fx.app.selected_index];
             assert_eq!(selected.name, "paused");
             let model = &selected.settings.as_ref().unwrap().model;
             assert_eq!(model.spec, "stepfun:step-3.7-flash@low");
-            assert_eq!(model.origin, SettingOrigin::Automation);
-            assert!(selected.schedule.is_none(), "paused job stays paused");
+            assert_eq!(model.origin, SettingOrigin::Job);
+            assert_eq!(
+                selected.schedule,
+                Some(JobSchedule::Manual),
+                "paused job stays paused"
+            );
             assert!(
                 fx.app
                     .status_message
-                    .contains("now stepfun:step-3.7-flash@low (set by automation)"),
+                    .contains("now stepfun:step-3.7-flash@low (set by job)"),
                 "{}",
                 fx.app.status_message
             );
 
-            let target = PickerTarget::Automation {
+            let target = PickerTarget::Job {
                 name: "paused".to_string(),
                 path: selected.path.clone(),
                 declared: selected.declared_model.clone(),
@@ -1038,7 +1383,7 @@ mod tests {
             let loader = fx.loader();
             edit_model_with(&mut fx.app, &target, ModelEdit::Clear, loader);
             assert_eq!(fx.file("paused"), PAUSED);
-            let selected = &fx.app.automations[fx.app.selected_index];
+            let selected = &fx.app.jobs[fx.app.selected_index];
             assert_eq!(selected.name, "paused");
             assert_eq!(
                 selected.settings.as_ref().unwrap().model.origin,
@@ -1051,7 +1396,7 @@ mod tests {
         fn reset_on_inherited_job_is_a_no_op() {
             let mut fx = Fixture::new();
             fx.select("paused");
-            assert!(handle_automations_key(&mut fx.app, KeyCode::Char('d')));
+            assert!(handle_jobs_key(&mut fx.app, KeyCode::Char('d')));
             assert!(fx.app.status_message.contains("already inherits"));
             assert_eq!(fx.file("paused"), PAUSED);
         }
@@ -1060,7 +1405,7 @@ mod tests {
         fn concurrent_change_fails_visibly_and_keeps_the_new_file() {
             let mut fx = Fixture::new();
             fx.select("explicit");
-            open_automation_model_picker(&mut fx.app);
+            open_job_model_picker(&mut fx.app);
             let changed = EXPLICIT.replace("claude-sonnet-5@low", "claude-sonnet-5@max");
             fs::write(fx.dir.join("explicit.md"), &changed).unwrap();
 
@@ -1077,7 +1422,7 @@ mod tests {
                 "{}",
                 fx.app.status_message
             );
-            let selected = &fx.app.automations[fx.app.selected_index];
+            let selected = &fx.app.jobs[fx.app.selected_index];
             assert_eq!(selected.name, "explicit");
             assert_eq!(
                 selected.declared_model.as_deref(),
@@ -1089,7 +1434,7 @@ mod tests {
         fn picker_renders_in_a_narrow_terminal() {
             let mut fx = Fixture::new();
             fx.select("paused");
-            open_automation_model_picker(&mut fx.app);
+            open_job_model_picker(&mut fx.app);
             let picker = fx.app.model_picker.as_ref().unwrap();
             let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
             terminal
@@ -1100,7 +1445,7 @@ mod tests {
                 .flat_map(|y| (0..buffer.area.width).map(move |x| (x, y)))
                 .map(|(x, y)| buffer.cell((x, y)).unwrap().symbol().to_string())
                 .collect();
-            assert!(text.contains("automation"), "{text}");
+            assert!(text.contains("job"), "{text}");
             assert!(text.contains("filter"), "{text}");
         }
     }

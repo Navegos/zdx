@@ -64,7 +64,7 @@ impl Service {
         let root = root.to_string_lossy().to_string();
         match self {
             Self::Bot => vec!["--root".into(), root, "bot".into()],
-            Self::Daemon => vec!["--root".into(), root, "automations".into(), "daemon".into()],
+            Self::Daemon => vec!["--root".into(), root, "jobs".into(), "daemon".into()],
         }
     }
 
@@ -781,7 +781,7 @@ mod tests {
     }
 
     #[test]
-    fn daemon_plist_runs_automations_daemon() {
+    fn daemon_plist_runs_jobs_daemon() {
         let plist = render_plist(
             Service::Daemon,
             Path::new("/Users/x/.local/bin/zdx"),
@@ -789,7 +789,7 @@ mod tests {
         );
         assert!(plist.contains("<string>dev.zdx.daemon</string>"));
         assert!(plist.contains(
-            "<string>exec '/Users/x/.local/bin/zdx' '--root' '/Users/x/projects/zdx' 'automations' 'daemon'</string>"
+            "<string>exec '/Users/x/.local/bin/zdx' '--root' '/Users/x/projects/zdx' 'jobs' 'daemon'</string>"
         ));
         assert!(plist.contains("daemon.err"));
     }

@@ -823,9 +823,9 @@ pub enum PickerTarget {
     /// The Config tab field in `ModelPickerState::field`, in the current
     /// write target.
     Config,
-    /// The `model:` of one automation file. `declared` is the value on disk
+    /// The `model:` of one job file. `declared` is the value on disk
     /// when the picker opened; the save refuses if it changed since.
-    Automation {
+    Job {
         name: String,
         path: PathBuf,
         declared: Option<String>,
@@ -1062,9 +1062,9 @@ fn commit_model_picker(app: &mut MonitorApp) {
     let field = picker.field.clone();
     let model = picker.chosen_model.clone();
     let level = picker.selected_thinking();
-    if let PickerTarget::Automation { .. } = picker.target {
+    if let PickerTarget::Job { .. } = picker.target {
         let spec = zdx_engine::models::format_model_thinking(&model, level);
-        crate::tabs::automations::save_picked_model(app, &spec);
+        crate::tabs::jobs::save_picked_model(app, &spec);
         return;
     }
 

@@ -1,6 +1,6 @@
 # Delivery Patterns Reference
 
-Detailed guidance for automation delivery channels, shell reliability, and multi-step delivery flows. Referenced from the main automations SKILL.md.
+Detailed guidance for job delivery channels, shell reliability, and multi-step delivery flows. Referenced from the main jobs SKILL.md.
 
 ## General Delivery Principles
 
@@ -19,7 +19,7 @@ Detailed guidance for automation delivery channels, shell reliability, and multi
 - Channel/provider: <telegram | whatsapp | email | slack | ...>
 - Target: <chat id / phone / email / webhook / file path>
 - Topic/thread policy: <reuse-existing | create-per-run> (if applicable)
-- If delivery fails: report the delivery error clearly; run output remains in the automation thread.
+- If delivery fails: report the delivery error clearly; run output remains in the job thread.
 ```
 
 ### Reliability patterns
@@ -27,7 +27,7 @@ Detailed guidance for automation delivery channels, shell reliability, and multi
 - Prefer first-party tooling/skills over raw API calls when available.
 - For multi-step delivery flows, explicitly capture and reuse IDs from prior steps.
 - If one data source fails, continue with available sources unless user requested strict failure.
-- Always include a fallback: run output is persisted to the automation thread regardless of delivery success.
+- Always include a fallback: run output is persisted to the job thread regardless of delivery success.
 
 ## Channel-Specific Guidance
 
@@ -53,7 +53,7 @@ Example delivery block:
 - Steps:
   1. Create topic in the target chat.
   2. Send formatted report to the new topic.
-- If topic creation fails: report error; run output remains in automation thread.
+- If topic creation fails: report error; run output remains in job thread.
 - If message send fails: report error with response details.
 ```
 
@@ -70,7 +70,7 @@ Example delivery block:
 
 - Channel: WhatsApp (use `wacli` skill)
 - Target: <phone number or group name>
-- If delivery fails: report error; run output remains in automation thread.
+- If delivery fails: report error; run output remains in job thread.
 ```
 
 ### Email (Gmail)
@@ -87,12 +87,12 @@ Example delivery block:
 - Channel: email (use `gog` skill)
 - Target: <email address>
 - Subject format: `<Report Name> - YYYY-MM-DD`
-- If delivery fails: report error; run output remains in automation thread.
+- If delivery fails: report error; run output remains in job thread.
 ```
 
 ## Multi-Channel Delivery
 
-When an automation delivers to multiple channels:
+When a job delivers to multiple channels:
 
 1. Define a primary and fallback channel.
 2. Attempt primary first.
@@ -106,7 +106,7 @@ When an automation delivers to multiple channels:
 - Fallback: email via `gog` to <address>
 - Attempt primary first. If it fails, attempt fallback.
 - Report delivery status for each channel.
-- Run output always remains in automation thread regardless of delivery outcome.
+- Run output always remains in job thread regardless of delivery outcome.
 ```
 
 ## Shell Reliability

@@ -37,7 +37,7 @@ use zdx_engine::providers::ReplayToken;
 use zdx_engine::providers::subscription_quota::{self, QuotaError, SubscriptionQuota};
 use zdx_engine::service::{self, Service};
 use zdx_engine::workspace_config::{self, WorkspaceReport};
-use zdx_engine::{agent_activity, automations, background_activity};
+use zdx_engine::{agent_activity, background_activity, jobs};
 
 const INIT_DATA_MAX_AGE_SECS: u64 = 60 * 60;
 const INIT_DATA_FUTURE_SKEW_SECS: u64 = 30;
@@ -437,7 +437,10 @@ struct MonitorResponse {
     services: Vec<MonitorService>,
     active_agents: Vec<MonitorAgent>,
     background_processes: Vec<MonitorBackgroundProcess>,
-    automations: Vec<MonitorAutomation>,
+    /// Shared job summaries (`zdx_engine::jobs::summaries`).
+    jobs: Vec<jobs::JobSummary>,
+    /// Set when jobs could not be listed at all.
+    jobs_error: Option<String>,
     config: MonitorConfig,
     usage: Option<MonitorUsage>,
     subscriptions: Vec<MonitorSubscription>,
@@ -485,12 +488,6 @@ struct MonitorBackgroundProcess {
     thread_id: Option<String>,
     command: String,
     uptime: String,
-}
-
-#[derive(Clone, Serialize)]
-struct MonitorAutomation {
-    name: String,
-    schedule: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -2400,7 +2397,7 @@ async fn get_monitor(
 }
 
 /// Builds (or reuses) the local part of the dashboard: services, agents,
-/// automations, config and usage. Everything here is local state, so it is
+/// jobs, config and usage. Everything here is local state, so it is
 /// cached for [`MONITOR_CACHE_TTL`] and never waits on the network.
 ///
 /// Quotas are deliberately *not* cached with it — they are overlaid per request
@@ -2501,14 +2498,10 @@ fn build_monitor_response(root: &FilePath) -> anyhow::Result<MonitorResponse> {
         })
         .collect();
 
-    let automations = automations::discover(root)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|automation| MonitorAutomation {
-            name: automation.name,
-            schedule: automation.schedule,
-        })
-        .collect();
+    let (jobs, jobs_error) = match jobs::summaries(&jobs::JobsHome::current(), chrono::Utc::now()) {
+        Ok(jobs) => (jobs, None),
+        Err(error) => (Vec::new(), Some(format!("{error:#}"))),
+    };
 
     let usage = usage_stats::aggregate_usage(
         &config.model,
@@ -2526,7 +2519,8 @@ fn build_monitor_response(root: &FilePath) -> anyhow::Result<MonitorResponse> {
         services,
         active_agents,
         background_processes,
-        automations,
+        jobs,
+        jobs_error,
         config: monitor_config(&config),
         usage,
         subscriptions: Vec::new(),

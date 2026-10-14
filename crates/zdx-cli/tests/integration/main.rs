@@ -6,11 +6,12 @@
 
 mod fixtures;
 
-mod automations_run;
 mod cli_help;
 mod config_path;
 mod custom_provider_api;
 mod exec_subagent;
+mod jobs_run;
+mod jobs_schedule;
 mod login_logout;
 mod memory_embed;
 mod memory_relevance;

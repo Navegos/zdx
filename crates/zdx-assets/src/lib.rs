@@ -45,14 +45,14 @@ pub const PROMPT_PARTIALS: &[(&str, &str)] = &[
     ),
 ];
 
-/// Appended to a named subagent's prompt when it runs non-interactively (automation
+/// Appended to a named subagent's prompt when it runs non-interactively (job
 /// `subagent:`): project instructions, Safety/Git rules, and runtime layers.
 pub const NON_INTERACTIVE_SUBAGENT_SUFFIX_TEMPLATE: &str =
     include_str!("../prompts/non_interactive_subagent_suffix.md");
 
-/// Built-in instruction layer for headless automation behavior.
-pub const AUTOMATION_INSTRUCTION_LAYER: &str =
-    include_str!("../instruction_layers/automation_instruction_layer.md");
+/// Built-in instruction layer for headless job behavior.
+pub const JOB_INSTRUCTION_LAYER: &str =
+    include_str!("../instruction_layers/job_instruction_layer.md");
 
 /// Instruction layer for non-interactive exec mode.
 pub const EXEC_INSTRUCTION_LAYER: &str =

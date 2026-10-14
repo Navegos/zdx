@@ -1,27 +1,40 @@
-//! Automation discovery and parsing.
+//! Jobs: saved prompts that run unattended, manually, on a recurring cron
+//! schedule, or once at a set time.
 //!
-//! Automations are markdown files with YAML frontmatter and prompt body.
+//! A job is one markdown file in `$ZDX_HOME/jobs/` with YAML frontmatter and a
+//! prompt body. This module parses and resolves definitions; [`schedule`]
+//! owns schedules and occurrences, [`store`] the durable state, [`plan`] the
+//! scheduler's per-tick decisions, and [`migrate`] the move from the old
+//! `automations` layout.
+
+pub mod migrate;
+pub mod plan;
+pub mod schedule;
+pub mod store;
 
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use chrono::{DateTime, Datelike, Local, Timelike};
+use chrono::{DateTime, Local, TimeDelta, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 
+pub use self::schedule::{JobSchedule, ScheduleKind};
+use self::schedule::{MAX_GRACE_SECS, MIN_GRACE_SECS, next_recurring_after, once_occurrence};
+pub use self::store::{ArchivedJob, JobsHome, LastRun, Outcome, RunTrigger};
 use crate::config::{Config, paths};
 use crate::models::ModelSpec;
 use crate::subagents::{self, SubagentDefinition};
 
-/// Source location for an automation definition.
+/// Source location for a job definition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AutomationSource {
-    /// `<ZDX_HOME>/automations/*.md`
+pub enum JobSource {
+    /// `<ZDX_HOME>/jobs/*.md`
     User,
 }
 
-impl AutomationSource {
+impl JobSource {
     /// Returns a short display label.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -31,24 +44,26 @@ impl AutomationSource {
     }
 }
 
-/// Parsed automation definition.
+/// Parsed job definition.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AutomationDefinition {
-    /// Stable automation name (file stem).
+pub struct JobDefinition {
+    /// Stable job name (file stem).
     pub name: String,
     /// Absolute path to the source markdown file.
     pub path: PathBuf,
-    /// Which directory this automation came from.
-    pub source: AutomationSource,
-    /// Optional schedule expression.
-    pub schedule: Option<String>,
-    /// Optional model override for this automation run.
+    /// Which directory this job came from.
+    pub source: JobSource,
+    /// When the job runs.
+    pub schedule: JobSchedule,
+    /// Declared `grace_secs`; [`JobDefinition::grace`] applies the default.
+    pub grace_secs: Option<u32>,
+    /// Optional model override for this job run.
     pub model: Option<String>,
-    /// Optional named subagent for this automation run.
+    /// Optional named subagent for this job run.
     pub subagent: Option<String>,
     /// Optional working root, as written in frontmatter (`~/...` or absolute).
     /// Expanded and checked by [`resolve_run`], so a bad root fails only this
-    /// automation instead of discovery.
+    /// job instead of discovery.
     pub root: Option<String>,
     /// Optional per-run timeout in seconds.
     pub timeout_secs: Option<u32>,
@@ -60,8 +75,10 @@ pub struct AutomationDefinition {
 
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
-struct AutomationFrontmatter {
+struct JobFrontmatter {
     schedule: Option<String>,
+    run_at: Option<String>,
+    grace_secs: Option<u32>,
     model: Option<String>,
     subagent: Option<String>,
     root: Option<String>,
@@ -69,12 +86,12 @@ struct AutomationFrontmatter {
     max_retries: Option<u32>,
 }
 
-/// Which layer supplied a resolved automation setting.
+/// Which layer supplied a resolved job setting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SettingOrigin {
-    /// The automation's own frontmatter.
-    Automation,
+    /// The job's own frontmatter.
+    Job,
     /// The named subagent definition's `model`.
     Subagent,
     /// `[subagents.overrides.<name>]` in config.
@@ -83,10 +100,10 @@ pub enum SettingOrigin {
     /// config, or the declared root's layers when `root` is set.
     Config,
     /// Inherited from the caller's root: the process that resolved the
-    /// settings (`zdx automations run|validate|list --root`).
+    /// settings (`zdx jobs run|validate|list --root`).
     Caller,
     /// Inherited from the scheduled daemon's root (see
-    /// [`crate::automation_daemon`]), whichever process asks.
+    /// [`crate::job_daemon`]), whichever process asks.
     Daemon,
 }
 
@@ -95,7 +112,7 @@ impl SettingOrigin {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Automation => "automation",
+            Self::Job => "job",
             Self::Subagent => "subagent",
             Self::SubagentOverride => "subagent_override",
             Self::Config => "config",
@@ -104,7 +121,7 @@ impl SettingOrigin {
         }
     }
 
-    /// Whether the value was inherited rather than set for this automation
+    /// Whether the value was inherited rather than set for this job
     /// or its subagent.
     #[must_use]
     pub const fn is_inherited(self) -> bool {
@@ -112,18 +129,18 @@ impl SettingOrigin {
     }
 }
 
-/// The working root an automation runs in.
+/// The working root a job runs in.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct ResolvedAutomationRoot {
+pub struct ResolvedJobRoot {
     pub path: PathBuf,
-    /// `Automation` when set in frontmatter, otherwise the inherited context's
+    /// `Job` when set in frontmatter, otherwise the inherited context's
     /// origin (`Caller` or `Daemon`).
     pub origin: SettingOrigin,
 }
 
-/// The model an automation runs with.
+/// The model a job runs with.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct ResolvedAutomationModel {
+pub struct ResolvedJobModel {
     /// Canonical spec with the thinking level inline, e.g.
     /// `claude-cli@work:claude-opus-5-5@high`.
     pub spec: String,
@@ -143,39 +160,202 @@ pub struct ResolvedAutomationModel {
     pub thinking_origin: SettingOrigin,
 }
 
-/// Resolved settings for one automation, shared by every surface.
+/// Resolved settings for one job, shared by every surface.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct AutomationRunSettings {
-    pub root: ResolvedAutomationRoot,
-    pub model: ResolvedAutomationModel,
+pub struct JobRunSettings {
+    pub root: ResolvedJobRoot,
+    pub model: ResolvedJobModel,
     pub subagent: Option<String>,
 }
 
-/// A resolved automation run: the config to run with plus its reported settings.
+/// A resolved job run: the config to run with plus its reported settings.
 #[derive(Debug, Clone)]
-pub struct ResolvedAutomationRun {
+pub struct ResolvedJobRun {
     pub config: Config,
     pub subagent: Option<SubagentDefinition>,
-    pub settings: AutomationRunSettings,
+    pub settings: JobRunSettings,
 }
 
-/// Declared and resolved view of one automation for listing surfaces.
+/// Where a job stands now, derived from its schedule and durable state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobStatus {
+    /// The file does not parse; the job cannot run.
+    Invalid,
+    /// No schedule: runs only with `zdx jobs run`.
+    Manual,
+    /// Recurring; `next_run_at` is the next occurrence.
+    Scheduled,
+    /// Once; `run_at` is in the future.
+    Pending,
+    /// Once; `run_at` passed and the job is still within its grace.
+    Due,
+    /// Once; past its grace without a run. The scheduler records it as
+    /// missed and archives it.
+    Expired,
+    /// A run holds the job's lock.
+    Running,
+    /// Once; its run stopped without a result. The scheduler records it as
+    /// interrupted and archives it.
+    Interrupted,
+    /// Once; its occurrence already has a final outcome (see `last_run`).
+    Finished,
+}
+
+impl JobStatus {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Invalid => "invalid",
+            Self::Manual => "manual",
+            Self::Scheduled => "scheduled",
+            Self::Pending => "pending",
+            Self::Due => "due",
+            Self::Expired => "expired",
+            Self::Running => "running",
+            Self::Interrupted => "interrupted",
+            Self::Finished => "finished",
+        }
+    }
+}
+
+/// Live state of one job, shared by every listing surface.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct AutomationOverview {
+pub struct JobState {
+    pub status: JobStatus,
+    /// Next scheduled instant: the next recurring occurrence, or `run_at` of
+    /// a once job that has not run yet (in the past while due or expired).
+    pub next_run_at: Option<DateTime<Utc>>,
+    /// Latest final outcome, from any trigger.
+    pub last_run: Option<LastRun>,
+}
+
+impl JobState {
+    fn invalid() -> Self {
+        Self {
+            status: JobStatus::Invalid,
+            next_run_at: None,
+            last_run: None,
+        }
+    }
+}
+
+/// Derives `job`'s live state from its schedule, claim, lock, and last
+/// outcome. Reads a few small files; no scan.
+#[must_use]
+pub fn job_state<Tz: TimeZone>(
+    home: &JobsHome,
+    job: &JobDefinition,
+    now: DateTime<Utc>,
+    tz: &Tz,
+) -> JobState {
+    let mut last_run = home.last_run(&job.name);
+    let running = home.is_job_running(&job.name);
+    let (status, next_run_at) = match &job.schedule {
+        JobSchedule::Manual => (JobStatus::Manual, None),
+        JobSchedule::Recurring { parsed, .. } => {
+            (JobStatus::Scheduled, next_recurring_after(parsed, now, tz))
+        }
+        JobSchedule::Once { run_at } => {
+            let occurrence = once_occurrence(*run_at);
+            let claim = home.read_claim(&job.name, &occurrence.key).ok().flatten();
+            // The final claim wins over a `last.json` a crash left stale.
+            last_run =
+                store::newer_last_run(last_run, claim.as_ref().and_then(store::Claim::to_last_run));
+            let status = match claim {
+                Some(claim) if claim.outcome.is_some() => JobStatus::Finished,
+                Some(_) if running => JobStatus::Running,
+                Some(_) => JobStatus::Interrupted,
+                None if occurrence.at > now => JobStatus::Pending,
+                None if job
+                    .grace()
+                    .is_some_and(|grace| now - occurrence.at <= grace) =>
+                {
+                    JobStatus::Due
+                }
+                None => JobStatus::Expired,
+            };
+            let next = matches!(
+                status,
+                JobStatus::Pending | JobStatus::Due | JobStatus::Expired
+            )
+            .then_some(occurrence.at);
+            (status, next)
+        }
+    };
+    let status = if running && status != JobStatus::Finished {
+        JobStatus::Running
+    } else {
+        status
+    };
+    JobState {
+        status,
+        next_run_at,
+        last_run,
+    }
+}
+
+/// Short listing of one job without resolving its model or root, for
+/// surfaces that refresh often (the Mini App).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct JobSummary {
+    pub name: String,
+    /// `None` when the file is invalid.
+    pub schedule: Option<JobSchedule>,
+    #[serde(flatten)]
+    pub state: JobState,
+    pub error: Option<String>,
+}
+
+/// Summaries of every job file, valid or not.
+///
+/// # Errors
+/// Returns an error when the jobs directory cannot be listed or the legacy
+/// `automations` directory still holds job files.
+pub fn summaries(home: &JobsHome, now: DateTime<Utc>) -> Result<Vec<JobSummary>> {
+    let catalog = catalog(home)?;
+    let mut out: Vec<JobSummary> = catalog
+        .jobs
+        .iter()
+        .map(|job| JobSummary {
+            name: job.name.clone(),
+            schedule: Some(job.schedule.clone()),
+            state: job_state(home, job, now, &Local),
+            error: None,
+        })
+        .chain(catalog.invalid.iter().map(|invalid| JobSummary {
+            name: invalid.name.clone(),
+            schedule: None,
+            state: JobState::invalid(),
+            error: Some(invalid.error.clone()),
+        }))
+        .collect();
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(out)
+}
+
+/// Declared and resolved view of one job for listing surfaces.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct JobOverview {
     pub name: String,
     pub path: PathBuf,
-    pub schedule: Option<String>,
+    /// `None` when the file is invalid; `error` then says why.
+    pub schedule: Option<JobSchedule>,
+    /// Effective grace in seconds; `None` for manual and invalid jobs.
+    pub grace_secs: Option<u32>,
+    #[serde(flatten)]
+    pub state: JobState,
     pub declared_root: Option<String>,
     pub declared_model: Option<String>,
     pub subagent: Option<String>,
     pub timeout_secs: Option<u32>,
     pub max_retries: u32,
     /// `None` when resolution failed; `error` then says why.
-    pub settings: Option<AutomationRunSettings>,
+    pub settings: Option<JobRunSettings>,
     pub error: Option<String>,
 }
 
-/// The config and root an automation without its own `root` inherits.
+/// The config and root a job without its own `root` inherits.
 #[derive(Debug, Clone, Copy)]
 pub struct InheritedContext<'a> {
     pub config: &'a Config,
@@ -184,13 +364,13 @@ pub struct InheritedContext<'a> {
     pub root_origin: SettingOrigin,
 }
 
-/// Resolves the root, config, subagent, and model one automation runs with.
+/// Resolves the root, config, subagent, and model one job runs with.
 ///
 /// `base` and `caller_root` are the caller's config and root. Without a
 /// `root` in frontmatter the run uses both unchanged. With one, the root must
 /// be an existing directory and config layers are loaded for that root, so
 /// its workspace overlays apply. Model layers apply in order: config →
-/// subagent definition → `[subagents.overrides.<name>]` → automation `model`;
+/// subagent definition → `[subagents.overrides.<name>]` → job `model`;
 /// a suffixless spec inherits the previous thinking level.
 ///
 /// # Errors
@@ -199,44 +379,44 @@ pub struct InheritedContext<'a> {
 pub fn resolve_run(
     base: &Config,
     caller_root: &Path,
-    automation: &AutomationDefinition,
-) -> Result<ResolvedAutomationRun> {
+    job: &JobDefinition,
+) -> Result<ResolvedJobRun> {
     resolve_run_from(
         Ok(InheritedContext {
             config: base,
             root: caller_root,
             root_origin: SettingOrigin::Caller,
         }),
-        automation,
+        job,
     )
 }
 
 /// Like [`resolve_run`], with the inherited context supplied by the caller.
-/// `Err(reason)` means no inherited context is known: an automation that
+/// `Err(reason)` means no inherited context is known: a job that
 /// declares its own `root` still resolves, any other fails with `reason`.
 ///
 /// # Errors
-/// As [`resolve_run`], plus `reason` for an automation that needs the
+/// As [`resolve_run`], plus `reason` for a job that needs the
 /// missing inherited context.
 pub fn resolve_run_from(
     inherited: std::result::Result<InheritedContext<'_>, &str>,
-    automation: &AutomationDefinition,
-) -> Result<ResolvedAutomationRun> {
-    let (root, mut config) = if let Some(raw) = automation.root.as_deref() {
+    job: &JobDefinition,
+) -> Result<ResolvedJobRun> {
+    let (root, mut config) = if let Some(raw) = job.root.as_deref() {
         let path = resolve_declared_root(raw, paths::home_dir().as_deref())?;
         let config = Config::load_layered(&paths::config_layer_paths_for(&path))
             .with_context(|| format!("load config for root {}", path.display()))?;
         (
-            ResolvedAutomationRoot {
+            ResolvedJobRoot {
                 path,
-                origin: SettingOrigin::Automation,
+                origin: SettingOrigin::Job,
             },
             config,
         )
     } else {
         let inherited = inherited.map_err(|reason| anyhow::anyhow!("{reason}"))?;
         (
-            ResolvedAutomationRoot {
+            ResolvedJobRoot {
                 path: inherited.root.to_path_buf(),
                 origin: inherited.root_origin,
             },
@@ -254,7 +434,7 @@ pub fn resolve_run_from(
         }
     };
 
-    let subagent = match automation.subagent.as_deref() {
+    let subagent = match job.subagent.as_deref() {
         Some(name) => {
             let definition = subagents::resolve_named(&root.path, name, None)
                 .with_context(|| format!("load subagent '{name}'"))?;
@@ -273,74 +453,98 @@ pub fn resolve_run_from(
         }
         None => None,
     };
-    if let Some(model) = automation.model.as_deref() {
-        apply(&mut config, model, SettingOrigin::Automation);
+    if let Some(model) = job.model.as_deref() {
+        apply(&mut config, model, SettingOrigin::Job);
     }
 
     let model = describe_model(&config, model_origin, thinking_origin);
-    Ok(ResolvedAutomationRun {
+    Ok(ResolvedJobRun {
         config,
         subagent,
-        settings: AutomationRunSettings {
+        settings: JobRunSettings {
             root,
             model,
-            subagent: automation.subagent.clone(),
+            subagent: job.subagent.clone(),
         },
     })
 }
 
-/// Resolves only the reported settings of one automation.
+/// Resolves only the reported settings of one job.
 ///
 /// # Errors
 /// Same as [`resolve_run`].
 pub fn resolve_run_settings(
     base: &Config,
     caller_root: &Path,
-    automation: &AutomationDefinition,
-) -> Result<AutomationRunSettings> {
-    resolve_run(base, caller_root, automation).map(|run| run.settings)
+    job: &JobDefinition,
+) -> Result<JobRunSettings> {
+    resolve_run(base, caller_root, job).map(|run| run.settings)
 }
 
-/// Builds the listing view of one automation. Resolution errors are kept in
-/// `error` so one bad automation does not hide the others.
+/// Builds the listing view of one job, resolved for the caller. Resolution
+/// errors are kept in `error` so one bad job does not hide the others.
 #[must_use]
 pub fn overview(
     base: &Config,
     caller_root: &Path,
-    automation: &AutomationDefinition,
-) -> AutomationOverview {
+    home: &JobsHome,
+    job: &JobDefinition,
+) -> JobOverview {
     overview_from(
         Ok(InheritedContext {
             config: base,
             root: caller_root,
             root_origin: SettingOrigin::Caller,
         }),
-        automation,
+        job,
+        job_state(home, job, Utc::now(), &Local),
     )
 }
 
 /// Like [`overview`], with the inherited context supplied by the caller (see
-/// [`resolve_run_from`]).
+/// [`resolve_run_from`]) and the job's live state.
 #[must_use]
 pub fn overview_from(
     inherited: std::result::Result<InheritedContext<'_>, &str>,
-    automation: &AutomationDefinition,
-) -> AutomationOverview {
-    let (settings, error) = match resolve_run_from(inherited, automation) {
+    job: &JobDefinition,
+    state: JobState,
+) -> JobOverview {
+    let (settings, error) = match resolve_run_from(inherited, job) {
         Ok(run) => (Some(run.settings), None),
         Err(error) => (None, Some(format!("{error:#}"))),
     };
-    AutomationOverview {
-        name: automation.name.clone(),
-        path: automation.path.clone(),
-        schedule: automation.schedule.clone(),
-        declared_root: automation.root.clone(),
-        declared_model: automation.model.clone(),
-        subagent: automation.subagent.clone(),
-        timeout_secs: automation.timeout_secs,
-        max_retries: automation.max_retries,
+    JobOverview {
+        name: job.name.clone(),
+        path: job.path.clone(),
+        schedule: Some(job.schedule.clone()),
+        grace_secs: job.effective_grace_secs(),
+        state,
+        declared_root: job.root.clone(),
+        declared_model: job.model.clone(),
+        subagent: job.subagent.clone(),
+        timeout_secs: job.timeout_secs,
+        max_retries: job.max_retries,
         settings,
         error,
+    }
+}
+
+/// The listing view of a job file that does not parse.
+#[must_use]
+pub fn invalid_overview(invalid: &InvalidJob) -> JobOverview {
+    JobOverview {
+        name: invalid.name.clone(),
+        path: invalid.path.clone(),
+        schedule: None,
+        grace_secs: None,
+        state: JobState::invalid(),
+        declared_root: None,
+        declared_model: None,
+        subagent: None,
+        timeout_secs: None,
+        max_retries: 0,
+        settings: None,
+        error: Some(invalid.error.clone()),
     }
 }
 
@@ -380,7 +584,7 @@ fn describe_model(
     config: &Config,
     origin: SettingOrigin,
     thinking_origin: SettingOrigin,
-) -> ResolvedAutomationModel {
+) -> ResolvedJobModel {
     let spec = crate::models::format_model_thinking(&config.model, config.thinking_level);
     let parsed = ModelSpec::parse(&spec);
     let (provider, account, model) =
@@ -400,7 +604,7 @@ fn describe_model(
                 selection.model,
             )
         };
-    ResolvedAutomationModel {
+    ResolvedJobModel {
         provider,
         account,
         model,
@@ -412,127 +616,124 @@ fn describe_model(
     }
 }
 
-/// Discovers and parses automations from user-global directory.
-///
-/// Scans:
-/// - `<ZDX_HOME>/automations/*.md`
-///
-/// # Errors
-/// Returns an error if parsing fails, duplicate names are found, or I/O fails.
-pub fn discover(root: &Path) -> Result<Vec<AutomationDefinition>> {
-    let user_dir = paths::zdx_home().join("automations");
-    discover_with_user_dir(root, &user_dir)
+impl JobDefinition {
+    /// Effective grace in seconds; `None` for manual jobs.
+    #[must_use]
+    pub fn effective_grace_secs(&self) -> Option<u32> {
+        match self.schedule {
+            JobSchedule::Manual => None,
+            _ => self.grace_secs.or(self.schedule.default_grace_secs()),
+        }
+    }
+
+    /// Effective grace; `None` for manual jobs.
+    #[must_use]
+    pub fn grace(&self) -> Option<TimeDelta> {
+        self.effective_grace_secs()
+            .map(|secs| TimeDelta::seconds(i64::from(secs)))
+    }
 }
 
-/// Discovers and parses automations with an explicit user automations directory.
-///
-/// Intended for testing without env-var mutation.
-///
-/// # Errors
-/// Returns an error if parsing fails, duplicate names are found, or I/O fails.
-pub fn discover_with_user_dir(root: &Path, user_dir: &Path) -> Result<Vec<AutomationDefinition>> {
-    let _ = root;
-    let mut entries: Vec<(PathBuf, AutomationSource)> = Vec::new();
-    collect_markdown_files(user_dir, AutomationSource::User, &mut entries)?;
+/// A job file that does not parse. It fails alone: the other jobs still run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct InvalidJob {
+    pub name: String,
+    pub path: PathBuf,
+    pub error: String,
+}
 
-    let mut by_name: BTreeMap<String, AutomationDefinition> = BTreeMap::new();
-    for (path, source) in entries {
-        let definition = parse_automation_file(&path, source)
-            .with_context(|| format!("parse automation {}", path.display()))?;
+/// Every job file in `$ZDX_HOME/jobs/`, split into valid and invalid.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct JobCatalog {
+    /// Valid jobs, sorted by name.
+    pub jobs: Vec<JobDefinition>,
+    /// Files that failed to parse, sorted by name.
+    pub invalid: Vec<InvalidJob>,
+}
 
-        if let Some(existing) = by_name.get(&definition.name) {
+impl JobCatalog {
+    /// Finds a job by name, or explains why it cannot run.
+    ///
+    /// # Errors
+    /// Returns an error when the name is empty, unknown, or its file is
+    /// invalid.
+    pub fn find(&self, name: &str) -> Result<&JobDefinition> {
+        let name = name.trim();
+        if name.is_empty() {
+            bail!("Job name cannot be empty");
+        }
+        if let Some(job) = self.jobs.iter().find(|job| job.name == name) {
+            return Ok(job);
+        }
+        if let Some(invalid) = self.invalid.iter().find(|job| job.name == name) {
             bail!(
-                "Duplicate automation name '{}': '{}' and '{}'",
-                definition.name,
-                existing.path.display(),
-                definition.path.display()
+                "job '{name}' is invalid ({}): {}",
+                invalid.path.display(),
+                invalid.error
             );
         }
-
-        by_name.insert(definition.name.clone(), definition);
+        bail!("Job '{name}' not found")
     }
-
-    Ok(by_name.into_values().collect())
 }
 
-/// Loads one automation by file-stem name.
+/// Reads every job file in `home`. A file that does not parse is reported in
+/// [`JobCatalog::invalid`] and does not affect the others.
 ///
 /// # Errors
-/// Returns an error if discovery/parsing fails or the name is not found.
-pub fn load_by_name(root: &Path, name: &str) -> Result<AutomationDefinition> {
-    let user_dir = paths::zdx_home().join("automations");
-    load_by_name_with_user_dir(root, &user_dir, name)
+/// Returns an error when the jobs directory cannot be listed, or when the old
+/// `$ZDX_HOME/automations/` directory still holds job files (run
+/// `zdx jobs migrate`).
+pub fn catalog(home: &JobsHome) -> Result<JobCatalog> {
+    migrate::ensure_migrated(home)?;
+    let mut by_name: BTreeMap<String, JobDefinition> = BTreeMap::new();
+    let mut invalid = Vec::new();
+    for path in markdown_files(&home.jobs_dir())? {
+        let name = file_stem(&path).unwrap_or_else(|_| path.display().to_string());
+        match parse_job_file(&path, JobSource::User) {
+            Ok(definition) => {
+                if let Some(existing) = by_name.get(&definition.name) {
+                    invalid.push(InvalidJob {
+                        name,
+                        path: path.clone(),
+                        error: format!(
+                            "duplicate job name: '{}' already defines it",
+                            existing.path.display()
+                        ),
+                    });
+                } else {
+                    by_name.insert(definition.name.clone(), definition);
+                }
+            }
+            Err(err) => invalid.push(InvalidJob {
+                name,
+                path,
+                error: format!("{err:#}"),
+            }),
+        }
+    }
+    invalid.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(JobCatalog {
+        jobs: by_name.into_values().collect(),
+        invalid,
+    })
 }
 
-/// Loads one automation by name with explicit user automations directory.
+/// Loads one valid job by file-stem name.
 ///
 /// # Errors
-/// Returns an error if discovery/parsing fails or the name is not found.
-pub fn load_by_name_with_user_dir(
-    root: &Path,
-    user_dir: &Path,
-    name: &str,
-) -> Result<AutomationDefinition> {
-    let trimmed = name.trim();
-    if trimmed.is_empty() {
-        bail!("Automation name cannot be empty");
-    }
-
-    let all = discover_with_user_dir(root, user_dir)?;
-    all.into_iter()
-        .find(|a| a.name == trimmed)
-        .ok_or_else(|| anyhow::anyhow!("Automation '{trimmed}' not found"))
+/// Returns an error when the catalog cannot be read or the job is unknown or
+/// invalid.
+pub fn load_by_name(home: &JobsHome, name: &str) -> Result<JobDefinition> {
+    catalog(home)?.find(name).cloned()
 }
 
-/// Returns whether a 5-field cron schedule matches the provided local time.
-///
-/// Supported field forms per position:
-/// - `*`
-/// - `N`
-/// - `*/N`
-/// - `A-B`
-/// - comma-separated combinations of the above
-///
-/// Cron fields order: minute hour day-of-month month day-of-week.
-/// Day-of-week accepts 0-6 (Sun-Sat), and 7 as Sunday.
-///
-/// # Errors
-/// Returns an error for invalid cron syntax/ranges.
-///
-/// # Panics
-/// Panics only if chrono returns invalid field values that do not fit in `i32`.
-pub fn schedule_matches_local_time(schedule: &str, now: DateTime<Local>) -> Result<bool> {
-    let fields: Vec<&str> = schedule.split_whitespace().collect();
-    if fields.len() != 5 {
-        bail!(
-            "Invalid schedule '{schedule}': expected 5 cron fields (minute hour day month weekday)"
-        );
-    }
-
-    let minute = i32::try_from(now.minute()).expect("minute in i32 range");
-    let hour = i32::try_from(now.hour()).expect("hour in i32 range");
-    let day = i32::try_from(now.day()).expect("day in i32 range");
-    let month = i32::try_from(now.month()).expect("month in i32 range");
-    let weekday = i32::try_from(now.weekday().num_days_from_sunday()).expect("weekday in range");
-
-    Ok(field_matches(fields[0], minute, 0, 59, false)?
-        && field_matches(fields[1], hour, 0, 23, false)?
-        && field_matches(fields[2], day, 1, 31, false)?
-        && field_matches(fields[3], month, 1, 12, false)?
-        && field_matches(fields[4], weekday, 0, 6, true)?)
-}
-
-fn collect_markdown_files(
-    dir: &Path,
-    source: AutomationSource,
-    out: &mut Vec<(PathBuf, AutomationSource)>,
-) -> Result<()> {
+/// Markdown files directly in `dir` (not recursive), sorted.
+pub(crate) fn markdown_files(dir: &Path) -> Result<Vec<PathBuf>> {
     if !dir.exists() {
-        return Ok(());
+        return Ok(Vec::new());
     }
-
     let mut files: Vec<PathBuf> = fs::read_dir(dir)
-        .with_context(|| format!("read automation dir {}", dir.display()))?
+        .with_context(|| format!("read job dir {}", dir.display()))?
         .filter_map(std::result::Result::ok)
         .map(|entry| entry.path())
         .filter(|path| {
@@ -543,56 +744,63 @@ fn collect_markdown_files(
                     .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
         })
         .collect();
-
     files.sort();
-    for path in files {
-        out.push((path, source));
-    }
-    Ok(())
+    Ok(files)
 }
 
-fn parse_automation_file(path: &Path, source: AutomationSource) -> Result<AutomationDefinition> {
-    let content = fs::read_to_string(path)
-        .with_context(|| format!("read automation file {}", path.display()))?;
-    parse_automation_content(path, &content, source)
+fn parse_job_file(path: &Path, source: JobSource) -> Result<JobDefinition> {
+    let content =
+        fs::read_to_string(path).with_context(|| format!("read job file {}", path.display()))?;
+    parse_job_content(path, &content, source)
 }
 
-fn parse_automation_content(
+pub(crate) fn parse_job_content(
     path: &Path,
     content: &str,
-    source: AutomationSource,
-) -> Result<AutomationDefinition> {
+    source: JobSource,
+) -> Result<JobDefinition> {
     let (yaml, body) = split_frontmatter(content)?;
 
-    let frontmatter: AutomationFrontmatter = if yaml.trim().is_empty() {
-        AutomationFrontmatter::default()
+    let frontmatter: JobFrontmatter = if yaml.trim().is_empty() {
+        JobFrontmatter::default()
     } else {
         serde_yaml::from_str(&yaml)
             .with_context(|| format!("parse YAML frontmatter in {}", path.display()))?
     };
 
     let name = file_stem(path)?;
-    let schedule = normalize_optional_string(frontmatter.schedule, "schedule")?;
+    let cron = normalize_optional_string(frontmatter.schedule, "schedule")?;
+    let run_at = normalize_optional_string(frontmatter.run_at, "run_at")?;
+    let schedule = JobSchedule::parse(cron.as_deref(), run_at.as_deref())?;
     let model = normalize_optional_string(frontmatter.model, "model")?;
     let subagent = normalize_optional_string(frontmatter.subagent, "subagent")?;
     // Root problems (including empty) are reported by `resolve_run`, so they
-    // fail only this automation rather than discovery of every automation.
+    // fail only this job rather than discovery of every job.
     let root = frontmatter.root.map(|raw| raw.trim().to_string());
 
     if matches!(frontmatter.timeout_secs, Some(0)) {
         bail!("timeout_secs must be greater than zero");
     }
+    if let Some(grace) = frontmatter.grace_secs {
+        if schedule == JobSchedule::Manual {
+            bail!("grace_secs needs `schedule` or `run_at`");
+        }
+        if !(MIN_GRACE_SECS..=MAX_GRACE_SECS).contains(&grace) {
+            bail!("grace_secs must be between {MIN_GRACE_SECS} and {MAX_GRACE_SECS}");
+        }
+    }
 
     let prompt = body.trim().to_string();
     if prompt.is_empty() {
-        bail!("Automation prompt body cannot be empty");
+        bail!("Job prompt body cannot be empty");
     }
 
-    Ok(AutomationDefinition {
+    Ok(JobDefinition {
         name,
         path: path.to_path_buf(),
         source,
         schedule,
+        grace_secs: frontmatter.grace_secs,
         model,
         subagent,
         root,
@@ -602,16 +810,16 @@ fn parse_automation_content(
     })
 }
 
-/// A change to an automation's declared `model`.
+/// A change to a job's declared `model`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelEdit<'a> {
     /// Set `model:` to this spec (`provider[@account]:model[@thinking][@fast]`).
     Set(&'a str),
-    /// Remove `model:`, so the automation inherits the model again.
+    /// Remove `model:`, so the job inherits the model again.
     Clear,
 }
 
-/// Changes the `model` key of the automation file at `path` and returns the
+/// Changes the `model` key of the job file at `path` and returns the
 /// updated definition.
 ///
 /// Only the `model:` line in the frontmatter changes (an inline comment on it
@@ -633,17 +841,17 @@ pub fn set_model(
     path: &Path,
     expected: Option<Option<&str>>,
     edit: ModelEdit<'_>,
-) -> Result<AutomationDefinition> {
-    let source = AutomationSource::User;
-    let original = fs::read_to_string(path)
-        .with_context(|| format!("read automation file {}", path.display()))?;
-    let before = parse_automation_content(path, &original, source)
-        .with_context(|| format!("parse automation {}", path.display()))?;
+) -> Result<JobDefinition> {
+    let source = JobSource::User;
+    let original =
+        fs::read_to_string(path).with_context(|| format!("read job file {}", path.display()))?;
+    let before = parse_job_content(path, &original, source)
+        .with_context(|| format!("parse job {}", path.display()))?;
     if let Some(expected) = expected
         && before.model.as_deref() != expected
     {
         bail!(
-            "automation '{}' changed on disk (model is now {}); reload and try again",
+            "job '{}' changed on disk (model is now {}); reload and try again",
             before.name,
             before.model.as_deref().unwrap_or("not set")
         );
@@ -658,9 +866,9 @@ pub fn set_model(
     }
 
     let updated = edit_model_line(&original, spec)?;
-    let after = parse_automation_content(path, &updated, source)
-        .context("the edited automation no longer parses; file left unchanged")?;
-    let expected_after = AutomationDefinition {
+    let after = parse_job_content(path, &updated, source)
+        .context("the edited job no longer parses; file left unchanged")?;
+    let expected_after = JobDefinition {
         model: spec.map(str::to_string),
         ..before.clone()
     };
@@ -752,7 +960,7 @@ fn write_if_unchanged(path: &Path, original: &str, updated: &str) -> Result<()> 
     let file_name = path
         .file_name()
         .and_then(std::ffi::OsStr::to_str)
-        .context("invalid automation file name")?;
+        .context("invalid job file name")?;
     let tmp = path.with_file_name(format!(".{file_name}.{}.tmp", std::process::id()));
     fs::write(&tmp, updated).with_context(|| format!("write {}", tmp.display()))?;
     let result = (|| {
@@ -761,7 +969,7 @@ fn write_if_unchanged(path: &Path, original: &str, updated: &str) -> Result<()> 
                 .with_context(|| format!("copy permissions to {}", tmp.display()))?;
         }
         let current = fs::read_to_string(path)
-            .with_context(|| format!("re-read automation file {}", path.display()))?;
+            .with_context(|| format!("re-read job file {}", path.display()))?;
         if current != original {
             bail!(
                 "{} changed on disk while saving; reload and try again",
@@ -782,7 +990,7 @@ fn file_stem(path: &Path) -> Result<String> {
         .and_then(std::ffi::OsStr::to_str)
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("Invalid automation file name: {}", path.display()))?;
+        .ok_or_else(|| anyhow::anyhow!("Invalid job file name: {}", path.display()))?;
     Ok(stem.to_string())
 }
 
@@ -823,74 +1031,14 @@ fn split_frontmatter(content: &str) -> Result<(String, String)> {
     bail!("Unterminated YAML frontmatter")
 }
 
-fn field_matches(expr: &str, value: i32, min: i32, max: i32, is_dow: bool) -> Result<bool> {
-    for part in expr.split(',').map(str::trim).filter(|p| !p.is_empty()) {
-        if part == "*" {
-            return Ok(true);
-        }
-
-        if let Some(step_str) = part.strip_prefix("*/") {
-            let step = parse_value(step_str, min, max, is_dow)?;
-            if step <= 0 {
-                bail!("Invalid step '{part}': must be greater than zero");
-            }
-            if (value - min) % step == 0 {
-                return Ok(true);
-            }
-            continue;
-        }
-
-        if let Some((start_str, end_str)) = part.split_once('-') {
-            let start = parse_value(start_str, min, max, is_dow)?;
-            let end = parse_value(end_str, min, max, is_dow)?;
-            if start > end {
-                bail!("Invalid range '{part}': start must be <= end");
-            }
-            if (start..=end).contains(&value) {
-                return Ok(true);
-            }
-            continue;
-        }
-
-        let n = parse_value(part, min, max, is_dow)?;
-        if n == value {
-            return Ok(true);
-        }
-    }
-
-    Ok(false)
-}
-
-fn parse_value(raw: &str, min: i32, max: i32, is_dow: bool) -> Result<i32> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        bail!("Invalid empty cron value");
-    }
-
-    let mut n = trimmed
-        .parse::<i32>()
-        .with_context(|| format!("Invalid cron value '{trimmed}'"))?;
-
-    // Allow 7 as Sunday for day-of-week.
-    if is_dow && n == 7 {
-        n = 0;
-    }
-
-    if !(min..=max).contains(&n) {
-        bail!("Cron value '{trimmed}' out of range {min}..{max}");
-    }
-    Ok(n)
-}
-
 #[cfg(test)]
 mod tests {
-    use chrono::{LocalResult, TimeZone};
     use tempfile::tempdir;
 
     use super::*;
 
     #[test]
-    fn parse_minimal_automation_defaults() {
+    fn parse_minimal_job_defaults() {
         let dir = tempdir().unwrap();
         let file = dir.path().join("morning-report.md");
         fs::write(
@@ -899,9 +1047,9 @@ mod tests {
         )
         .unwrap();
 
-        let parsed = parse_automation_file(&file, AutomationSource::User).unwrap();
+        let parsed = parse_job_file(&file, JobSource::User).unwrap();
         assert_eq!(parsed.name, "morning-report");
-        assert!(parsed.schedule.is_none());
+        assert_eq!(parsed.schedule, JobSchedule::Manual);
         assert!(parsed.model.is_none());
         assert!(parsed.subagent.is_none());
         assert_eq!(parsed.max_retries, 0);
@@ -912,7 +1060,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_automation_with_subagent() {
+    fn parse_job_with_subagent() {
         let dir = tempdir().unwrap();
         let file = dir.path().join("morning-report.md");
         fs::write(
@@ -921,24 +1069,25 @@ mod tests {
         )
         .unwrap();
 
-        let parsed = parse_automation_file(&file, AutomationSource::User).unwrap();
+        let parsed = parse_job_file(&file, JobSource::User).unwrap();
         assert_eq!(parsed.subagent.as_deref(), Some("explorer"));
     }
 
     #[test]
-    fn parse_automation_with_root() {
+    fn parse_job_with_root() {
         let dir = tempdir().unwrap();
         let file = dir.path().join("scoped.md");
         fs::write(&file, "---\nroot: \"~/work/space\"\n---\nprompt").unwrap();
 
-        let parsed = parse_automation_file(&file, AutomationSource::User).unwrap();
+        let parsed = parse_job_file(&file, JobSource::User).unwrap();
         assert_eq!(parsed.root.as_deref(), Some("~/work/space"));
     }
 
     #[test]
     fn empty_root_fails_resolution_not_discovery() {
         let root = tempdir().unwrap();
-        let user_dir = root.path().join("automations");
+        let home = JobsHome::at(root.path());
+        let user_dir = home.jobs_dir();
         fs::create_dir_all(&user_dir).unwrap();
         fs::write(
             user_dir.join("empty-root.md"),
@@ -947,10 +1096,10 @@ mod tests {
         .unwrap();
         fs::write(user_dir.join("fine.md"), "---\n---\nprompt").unwrap();
 
-        let all = discover_with_user_dir(root.path(), &user_dir).unwrap();
+        let all = catalog(&home).unwrap().jobs;
         assert_eq!(all.len(), 2);
         let broken = all.iter().find(|a| a.name == "empty-root").unwrap();
-        let view = overview(&Config::default(), root.path(), broken);
+        let view = overview(&Config::default(), root.path(), &home, broken);
         assert!(view.error.unwrap().contains("root cannot be empty"));
     }
 
@@ -1013,7 +1162,7 @@ mod tests {
         scoped.root = Some(declared.path().to_string_lossy().to_string());
         let run = resolve_run_from(inherited(), &scoped).unwrap();
         assert_eq!(run.settings.root.path, declared.path());
-        assert_eq!(run.settings.root.origin, SettingOrigin::Automation);
+        assert_eq!(run.settings.root.origin, SettingOrigin::Job);
 
         let unknown = Err("daemon not running");
         assert!(resolve_run_from(unknown, &scoped).is_ok());
@@ -1024,12 +1173,13 @@ mod tests {
         assert!(resolve_run_from(inherited(), &scoped).is_err());
     }
 
-    fn definition(model: Option<&str>) -> AutomationDefinition {
-        AutomationDefinition {
+    fn definition(model: Option<&str>) -> JobDefinition {
+        JobDefinition {
             name: "demo".to_string(),
             path: PathBuf::from("/tmp/demo.md"),
-            source: AutomationSource::User,
-            schedule: Some("0 8 * * *".to_string()),
+            source: JobSource::User,
+            schedule: JobSchedule::parse(Some("0 8 * * *"), None).unwrap(),
+            grace_secs: None,
             model: model.map(str::to_string),
             subagent: None,
             root: None,
@@ -1065,7 +1215,7 @@ mod tests {
         .unwrap();
         assert_eq!(suffixless.model.spec, "claude-cli:claude-opus-5@high");
         assert_eq!(suffixless.model.account, None);
-        assert_eq!(suffixless.model.origin, SettingOrigin::Automation);
+        assert_eq!(suffixless.model.origin, SettingOrigin::Job);
         assert_eq!(suffixless.model.thinking_origin, SettingOrigin::Config);
 
         let explicit = resolve_run_settings(
@@ -1075,16 +1225,17 @@ mod tests {
         )
         .unwrap();
         assert_eq!(explicit.model.thinking, "low");
-        assert_eq!(explicit.model.thinking_origin, SettingOrigin::Automation);
+        assert_eq!(explicit.model.thinking_origin, SettingOrigin::Job);
     }
 
     #[test]
-    fn overview_keeps_resolution_errors_per_automation() {
+    fn overview_keeps_resolution_errors_per_job() {
         let caller = tempdir().unwrap();
         let mut broken = definition(None);
         broken.root = Some("relative/root".to_string());
 
-        let view = overview(&Config::default(), caller.path(), &broken);
+        let home = JobsHome::at(caller.path());
+        let view = overview(&Config::default(), caller.path(), &home, &broken);
         assert!(view.settings.is_none());
         assert!(
             view.error
@@ -1097,6 +1248,7 @@ mod tests {
         let json = serde_json::to_value(overview(
             &Config::default(),
             caller.path(),
+            &home,
             &definition(None),
         ))
         .unwrap();
@@ -1165,7 +1317,7 @@ mod tests {
         let (_dir, path) = write_fixture(content);
         let updated =
             set_model(&path, Some(None), ModelEdit::Set("gemini:gemini-3.8-flash")).unwrap();
-        assert!(updated.schedule.is_none());
+        assert_eq!(updated.schedule, JobSchedule::Manual);
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
             "---\r\ntimeout_secs: 60\r\nmodel: \"gemini:gemini-3.8-flash\"\r\n---\r\nPrompt\r\n"
@@ -1209,70 +1361,137 @@ mod tests {
         let file = dir.path().join("invalid.md");
         fs::write(&file, "no frontmatter").unwrap();
 
-        let err = parse_automation_file(&file, AutomationSource::User).unwrap_err();
+        let err = parse_job_file(&file, JobSource::User).unwrap_err();
         assert!(err.to_string().contains("Missing YAML frontmatter"));
     }
 
     #[test]
-    fn discover_reads_user_automations() {
-        let root = tempdir().unwrap();
-        let user = tempdir().unwrap();
-
-        let user_dir = user.path().join("automations");
-        fs::create_dir_all(&user_dir).unwrap();
-        fs::write(user_dir.join("user-report.md"), "---\n---\nuser prompt").unwrap();
-
-        let all = discover_with_user_dir(root.path(), &user_dir).unwrap();
-        assert_eq!(all.len(), 1);
-        assert!(all.iter().any(|a| a.name == "user-report"));
-    }
-
-    #[test]
-    fn discover_ignores_project_automations_directory() {
-        let root = tempdir().unwrap();
-        let user = tempdir().unwrap();
-
-        let project_dir = root.path().join(".zdx").join("automations");
-        let user_dir = user.path().join("automations");
-        fs::create_dir_all(&project_dir).unwrap();
-        fs::create_dir_all(&user_dir).unwrap();
-
+    fn catalog_lists_valid_jobs_and_isolates_invalid_files() {
+        let dir = tempdir().unwrap();
+        let home = JobsHome::at(dir.path());
+        let jobs = home.jobs_dir();
+        fs::create_dir_all(jobs.join("archive")).unwrap();
         fs::write(
-            project_dir.join("project-only.md"),
-            "---\n---\nproject prompt",
+            jobs.join("report.md"),
+            "---\nschedule: \"0 8 * * *\"\n---\nprompt",
         )
         .unwrap();
-        fs::write(user_dir.join("user-only.md"), "---\n---\nuser prompt").unwrap();
+        fs::write(
+            jobs.join("remind.md"),
+            "---\nrun_at: \"2026-10-20T09:00:00-03:00\"\ngrace_secs: 3600\n---\nprompt",
+        )
+        .unwrap();
+        fs::write(
+            jobs.join("typo.md"),
+            "---\nschedul: \"0 8 * * *\"\n---\nprompt",
+        )
+        .unwrap();
+        fs::write(
+            jobs.join("bad-cron.md"),
+            "---\nschedule: \"0 25 * * *\"\n---\nprompt",
+        )
+        .unwrap();
+        fs::write(
+            jobs.join("both.md"),
+            "---\nschedule: \"0 8 * * *\"\nrun_at: \"2026-10-20T12:00:00Z\"\n---\nprompt",
+        )
+        .unwrap();
+        fs::write(
+            jobs.join("no-offset.md"),
+            "---\nrun_at: \"2026-10-20T09:00:00\"\n---\nprompt",
+        )
+        .unwrap();
+        fs::write(
+            jobs.join("manual-grace.md"),
+            "---\ngrace_secs: 600\n---\nprompt",
+        )
+        .unwrap();
+        fs::write(
+            jobs.join("archive").join("old--20261001T120000Z.md"),
+            "---\n---\nprompt",
+        )
+        .unwrap();
 
-        let all = discover_with_user_dir(root.path(), &user_dir).unwrap();
-        assert_eq!(all.len(), 1);
-        assert_eq!(all[0].name, "user-only");
+        let catalog = catalog(&home).unwrap();
+        let valid: Vec<_> = catalog.jobs.iter().map(|job| job.name.as_str()).collect();
+        assert_eq!(valid, ["remind", "report"], "archive/ is not scanned");
+        let invalid: Vec<_> = catalog
+            .invalid
+            .iter()
+            .map(|job| job.name.as_str())
+            .collect();
+        assert_eq!(
+            invalid,
+            ["bad-cron", "both", "manual-grace", "no-offset", "typo"]
+        );
+        let find_err = |name: &str| format!("{:#}", catalog.find(name).unwrap_err());
+        assert!(
+            find_err("typo").contains("unknown field"),
+            "{}",
+            find_err("typo")
+        );
+        assert!(find_err("bad-cron").contains("out of range"));
+        assert!(find_err("missing").contains("not found"));
+        let remind = catalog.find("remind").unwrap();
+        assert_eq!(remind.effective_grace_secs(), Some(3600));
+        assert_eq!(
+            catalog.find("report").unwrap().effective_grace_secs(),
+            Some(600)
+        );
     }
 
     #[test]
-    fn cron_schedule_matches_expected_local_time() {
-        let LocalResult::Single(dt) = Local.with_ymd_and_hms(2026, 2, 11, 8, 0, 0) else {
-            panic!("expected unambiguous local datetime");
-        };
+    fn once_job_state_follows_its_claim_and_the_clock() {
+        use chrono::{FixedOffset, TimeZone as _};
 
-        assert!(schedule_matches_local_time("0 8 * * *", dt).unwrap());
-        assert!(!schedule_matches_local_time("1 8 * * *", dt).unwrap());
-    }
+        let dir = tempdir().unwrap();
+        let home = JobsHome::at(dir.path());
+        fs::create_dir_all(home.jobs_dir()).unwrap();
+        fs::write(
+            home.jobs_dir().join("remind.md"),
+            "---\nrun_at: \"2026-10-20T12:00:00Z\"\n---\nprompt",
+        )
+        .unwrap();
+        let job = catalog(&home).unwrap().find("remind").unwrap().clone();
+        let tz = FixedOffset::east_opt(0).unwrap();
+        let at = |h, m| Utc.with_ymd_and_hms(2026, 10, 20, h, m, 0).unwrap();
 
-    #[test]
-    fn cron_schedule_supports_steps_and_ranges() {
-        let LocalResult::Single(dt) = Local.with_ymd_and_hms(2026, 2, 11, 8, 30, 0) else {
-            panic!("expected unambiguous local datetime");
-        };
+        let state = job_state(&home, &job, at(11, 0), &tz);
+        assert_eq!(state.status, JobStatus::Pending);
+        assert_eq!(state.next_run_at, Some(at(12, 0)));
+        assert_eq!(
+            job_state(&home, &job, at(13, 0), &tz).status,
+            JobStatus::Due
+        );
+        assert_eq!(
+            job_state(&home, &job, at(18, 1), &tz).status,
+            JobStatus::Expired
+        );
 
-        assert!(schedule_matches_local_time("*/15 8-10 * * *", dt).unwrap());
-        assert!(!schedule_matches_local_time("*/20 8-10 * * *", dt).unwrap());
-    }
-
-    #[test]
-    fn cron_invalid_field_count_is_rejected() {
-        let dt = Local::now();
-        let err = schedule_matches_local_time("0 8 * *", dt).unwrap_err();
-        assert!(err.to_string().contains("expected 5 cron fields"));
+        let claim = store::Claim::new(
+            "remind",
+            "20261020T120000Z",
+            RunTrigger::Manual,
+            ScheduleKind::Once,
+            at(12, 0),
+        );
+        home.create_claim(&claim).unwrap();
+        assert_eq!(
+            job_state(&home, &job, at(13, 0), &tz).status,
+            JobStatus::Interrupted
+        );
+        let lock = home.try_lock_job("remind").unwrap().unwrap();
+        assert_eq!(
+            job_state(&home, &job, at(13, 0), &tz).status,
+            JobStatus::Running
+        );
+        drop(lock);
+        let finished = claim.finished(Outcome::Succeeded, None);
+        home.update_claim(&finished).unwrap();
+        // A crash before `last.json` was written: the claim still shows.
+        let state = job_state(&home, &job, at(13, 0), &tz);
+        assert_eq!(state.status, JobStatus::Finished);
+        assert_eq!(state.next_run_at, None);
+        assert_eq!(state.last_run.unwrap().run_id, finished.run_id);
     }
 }

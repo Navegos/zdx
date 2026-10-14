@@ -104,9 +104,9 @@ Delegate scoped work to isolated child agents:
 - Interactive questions & follow-up buttons, per-project chat routing
 - `/model` override, thinking controls, and file/document attachments
 
-### Automations & MCP
+### Jobs & MCP
 
-- **Automations** — scheduled, headless agent jobs (reports, reminders, actions)
+- **Jobs** — headless agent prompts that run by hand, on a recurring cron schedule, or once at a set time (reports, reminders, actions)
 - **MCP** — connect remote MCP servers (with OAuth), plus schema/call helpers
 
 ### Context & config

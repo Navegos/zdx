@@ -2,7 +2,6 @@
 
 pub mod ask_media;
 pub mod auth;
-pub mod automations;
 pub mod bg;
 pub mod bot;
 pub mod chat;
@@ -10,6 +9,7 @@ pub mod config;
 pub mod daemon;
 pub mod exec;
 pub mod imagine;
+pub mod jobs;
 pub mod mcp;
 pub mod memory;
 pub mod models;

@@ -287,10 +287,10 @@ enum Commands {
         #[command(subcommand)]
         command: MemoryCommands,
     },
-    /// Manage automations
-    Automations {
+    /// Manage jobs
+    Jobs {
         #[command(subcommand)]
-        command: AutomationCommands,
+        command: JobCommands,
     },
     /// Inspect and call MCP servers through the internal helper CLI
     Mcp {
@@ -365,7 +365,7 @@ enum Commands {
         command: TelegramCommands,
     },
 
-    /// Service dashboard (inspect config, threads, automations)
+    /// Service dashboard (inspect config, threads, jobs)
     Monitor,
 
     /// Manage git worktrees
@@ -645,28 +645,34 @@ enum MemoryCommands {
 }
 
 #[derive(clap::Subcommand)]
-enum AutomationCommands {
-    /// List discovered automations
+enum JobCommands {
+    /// List jobs with their schedule, status, next run, and last outcome
     List {
-        /// Output JSON with declared and resolved root/model per automation
+        /// Output JSON with schedule, status, and declared and resolved
+        /// root/model per job
         #[arg(long)]
         json: bool,
         /// Resolve settings the way the scheduled daemon does (its root and
         /// config), instead of for this process's --root
-        #[arg(long)]
+        #[arg(long, conflicts_with = "archived")]
         daemon: bool,
+        /// List archived once jobs (`$ZDX_HOME/jobs/archive`) with their
+        /// final outcome, newest first
+        #[arg(long)]
+        archived: bool,
     },
-    /// Validate automation files
+    /// Validate job files
     Validate,
-    /// Run scheduled automations daemon
+    /// Run the jobs scheduler daemon
     Daemon {
-        /// Poll interval in seconds (minimum 1)
+        /// Longest wait between checks, in seconds (minimum 1). The daemon
+        /// also wakes when a job becomes due.
         #[arg(long, default_value_t = 30)]
         poll_interval_secs: u64,
     },
-    /// Show automation run history (from JSONL log)
+    /// Show job run history (from JSONL log)
     Runs {
-        /// Optional automation name (file stem)
+        /// Optional job name (file stem)
         #[arg(value_name = "NAME")]
         name: Option<String>,
 
@@ -686,10 +692,10 @@ enum AutomationCommands {
         #[arg(long)]
         json: bool,
     },
-    /// Set or clear the `model` of one automation file (other keys, comments,
+    /// Set or clear the `model` of one job file (other keys, comments,
     /// and the prompt stay unchanged)
     SetModel {
-        /// Automation name (file stem)
+        /// Job name (file stem)
         #[arg(value_name = "NAME")]
         name: String,
 
@@ -701,15 +707,35 @@ enum AutomationCommands {
         )]
         spec: Option<String>,
 
-        /// Remove the model override so the automation inherits it
+        /// Remove the model override so the job inherits it
         #[arg(long)]
         clear: bool,
     },
-    /// Run one automation by name (file stem)
+    /// Run one job by name (file stem). A once job is consumed: it does not
+    /// run again at `run_at`, and its file is archived
     Run {
-        /// Automation name (file stem)
+        /// Job name (file stem)
         #[arg(value_name = "NAME")]
         name: String,
+
+        /// Run a once job as a test: its scheduled run stays pending
+        #[arg(long)]
+        keep: bool,
+
+        /// Internal: occurrence key of a scheduler-started run
+        #[arg(long, hide = true, value_name = "KEY", requires = "scheduled_for")]
+        occurrence: Option<String>,
+
+        /// Internal: scheduled instant of that occurrence (RFC 3339)
+        #[arg(long, hide = true, value_name = "RFC3339", requires = "occurrence")]
+        scheduled_for: Option<String>,
+    },
+    /// Move job files from the old `automations` location to
+    /// `$ZDX_HOME/jobs` and convert the run log
+    Migrate {
+        /// Print what would change without changing anything
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -1336,7 +1362,7 @@ async fn dispatch_command(command: Commands, context: &DispatchContext<'_>) -> R
             .await
         }
         Commands::Memory { command } => dispatch_memory(command, context).await,
-        Commands::Automations { command } => Box::pin(dispatch_automations(command, context)).await,
+        Commands::Jobs { command } => Box::pin(dispatch_jobs(command, context)).await,
         Commands::Mcp { command } => dispatch_mcp(command, context).await,
         Commands::Config { command } => dispatch_config(&command),
         Commands::Login {
@@ -1560,57 +1586,77 @@ async fn dispatch_memory(command: MemoryCommands, context: &DispatchContext<'_>)
     }
 }
 
-async fn dispatch_automations(
-    command: AutomationCommands,
-    context: &DispatchContext<'_>,
-) -> Result<()> {
+async fn dispatch_jobs(command: JobCommands, context: &DispatchContext<'_>) -> Result<()> {
     if context.model.is_some() {
-        anyhow::bail!(
-            "--model is not supported for automations; set `model:` in the automation file"
-        );
+        anyhow::bail!("--model is not supported for jobs; set `model:` in the job file");
     }
     let root_path = resolve_root(context.root, context.worktree_id)?;
-    let caller = commands::automations::Caller {
+    let caller = commands::jobs::Caller {
         root: &root_path,
         config: context.config,
         system_prompt_override: context.system_prompt,
     };
     match command {
-        AutomationCommands::List { json, daemon: true } => commands::automations::list_daemon(json),
-        AutomationCommands::List {
+        JobCommands::List {
             json,
-            daemon: false,
-        } => commands::automations::list(&caller, json),
-        AutomationCommands::Validate => commands::automations::validate(&caller),
-        AutomationCommands::Daemon { poll_interval_secs } => {
-            let thread_opts: ThreadPersistenceOptions = context.thread_args.into();
-            Box::pin(commands::daemon::run(
-                &caller,
-                &thread_opts,
+            archived: true,
+            ..
+        } => commands::jobs::list_archived(json),
+        JobCommands::List {
+            json, daemon: true, ..
+        } => commands::jobs::list_daemon(json),
+        JobCommands::List { json, .. } => commands::jobs::list(&caller, json),
+        JobCommands::Validate => commands::jobs::validate(&caller),
+        JobCommands::Daemon { poll_interval_secs } => {
+            Box::pin(commands::daemon::run(commands::daemon::DaemonOptions {
+                root: &root_path,
+                system_prompt_override: context.system_prompt,
+                no_thread: context.thread_args.no_save,
                 poll_interval_secs,
-            ))
+            }))
             .await
         }
-        AutomationCommands::Runs {
+        JobCommands::Runs {
             name,
             date,
             date_start,
             date_end,
             json,
-        } => commands::automations::runs(commands::automations::RunsOptions {
+        } => commands::jobs::runs(commands::jobs::RunsOptions {
             name,
             date,
             date_start,
             date_end,
             json,
         }),
-        AutomationCommands::SetModel { name, spec, clear } => {
-            commands::automations::set_model(&caller, &name, spec.as_deref(), clear)
+        JobCommands::SetModel { name, spec, clear } => {
+            commands::jobs::set_model(&name, spec.as_deref(), clear)
         }
-        AutomationCommands::Run { name } => {
+        JobCommands::Run {
+            name,
+            keep,
+            occurrence,
+            scheduled_for,
+        } => {
+            let scheduled = match (occurrence, scheduled_for) {
+                (Some(key), Some(at)) => Some(commands::jobs::ScheduledOccurrence {
+                    key,
+                    at: chrono::DateTime::parse_from_rfc3339(&at)
+                        .with_context(|| format!("invalid --scheduled-for '{at}'"))?
+                        .with_timezone(&chrono::Utc),
+                }),
+                _ => None,
+            };
             let thread_opts: ThreadPersistenceOptions = context.thread_args.into();
-            Box::pin(commands::automations::run(&caller, &thread_opts, &name)).await
+            Box::pin(commands::jobs::run(
+                &caller,
+                &thread_opts,
+                &name,
+                commands::jobs::RunRequest { keep, scheduled },
+            ))
+            .await
         }
+        JobCommands::Migrate { dry_run } => commands::jobs::migrate(dry_run),
     }
 }
 

@@ -1,7 +1,7 @@
 pub mod agents;
-pub mod automations;
 pub mod background;
 pub mod config;
+pub mod jobs;
 pub mod logs;
 pub mod services;
 pub mod threads;

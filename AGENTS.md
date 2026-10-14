@@ -43,9 +43,9 @@ This monorepo now uses scoped `AGENTS.md` files per crate.
 All common tasks are available via `just` (see `justfile`). Run `just` to list all recipes.
 
 - `just run` (interactive TUI; pass extra args: `just run --help`)
-- `just monitor` (service dashboard for config, threads, automations)
+- `just monitor` (service dashboard for config, threads, jobs)
 - `just bot` (Telegram bot; runs the global `[telegram]` config)
-- `just automations` (automation subcommands; e.g. `just automations list`)
+- `just jobs` (jobs subcommands; e.g. `just jobs list`)
 - `just deploy` (build release → install to `~/.local/bin/zdx` → guarded `zdx service restart all`; the standard way to ship a change to the running bot/daemon). The restart refuses to interrupt active agent runs; wait for them, queue it with `zdx service restart --queue` (the bot restarts once no run is active — use this from inside an agent run, which counts as active), or explicitly run `zdx service restart all --force`. Set `ZDX_CODESIGN_ID` in your shell env to a code-signing identity so `install` signs the binary with a stable identifier and macOS TCC grants survive rebuilds; unset, the binary stays ad-hoc signed and macOS re-prompts after every build.
 - `just safe-deploy` (build release → install → `zdx service restart all --queue`: the bot restarts once no agent run, worker, or orchestrator `[worker update]` turn is pending. Use this from inside an agent run, or whenever workers may be busy.)
 - `just ci` (full local CI: lint + test; matches what GHA runs on push/PR — optional pre-push gate)

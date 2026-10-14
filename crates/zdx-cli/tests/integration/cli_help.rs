@@ -19,7 +19,7 @@ fn test_help_shows_all_commands() {
         .stdout(predicate::str::contains("imagine"))
         .stdout(predicate::str::contains("speak"))
         .stdout(predicate::str::contains("mcp"))
-        .stdout(predicate::str::contains("automations"))
+        .stdout(predicate::str::contains("jobs"))
         .stdout(predicate::str::contains("threads"))
         .stdout(predicate::str::contains("--model"))
         .stdout(predicate::str::contains("--thinking").not());
@@ -165,9 +165,9 @@ fn test_threads_tools_help_shows_flags() {
 }
 
 #[test]
-fn test_automations_help_shows_subcommands() {
+fn test_jobs_help_shows_subcommands() {
     crate::fixtures::zdx_cmd()
-        .args(["automations", "--help"])
+        .args(["jobs", "--help"])
         .assert()
         .success()
         .stdout(predicate::str::contains("list"))
@@ -189,7 +189,7 @@ fn test_bot_help_shows_init_subcommand() {
 #[test]
 fn test_daemon_help_shows_poll_interval() {
     crate::fixtures::zdx_cmd()
-        .args(["automations", "daemon", "--help"])
+        .args(["jobs", "daemon", "--help"])
         .assert()
         .success()
         .stdout(predicate::str::contains("poll-interval-secs"));

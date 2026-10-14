@@ -12,10 +12,10 @@ use crossterm::event::{
 use crossterm::execute;
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::prelude::*;
-use zdx_engine::automation_daemon::DaemonContextState;
-use zdx_engine::automations::AutomationOverview;
 use zdx_engine::core::thread_index::{ThreadBrowseOptions, ThreadKindFilter};
 use zdx_engine::core::usage_stats::UsageStats;
+use zdx_engine::job_daemon::DaemonContextState;
+use zdx_engine::jobs::JobOverview;
 use zdx_engine::workspace_config::{self, EditTarget, Setting, Workspace};
 
 use crate::log_line::{LevelFilter, line_target};
@@ -23,7 +23,6 @@ use crate::tabs::agents::{
     ActiveAgentInfo, AgentOverlayState, agent_overlay_page_size, handle_agent_overlay_key,
     handle_overlay_click, load_active_agents, open_agent_overlay, refresh_agent_overlay,
 };
-use crate::tabs::automations::{apply_snapshot, handle_automations_key, load_automations};
 use crate::tabs::background::{
     BackgroundDetailState, BackgroundInfo, handle_background_detail_key, kill_selected_background,
     load_background, open_background_detail, refresh_background_detail,
@@ -33,6 +32,7 @@ use crate::tabs::config::{
     handle_config_key, handle_model_picker_key, load_config_view, move_config_selection,
     open_model_picker, rendered_line_count,
 };
+use crate::tabs::jobs::{apply_snapshot, handle_jobs_key, load_jobs};
 use crate::tabs::logs::{
     LOG_TAIL_LINES, LoadedLogFile, ensure_log_selected_visible, handle_log_overlay_key,
     handle_log_query_key, handle_log_target_picker_key, handle_logs_key, load_active_log,
@@ -104,15 +104,18 @@ pub struct MonitorApp {
     pub threads_scan_options: Option<ThreadBrowseOptions>,
     /// Raw thread JSONL queued to open after the current key event.
     pub(crate) pending_open_path: Option<PathBuf>,
-    /// Automations with settings resolved the way the scheduled daemon
+    /// Jobs with settings resolved the way the scheduled daemon
     /// resolves them, never for the Monitor's own `root`. Loaded on entry to
-    /// the Automations tab (not on the tick): resolution reads the daemon
+    /// the Jobs tab (not on the tick): resolution reads the daemon
     /// record, service plist, config, and subagent files.
-    pub automations: Vec<AutomationOverview>,
+    pub jobs: Vec<JobOverview>,
     /// Where the daemon's settings came from, or why they are unknown.
-    pub automations_daemon: Option<DaemonContextState>,
-    /// Why the Automations list could not be built, if it failed as a whole.
-    pub automations_error: Option<String>,
+    pub jobs_daemon: Option<DaemonContextState>,
+    /// Why the Jobs list could not be built, if it failed as a whole.
+    pub jobs_error: Option<String>,
+    /// Archived once jobs, shown instead of `jobs` while `Some` (toggled
+    /// with `a` in the Jobs tab).
+    pub jobs_archived: Option<Result<Vec<zdx_engine::jobs::ArchivedJob>, String>>,
     pub services: Vec<ServiceInfo>,
     /// In-flight background service restart, if any. Only one runs at a time.
     pub restart_job: Option<RestartJob>,
@@ -206,7 +209,7 @@ pub enum Section {
     Config,
     Threads,
     Usage,
-    Automations,
+    Jobs,
     Logs,
 }
 
@@ -218,7 +221,7 @@ impl Section {
         Section::Config,
         Section::Threads,
         Section::Usage,
-        Section::Automations,
+        Section::Jobs,
         Section::Logs,
     ];
 
@@ -230,7 +233,7 @@ impl Section {
             Section::Config => "Config",
             Section::Threads => "Threads",
             Section::Usage => "Usage",
-            Section::Automations => "Automations",
+            Section::Jobs => "Jobs",
             Section::Logs => "Logs",
         }
     }
@@ -242,8 +245,8 @@ impl Section {
             Section::Background => Section::Config,
             Section::Config => Section::Threads,
             Section::Threads => Section::Usage,
-            Section::Usage => Section::Automations,
-            Section::Automations => Section::Logs,
+            Section::Usage => Section::Jobs,
+            Section::Jobs => Section::Logs,
             Section::Logs => Section::Services,
         }
     }
@@ -256,8 +259,8 @@ impl Section {
             Section::Config => Section::Background,
             Section::Threads => Section::Config,
             Section::Usage => Section::Threads,
-            Section::Automations => Section::Usage,
-            Section::Logs => Section::Automations,
+            Section::Jobs => Section::Usage,
+            Section::Logs => Section::Jobs,
         }
     }
 }
@@ -275,7 +278,11 @@ impl MonitorApp {
             Section::ActiveAgents => self.active_agents.len(),
             Section::Background => self.background.len(),
             Section::Threads => self.threads.len(),
-            Section::Automations => self.automations.len(),
+            Section::Jobs => match &self.jobs_archived {
+                Some(Ok(archived)) => archived.len(),
+                Some(Err(_)) => 0,
+                None => self.jobs.len(),
+            },
         }
     }
 
@@ -382,8 +389,9 @@ fn switch_section(app: &mut MonitorApp, section: Section) {
     } else {
         app.log_query_editing = false;
     }
-    if app.active_section == Section::Automations {
-        apply_snapshot(app, load_automations(), None);
+    if app.active_section == Section::Jobs {
+        app.jobs_archived = None;
+        apply_snapshot(app, load_jobs(), None);
     }
     if app.active_section == Section::Threads {
         refresh_threads_if_stale(app);
@@ -428,9 +436,10 @@ pub(crate) fn build_app(root: &Path) -> Result<MonitorApp> {
         threads_rx: None,
         threads_scan_options: None,
         pending_open_path: None,
-        automations: Vec::new(),
-        automations_daemon: None,
-        automations_error: None,
+        jobs: Vec::new(),
+        jobs_daemon: None,
+        jobs_error: None,
+        jobs_archived: None,
         services,
         restart_job: None,
         active_agents: load_active_agents(),
@@ -616,7 +625,7 @@ fn dispatch_key_event(app: &mut MonitorApp, key: KeyEvent) {
     if app.active_section == Section::Config && handle_config_key(app, key.code) {
         return;
     }
-    if app.active_section == Section::Automations && handle_automations_key(app, key.code) {
+    if app.active_section == Section::Jobs && handle_jobs_key(app, key.code) {
         return;
     }
     match key.code {

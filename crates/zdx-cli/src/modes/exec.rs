@@ -48,7 +48,7 @@ pub struct ExecOptions {
     pub activity_parent_thread_id: Option<String>,
     /// Named subagent invoked when this is a `invoke_subagent` child.
     pub activity_subagent_name: Option<String>,
-    /// Per-run cap on a single tool call, from an automation's `timeout_secs`.
+    /// Per-run cap on a single tool call, from a job's `timeout_secs`.
     pub tool_timeout: Option<std::time::Duration>,
 }
 
@@ -373,7 +373,7 @@ mod tests {
 
     use super::sanitize_exec_event;
 
-    /// An automation's `timeout_secs` frontmatter is the only source of a
+    /// A job's `timeout_secs` frontmatter is the only source of a
     /// tool-call deadline. It used to travel by mutating the global config
     /// field; it now rides on the run options, so it must survive the
     /// conversion.

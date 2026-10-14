@@ -4,7 +4,7 @@
  * Canonical shapes:
  *   ?view=threads                  (recent-thread browser)
  *   ?view=thread&id=<id>&tab=agent|transcript|artifacts|trajectory|changes
- *   ?view=monitor&section=overview|agents|services|usage|config|workspaces|automations
+ *   ?view=monitor&section=overview|agents|services|usage|config|workspaces|jobs
  *
  * The bot already publishes `?view=threads&id=…`, `?view=git&id=…` and bare
  * `startapp=<thread_id>` deep links, so those are accepted and normalized rather
@@ -22,7 +22,7 @@ export type MonitorSection =
   | "usage"
   | "config"
   | "workspaces"
-  | "automations";
+  | "jobs";
 
 export interface Route {
   view: View;
@@ -39,7 +39,7 @@ const MONITOR_SECTIONS: MonitorSection[] = [
   "usage",
   "config",
   "workspaces",
-  "automations",
+  "jobs",
 ];
 
 export const THREAD_TAB_LABELS: Record<ThreadTab, string> = {
@@ -58,7 +58,7 @@ export const MONITOR_SECTION_LABELS: Record<MonitorSection, string> = {
   usage: "Usage",
   config: "Config",
   workspaces: "Workspaces",
-  automations: "Automations",
+  jobs: "Jobs",
 };
 
 function readRoute(): Route {

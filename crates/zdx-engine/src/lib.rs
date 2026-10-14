@@ -2,14 +2,14 @@
 
 pub mod agent_activity;
 pub mod audio;
-pub mod automation_daemon;
-pub mod automations;
 pub mod background_activity;
 pub mod config;
 pub mod core;
 pub mod custom_commands;
 pub mod followups;
 pub mod images;
+pub mod job_daemon;
+pub mod jobs;
 pub mod mcp;
 pub mod media;
 pub mod models;

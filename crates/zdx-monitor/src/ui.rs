@@ -3,9 +3,9 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Tabs};
 
 use crate::app::{MonitorApp, Section, TargetPickerState};
 use crate::tabs::agents::{render_active_agents, render_agent_overlay};
-use crate::tabs::automations::render_automations;
 use crate::tabs::background::{render_background, render_background_detail};
 use crate::tabs::config::{render_config, render_model_picker};
+use crate::tabs::jobs::render_jobs;
 use crate::tabs::logs::{render_log_overlay, render_logs};
 use crate::tabs::services::render_services;
 use crate::tabs::threads::{render_threads, render_timing_overlay};
@@ -30,7 +30,7 @@ pub fn render(f: &mut Frame, app: &MonitorApp) {
         Section::Config => render_config(f, app, chunks[1]),
         Section::Threads => render_threads(f, app, chunks[1]),
         Section::Usage => render_usage(f, app, chunks[1]),
-        Section::Automations => render_automations(f, app, chunks[1]),
+        Section::Jobs => render_jobs(f, app, chunks[1]),
         Section::Logs => render_logs(f, app, chunks[1]),
     }
 
@@ -112,7 +112,9 @@ fn footer_hint(section: Section) -> &'static str {
         }
         Section::ActiveAgents => "↑↓ navigate • Enter inspect • Tab/⇧Tab switch • q quit",
         Section::Background => "↑↓ navigate • Enter details • x kill • Tab/⇧Tab switch • q quit",
-        Section::Automations => "↑↓ navigate • Enter model • d inherit • Tab/⇧Tab switch • q quit",
+        Section::Jobs => {
+            "↑↓ navigate • Enter model • d inherit • a archive • Tab/⇧Tab switch • q quit"
+        }
         Section::Config => {
             "↑↓ select • Enter edit • d reset here / delete mode • D reset modes • p workspace • w target • PgUp/PgDn scroll • q quit"
         }

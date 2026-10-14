@@ -362,7 +362,10 @@ export interface MonitorResponse {
   services: MonitorService[];
   active_agents: MonitorAgent[];
   background_processes: MonitorBackgroundProcess[];
-  automations: MonitorAutomation[];
+  /** Shared job summaries (`zdx_engine::jobs::JobSummary`). */
+  jobs: MonitorJob[];
+  /** Set when jobs could not be listed at all (for example before `zdx jobs migrate`). */
+  jobs_error: string | null;
   config: MonitorConfig;
   usage: MonitorUsage | null;
   subscriptions: MonitorSubscription[];
@@ -405,9 +408,42 @@ export interface MonitorBackgroundProcess {
   uptime: string;
 }
 
-export interface MonitorAutomation {
+export type JobSchedule =
+  | { kind: "manual" }
+  | { kind: "recurring"; cron: string }
+  | { kind: "once"; run_at: string };
+
+export type JobStatus =
+  | "invalid"
+  | "manual"
+  | "scheduled"
+  | "pending"
+  | "due"
+  | "expired"
+  | "running"
+  | "interrupted"
+  | "finished";
+
+export type JobOutcome = "succeeded" | "failed" | "retrying" | "missed" | "interrupted";
+
+export interface MonitorJobLastRun {
+  run_id: string;
+  trigger: "manual" | "daemon";
+  outcome: JobOutcome;
+  scheduled_for: string | null;
+  finished_at: string;
+  error: string | null;
+  thread_id: string | null;
+}
+
+export interface MonitorJob {
   name: string;
-  schedule: string | null;
+  /** `null` when the job file is invalid; `error` says why. */
+  schedule: JobSchedule | null;
+  status: JobStatus;
+  next_run_at: string | null;
+  last_run: MonitorJobLastRun | null;
+  error: string | null;
 }
 
 export interface MonitorConfigModel {

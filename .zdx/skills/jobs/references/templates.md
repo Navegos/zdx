@@ -1,6 +1,6 @@
-# Automation Templates
+# Job Templates
 
-## Scheduled automation
+## Recurring job
 
 ```md
 ---
@@ -32,7 +32,32 @@ If <nothing to report condition>: `<short message>.`
 - If a non-critical source fails, continue with available data and state what failed.
 ```
 
-## Manual-only automation
+## Once job
+
+```md
+---
+run_at: "2026-10-20T09:00:00-03:00"
+# grace_secs: 21600
+# model: "gemini:gemini-3.8-flash"
+---
+
+# Goal
+<one-sentence goal>
+
+# Inputs
+- <source>
+
+# Execution Steps
+1. <step>
+
+# Output Format
+- <required sections / limits>
+
+# Failure Policy
+- <error handling rules>
+```
+
+## Manual-only job
 
 ```md
 ---

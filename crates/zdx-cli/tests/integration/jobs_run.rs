@@ -1,5 +1,5 @@
-//! Tests for `zdx automations run`: non-interactive prompt layers, the runtime
-//! context, and the optional per-automation `root`.
+//! Tests for `zdx jobs run`: non-interactive prompt layers, the runtime
+//! context, and the optional per-job `root`.
 
 use std::fs;
 use std::sync::{Arc, Mutex};
@@ -15,8 +15,8 @@ fn can_bind_localhost() -> bool {
     std::net::TcpListener::bind("127.0.0.1:0").is_ok()
 }
 
-fn write_automation(zdx_home: &std::path::Path, name: &str, frontmatter: &str) {
-    let dir = zdx_home.join("automations");
+fn write_job(zdx_home: &std::path::Path, name: &str, frontmatter: &str) {
+    let dir = zdx_home.join("jobs");
     fs::create_dir_all(&dir).unwrap();
     fs::write(
         dir.join(format!("{name}.md")),
@@ -26,7 +26,7 @@ fn write_automation(zdx_home: &std::path::Path, name: &str, frontmatter: &str) {
 }
 
 fn read_run_records(zdx_home: &std::path::Path) -> Vec<serde_json::Value> {
-    fs::read_to_string(zdx_home.join("automations_runs.jsonl"))
+    fs::read_to_string(zdx_home.join("jobs_runs.jsonl"))
         .unwrap_or_default()
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
@@ -34,7 +34,7 @@ fn read_run_records(zdx_home: &std::path::Path) -> Vec<serde_json::Value> {
 }
 
 #[tokio::test]
-async fn test_automation_run_uses_declared_root_layers_and_runtime_context() {
+async fn test_job_run_uses_declared_root_layers_and_runtime_context() {
     if !can_bind_localhost() {
         eprintln!("Skipping: cannot bind localhost TCP port in this environment.");
         return;
@@ -44,7 +44,7 @@ async fn test_automation_run_uses_declared_root_layers_and_runtime_context() {
     fs::write(caller_root.path().join("AGENTS.md"), "CALLER-ROOT-NOTE").unwrap();
     let declared_root = TempDir::new().unwrap();
     fs::write(declared_root.path().join("AGENTS.md"), "DECLARED-ROOT-NOTE").unwrap();
-    write_automation(
+    write_job(
         zdx_home.path(),
         "scoped",
         &format!(
@@ -76,7 +76,7 @@ async fn test_automation_run_uses_declared_root_layers_and_runtime_context() {
             "--root",
             caller_root.path().to_str().unwrap(),
             "--no-thread",
-            "automations",
+            "jobs",
             "run",
             "scoped",
         ])
@@ -88,12 +88,12 @@ async fn test_automation_run_uses_declared_root_layers_and_runtime_context() {
     assert!(system.contains("DECLARED-ROOT-NOTE"), "{system}");
     assert!(!system.contains("CALLER-ROOT-NOTE"), "{system}");
     assert!(system.contains("This run is non-interactive"), "{system}");
-    assert!(system.contains("This run is a ZDX automation"), "{system}");
+    assert!(system.contains("This run is a ZDX job"), "{system}");
 
     let first_user = request["messages"][0].to_string();
     assert!(
         first_user.contains("<runtime_context>"),
-        "automation run must carry the runtime-context snapshot: {first_user}"
+        "job run must carry the runtime-context snapshot: {first_user}"
     );
 
     let records = read_run_records(zdx_home.path());
@@ -107,11 +107,11 @@ async fn test_automation_run_uses_declared_root_layers_and_runtime_context() {
 }
 
 #[tokio::test]
-async fn test_automation_run_with_missing_root_fails_without_running() {
+async fn test_job_run_with_missing_root_fails_without_running() {
     let zdx_home = TempDir::new().unwrap();
     let caller_root = TempDir::new().unwrap();
     let missing = caller_root.path().join("missing-root");
-    write_automation(
+    write_job(
         zdx_home.path(),
         "scoped",
         &format!("model: \"{MOCK_MODEL}\"\nroot: \"{}\"\n", missing.display()),
@@ -126,7 +126,7 @@ async fn test_automation_run_with_missing_root_fails_without_running() {
             "--root",
             caller_root.path().to_str().unwrap(),
             "--no-thread",
-            "automations",
+            "jobs",
             "run",
             "scoped",
         ])
@@ -143,15 +143,15 @@ async fn test_automation_run_with_missing_root_fails_without_running() {
 }
 
 #[test]
-fn test_automations_list_json_reports_resolved_settings_and_errors() {
+fn test_jobs_list_json_reports_resolved_settings_and_errors() {
     let zdx_home = TempDir::new().unwrap();
     let caller_root = TempDir::new().unwrap();
-    write_automation(
+    write_job(
         zdx_home.path(),
         "explicit",
         &format!("schedule: \"0 8 * * *\"\nmodel: \"{MOCK_MODEL}@low\"\n"),
     );
-    write_automation(zdx_home.path(), "broken", "root: \"relative/path\"\n");
+    write_job(zdx_home.path(), "broken", "root: \"relative/path\"\n");
 
     let output = crate::fixtures::zdx_cmd()
         .env("ZDX_HOME", zdx_home.path())
@@ -159,7 +159,7 @@ fn test_automations_list_json_reports_resolved_settings_and_errors() {
         .args([
             "--root",
             caller_root.path().to_str().unwrap(),
-            "automations",
+            "jobs",
             "list",
             "--json",
         ])
@@ -187,7 +187,7 @@ fn test_automations_list_json_reports_resolved_settings_and_errors() {
     assert_eq!(explicit["declared_model"], format!("{MOCK_MODEL}@low"));
     let settings = &explicit["settings"];
     assert_eq!(settings["model"]["spec"], format!("{MOCK_MODEL}@low"));
-    assert_eq!(settings["model"]["origin"], "automation");
+    assert_eq!(settings["model"]["origin"], "job");
     assert_eq!(settings["model"]["thinking"], "low");
     assert_eq!(settings["root"]["origin"], "caller");
     assert_eq!(
@@ -196,11 +196,11 @@ fn test_automations_list_json_reports_resolved_settings_and_errors() {
     );
 }
 
-/// A subagent body replaces the default system prompt. The automation must
+/// A subagent body replaces the default system prompt. The job must
 /// still carry project instructions (once), the Safety/Git rules, both
 /// non-interactive layers, and the memory index, while keeping the profile's tools.
 #[tokio::test]
-async fn test_subagent_automation_keeps_safeguards_and_context() {
+async fn test_subagent_job_keeps_safeguards_and_context() {
     if !can_bind_localhost() {
         eprintln!("Skipping: cannot bind localhost TCP port in this environment.");
         return;
@@ -219,7 +219,7 @@ async fn test_subagent_automation_keeps_safeguards_and_context() {
         "---\ndescription: Helper\ntools:\n  - read\n---\nHELPER-BODY. {% if project_context %}{{ project_context }}{% endif %}\n",
     )
     .unwrap();
-    write_automation(
+    write_job(
         zdx_home.path(),
         "delegated",
         &format!("model: \"{MOCK_MODEL}\"\nsubagent: helper\n"),
@@ -248,7 +248,7 @@ async fn test_subagent_automation_keeps_safeguards_and_context() {
             "--root",
             root.path().to_str().unwrap(),
             "--no-thread",
-            "automations",
+            "jobs",
             "run",
             "delegated",
         ])
@@ -271,7 +271,7 @@ async fn test_subagent_automation_keeps_safeguards_and_context() {
         "{system}"
     );
     assert_eq!(
-        system.matches("This run is a ZDX automation").count(),
+        system.matches("This run is a ZDX job").count(),
         1,
         "{system}"
     );
@@ -297,17 +297,17 @@ async fn test_subagent_automation_keeps_safeguards_and_context() {
 }
 
 #[test]
-fn test_automations_reject_global_model_flag() {
+fn test_jobs_reject_global_model_flag() {
     let zdx_home = TempDir::new().unwrap();
-    write_automation(zdx_home.path(), "any", "");
+    write_job(zdx_home.path(), "any", "");
 
     crate::fixtures::zdx_cmd()
         .env("ZDX_HOME", zdx_home.path())
-        .args(["--model", MOCK_MODEL, "automations", "run", "any"])
+        .args(["--model", MOCK_MODEL, "jobs", "run", "any"])
         .assert()
         .failure()
         .stderr(predicate::str::contains(
-            "--model is not supported for automations",
+            "--model is not supported for jobs",
         ));
 }
 
@@ -332,7 +332,7 @@ fn daemon_list(
         .args([
             "--root",
             caller_root.to_str().unwrap(),
-            "automations",
+            "jobs",
             "list",
             "--daemon",
             "--json",
@@ -346,7 +346,7 @@ fn daemon_list(
 }
 
 fn find<'a>(view: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
-    view["automations"]
+    view["jobs"]
         .as_array()
         .unwrap()
         .iter()
@@ -364,8 +364,8 @@ fn test_list_daemon_uses_running_daemon_context_not_caller_root() {
     let caller_root = TempDir::new().unwrap();
     write_daemon_config(caller_root.path(), "openai-codex:gpt-5.4@low");
     let scoped_root = TempDir::new().unwrap();
-    write_automation(zdx_home.path(), "inherited", "");
-    write_automation(
+    write_job(zdx_home.path(), "inherited", "");
+    write_job(
         zdx_home.path(),
         "scoped",
         &format!(
@@ -414,9 +414,9 @@ fn test_list_daemon_uses_running_daemon_context_not_caller_root() {
         scoped["root"]["path"],
         scoped_root.path().to_string_lossy().as_ref()
     );
-    assert_eq!(scoped["root"]["origin"], "automation");
+    assert_eq!(scoped["root"]["origin"], "job");
     assert_eq!(scoped["model"]["spec"], format!("{MOCK_MODEL}@medium"));
-    assert_eq!(scoped["model"]["origin"], "automation");
+    assert_eq!(scoped["model"]["origin"], "job");
 }
 
 #[test]
@@ -426,7 +426,7 @@ fn test_list_daemon_reports_installed_service_when_stopped() {
     let daemon_root = TempDir::new().unwrap();
     write_daemon_config(daemon_root.path(), "claude-cli:claude-sonnet-5@low");
     let caller_root = TempDir::new().unwrap();
-    write_automation(zdx_home.path(), "inherited", "");
+    write_job(zdx_home.path(), "inherited", "");
 
     let agents = home.path().join("Library").join("LaunchAgents");
     fs::create_dir_all(&agents).unwrap();
@@ -435,7 +435,7 @@ fn test_list_daemon_reports_installed_service_when_stopped() {
         agents.join("dev.zdx.daemon.plist"),
         format!(
             "<plist><dict>\n<key>ProgramArguments</key><array>\n<string>/bin/zsh</string>\n\
-             <string>-c</string>\n<string>exec '/bin/zdx' '--root' '{root}' 'automations' \
+             <string>-c</string>\n<string>exec '/bin/zdx' '--root' '{root}' 'jobs' \
              'daemon'</string>\n</array>\n<key>WorkingDirectory</key>\n<string>{root}</string>\n\
              <key>EnvironmentVariables</key><dict>\n<key>ZDX_HOME</key>\n<string>{}</string>\n\
              </dict></dict></plist>\n",
@@ -460,8 +460,8 @@ fn test_list_daemon_unavailable_never_falls_back_to_caller_root() {
     let home = TempDir::new().unwrap();
     let caller_root = TempDir::new().unwrap();
     let scoped_root = TempDir::new().unwrap();
-    write_automation(zdx_home.path(), "inherited", "");
-    write_automation(
+    write_job(zdx_home.path(), "inherited", "");
+    write_job(
         zdx_home.path(),
         "scoped",
         &format!("root: \"{}\"\n", scoped_root.path().display()),
@@ -492,7 +492,7 @@ fn test_list_daemon_unavailable_never_falls_back_to_caller_root() {
 #[test]
 fn test_set_model_command_edits_only_the_model_line() {
     let zdx_home = TempDir::new().unwrap();
-    let dir = zdx_home.path().join("automations");
+    let dir = zdx_home.path().join("jobs");
     fs::create_dir_all(&dir).unwrap();
     let path = dir.join("paused.md");
     let original = "---\n# paused: no schedule\ntimeout_secs: 60\n---\nDo the thing.\n";
@@ -501,7 +501,7 @@ fn test_set_model_command_edits_only_the_model_line() {
     let run = |args: &[&str]| {
         crate::fixtures::zdx_cmd()
             .env("ZDX_HOME", zdx_home.path())
-            .args(["automations", "set-model"])
+            .args(["jobs", "set-model"])
             .args(args)
             .assert()
     };

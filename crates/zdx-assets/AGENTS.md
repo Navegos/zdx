@@ -7,8 +7,8 @@ Scope: embedded asset content (prompts, instruction layers, default TOMLs, bundl
 - `src/lib.rs`: `&'static str` / `&'static [u8]` constants + `bundled_skill_assets()` / `bundled_command_assets()` accessors
 - `build.rs`: generates the bundled-skill and bundled-command asset manifests from `bundled_skills/` and `bundled_commands/`
 - `prompts/`: shared prompt templates (identity, system, handoff, thread title, read_thread)
-- `prompts/partials/*.md`: named MiniJinja partials (`project_instructions`, `runtime_layers`, `safety_rules`) registered by the engine renderer and pulled into templates with `{% include "<name>" %}`. The default system prompt and `prompts/non_interactive_subagent_suffix.md` (appended to a subagent prompt when an automation runs it) both use them, so edit these blocks only in the partials. Register a new partial in `PROMPT_PARTIALS` in `src/lib.rs`.
-- `instruction_layers/automation_instruction_layer.md`: automation-specific rules, applied on top of the exec layer (keep shared one-shot rules in the exec layer only)
+- `prompts/partials/*.md`: named MiniJinja partials (`project_instructions`, `runtime_layers`, `safety_rules`) registered by the engine renderer and pulled into templates with `{% include "<name>" %}`. The default system prompt and `prompts/non_interactive_subagent_suffix.md` (appended to a subagent prompt when a job runs it) both use them, so edit these blocks only in the partials. Register a new partial in `PROMPT_PARTIALS` in `src/lib.rs`.
+- `instruction_layers/job_instruction_layer.md`: job-specific rules, applied on top of the exec layer (keep shared one-shot rules in the exec layer only)
 - `instruction_layers/exec_instruction_layer.md`: non-interactive `zdx exec` run rules (direct CLI, orchestrator workers, zbar)
 - `instruction_layers/chat_instruction_layer.md`: interactive TUI chat output rules
 - `instruction_layers/telegram_instruction_layer.md`: Telegram bot output rules

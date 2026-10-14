@@ -976,7 +976,7 @@ pub struct Config {
     ///
     /// This is a relocation bound, not a deadline: the command keeps running.
     /// A per-call `timeout_secs` overrides the duration for that one command
-    /// but cannot make it lethal. Only an automation's `timeout_secs`
+    /// but cannot make it lethal. Only a job's `timeout_secs`
     /// frontmatter kills, and it suppresses the handoff entirely.
     pub bash_foreground_bound_secs: u32,
 

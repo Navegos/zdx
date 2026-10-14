@@ -319,7 +319,7 @@ impl BashOutput {
 /// the returned envelope carries `backgrounded: true` plus a `bg_id`. The
 /// caller's `timeout_secs` sets that bound and is never destructive.
 ///
-/// `timeout` is the run's configured tool deadline (an automation's
+/// `timeout` is the run's configured tool deadline (a job's
 /// `timeout_secs` frontmatter). It is the only destructive one, it is not
 /// reachable from the tool's arguments, and it suppresses the handoff so an
 /// operator's deadline still kills.
@@ -762,7 +762,7 @@ async fn run_command(
 
     if timed_out {
         let timeout_msg = format!(
-            "Command was killed after {} seconds by the deadline configured for this run (an automation's timeout_secs). The Bash timeout_secs argument cannot raise or remove it. Report that this run's operator-imposed limit stopped the command and what it needs instead, so the limit can be adjusted with the operator's approval.",
+            "Command was killed after {} seconds by the deadline configured for this run (a job's timeout_secs). The Bash timeout_secs argument cannot raise or remove it. Report that this run's operator-imposed limit stopped the command and what it needs instead, so the limit can be adjusted with the operator's approval.",
             timeout.map_or(0, |d| d.as_secs())
         );
         if let Some(ref tx) = output_tx {
@@ -1605,7 +1605,7 @@ mod handoff_tests {
         }
     }
 
-    /// The operator's deadline (an automation's `timeout_secs` frontmatter) is
+    /// The operator's deadline (a job's `timeout_secs` frontmatter) is
     /// the only destructive one, and it suppresses the handoff so it still
     /// kills. The caller's `0` must not reach it.
     #[tokio::test]
