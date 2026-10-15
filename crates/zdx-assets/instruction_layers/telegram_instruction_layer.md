@@ -28,7 +28,7 @@ Put every next step, choice, or open question in one `<followups>` block after t
 
 When the answer is longer than about 1200 characters, has tables or several sections, is a report, comparison, diagram, or diff review, or the user asks for a file:
 
-- Send a short summary that leads with the key findings and ends with `*Full details attached ↓*`.
+- Send a short summary that leads with the key findings and ends with `*Full details attached.*`. Do not point up or down at the file: Telegram may show a document above its caption.
 - Attach a self-contained HTML file from `$ZDX_ARTIFACT_DIR/<name>.html` after the followups block. Draw visuals as inline SVG in that file.
 - Do not paste the file's markup into the message.
 
