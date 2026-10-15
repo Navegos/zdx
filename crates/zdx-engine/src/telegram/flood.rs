@@ -1,0 +1,728 @@
+//! Flood control and delivery-outcome classification shared by every ZDX
+//! Telegram client (the bot runtime and [`super::TelegramOutbound`]).
+//!
+//! What Telegram documents (Bots FAQ, Bot API `ResponseParameters`): avoid
+//! more than about one message per second in a chat, at most 20 messages per
+//! minute in a group, and on HTTP 429 wait `retry_after` seconds before the
+//! request is repeated.
+//!
+//! What it does not document, and this module therefore does not assume:
+//! whether a 429 is scoped to one chat, one method, or the whole bot; whether
+//! forum topics have their own budget; and how edits, typing, deletes, or
+//! albums count. The pacing below is ZDX policy derived from the published
+//! numbers, keyed per chat and applied to new messages only. A refusal can
+//! still arrive at any time, so every caller must handle 429 regardless.
+
+use std::collections::VecDeque;
+use std::fmt;
+use std::time::{Duration, Instant};
+
+use anyhow::Result;
+use serde_json::Value;
+
+/// Policy: minimum spacing between new messages in one chat ("avoid sending
+/// more than one message per second").
+pub const MIN_NEW_MESSAGE_SPACING: Duration = Duration::from_secs(1);
+/// Policy: rolling window for the group limit.
+pub const GROUP_WINDOW: Duration = Duration::from_mins(1);
+/// Policy: new messages allowed per [`GROUP_WINDOW`] in a group chat.
+pub const GROUP_WINDOW_MAX_NEW_MESSAGES: usize = 20;
+/// Wait used when a 429 carries no usable `retry_after`.
+const FALLBACK_RETRY_AFTER: Duration = Duration::from_secs(5);
+
+/// Non-secret identity of a bot token: the numeric bot id before `:`. The
+/// secret half is never logged.
+#[must_use]
+pub fn bot_identity(token: &str) -> &str {
+    token
+        .split_once(':')
+        .map(|(id, _)| id)
+        .filter(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
+        .unwrap_or("unknown")
+}
+
+/// Telegram answered with `ok: false`. The request reached Telegram and was
+/// refused, so nothing was delivered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TelegramApiError {
+    pub method: String,
+    pub code: Option<u16>,
+    pub description: String,
+    /// `parameters.retry_after` (seconds) on a flood-control refusal.
+    pub retry_after: Option<u64>,
+}
+
+impl TelegramApiError {
+    /// Flood-control wait when this is a 429, else `None`.
+    #[must_use]
+    pub fn flood_wait(&self) -> Option<Duration> {
+        if self.code != Some(429) {
+            return None;
+        }
+        let secs = self
+            .retry_after
+            .or_else(|| retry_after_from_description(&self.description));
+        Some(secs.map_or(FALLBACK_RETRY_AFTER, |secs| {
+            Duration::from_secs(secs.max(1))
+        }))
+    }
+}
+
+impl fmt::Display for TelegramApiError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let code = self
+            .code
+            .map_or_else(|| "unknown".to_string(), |code| code.to_string());
+        write!(
+            f,
+            "Telegram API error for {} ({code}): {}",
+            self.method, self.description
+        )
+    }
+}
+
+impl std::error::Error for TelegramApiError {}
+
+fn retry_after_from_description(description: &str) -> Option<u64> {
+    let lower = description.to_ascii_lowercase();
+    let rest = &lower[lower.find("retry after ")? + "retry after ".len()..];
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
+}
+
+/// Whether a transport failure could have reached Telegram.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportStage {
+    /// The request was never sent (connection or request build failed).
+    NotSent,
+    /// The request may have been processed: it was written but no readable
+    /// answer came back (timeout, dropped connection, unparseable body).
+    Ambiguous,
+}
+
+/// The HTTP exchange with Telegram failed. Carries no URL, because Bot API
+/// URLs embed the token.
+#[derive(Debug)]
+pub struct TelegramTransportError {
+    pub method: String,
+    pub stage: TransportStage,
+    detail: String,
+}
+
+impl TelegramTransportError {
+    /// Classifies a `reqwest` failure. The URL is stripped before the error
+    /// text is kept.
+    #[must_use]
+    pub fn from_reqwest(method: &str, err: reqwest::Error) -> Self {
+        let stage = if err.is_connect() || err.is_builder() {
+            TransportStage::NotSent
+        } else {
+            TransportStage::Ambiguous
+        };
+        let err = err.without_url();
+        let mut detail = err.to_string();
+        let mut source = std::error::Error::source(&err);
+        while let Some(cause) = source {
+            detail.push_str(": ");
+            detail.push_str(&cause.to_string());
+            source = cause.source();
+        }
+        Self {
+            method: method.to_string(),
+            stage,
+            detail,
+        }
+    }
+
+    /// The body is not kept: it may echo request data, and logs and delivery
+    /// records must not carry message bodies or the token.
+    fn unreadable_body(method: &str, body: &[u8]) -> Self {
+        Self {
+            method: method.to_string(),
+            stage: TransportStage::Ambiguous,
+            detail: format!("unreadable response ({} bytes)", body.len()),
+        }
+    }
+}
+
+impl fmt::Display for TelegramTransportError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.stage {
+            TransportStage::NotSent => write!(
+                f,
+                "Telegram request for {} was not sent: {}",
+                self.method, self.detail
+            ),
+            TransportStage::Ambiguous => write!(
+                f,
+                "Telegram request for {} got no readable answer and may have been delivered: {}",
+                self.method, self.detail
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TelegramTransportError {}
+
+/// A send skipped locally because the chat is inside a flood wait that
+/// Telegram announced earlier. Nothing was sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FloodWaitActive {
+    pub method: String,
+    pub chat_id: i64,
+    pub remaining: Duration,
+}
+
+impl fmt::Display for FloodWaitActive {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} not sent: Telegram flood wait for chat {} has {}s left",
+            self.method,
+            self.chat_id,
+            self.remaining.as_secs().max(1)
+        )
+    }
+}
+
+impl std::error::Error for FloodWaitActive {}
+
+/// Parses a Bot API response body into its `result`.
+///
+/// # Errors
+/// [`TelegramApiError`] for `ok: false`; an ambiguous
+/// [`TelegramTransportError`] when the body is not a Bot API envelope.
+pub fn parse_response(method: &str, bytes: &[u8]) -> Result<Value> {
+    let Ok(value) = serde_json::from_slice::<Value>(bytes) else {
+        return Err(TelegramTransportError::unreadable_body(method, bytes).into());
+    };
+    match value.get("ok").and_then(Value::as_bool) {
+        Some(true) => Ok(value.get("result").cloned().unwrap_or(Value::Bool(true))),
+        Some(false) => Err(TelegramApiError {
+            method: method.to_string(),
+            code: value
+                .get("error_code")
+                .and_then(Value::as_u64)
+                .and_then(|code| u16::try_from(code).ok()),
+            description: value
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or("Telegram API error")
+                .to_string(),
+            retry_after: value
+                .get("parameters")
+                .and_then(|params| params.get("retry_after"))
+                .and_then(Value::as_u64),
+        }
+        .into()),
+        None => Err(TelegramTransportError::unreadable_body(method, bytes).into()),
+    }
+}
+
+/// What a failed call means for delivery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureClass {
+    /// Flood control refused it (or a known wait is still running). Not
+    /// delivered; may be repeated after the wait.
+    FloodWait(Duration),
+    /// Telegram refused it for another reason. Not delivered.
+    Rejected,
+    /// Never sent (local error, connection failure). Not delivered.
+    NotSent,
+    /// May or may not have been delivered. Never resent automatically: a
+    /// resend could duplicate the message.
+    Unknown,
+}
+
+impl FailureClass {
+    /// Whether the item is known not to have been delivered.
+    #[must_use]
+    pub fn is_definitely_undelivered(self) -> bool {
+        !matches!(self, Self::Unknown)
+    }
+
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::FloodWait(_) => "flood_wait",
+            Self::Rejected => "rejected",
+            Self::NotSent => "not_sent",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Classifies a client error.
+///
+/// Errors carrying none of this module's types come from local work before
+/// any request (reading a file, size checks), so they count as not sent. Every
+/// network path in a ZDX Telegram client must therefore surface its failure
+/// as one of these types.
+#[must_use]
+pub fn classify(err: &anyhow::Error) -> FailureClass {
+    for cause in err.chain() {
+        if let Some(api) = cause.downcast_ref::<TelegramApiError>() {
+            return api
+                .flood_wait()
+                .map_or(FailureClass::Rejected, FailureClass::FloodWait);
+        }
+        if let Some(transport) = cause.downcast_ref::<TelegramTransportError>() {
+            return match transport.stage {
+                TransportStage::NotSent => FailureClass::NotSent,
+                TransportStage::Ambiguous => FailureClass::Unknown,
+            };
+        }
+        if let Some(active) = cause.downcast_ref::<FloodWaitActive>() {
+            return FailureClass::FloodWait(active.remaining);
+        }
+    }
+    FailureClass::NotSent
+}
+
+/// Bounded retry for important sends after an explicit flood refusal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetryPolicy {
+    /// Total attempts, including the first.
+    pub max_attempts: u32,
+    /// Longest time from the first attempt to the start of the last one.
+    pub deadline: Duration,
+}
+
+impl RetryPolicy {
+    /// Policy for reply text and files: three attempts within two minutes.
+    pub const IMPORTANT: Self = Self {
+        max_attempts: 3,
+        deadline: Duration::from_mins(2),
+    };
+
+    /// Delay before the next attempt, or `None` to give up. The wait is never
+    /// shortened to fit the deadline: if Telegram's wait does not fit, the
+    /// send fails instead.
+    #[must_use]
+    pub fn delay_before_retry(
+        self,
+        attempts_made: u32,
+        elapsed: Duration,
+        retry_after: Duration,
+    ) -> Option<Duration> {
+        if attempts_made >= self.max_attempts {
+            return None;
+        }
+        (elapsed + retry_after <= self.deadline).then_some(retry_after)
+    }
+}
+
+/// Per-chat pacing and cooldown state.
+///
+/// Only new messages are paced and counted; edits, deletes, and typing are
+/// not, because Telegram does not document how they count. A flood wait
+/// blocks every call to the chat until it ends. Admission is checked and
+/// recorded in one step at send time, so waiters that wake together still go
+/// out one slot apart.
+#[derive(Debug, Default)]
+pub struct ChatPacer {
+    last_new_message: Option<Instant>,
+    /// Send times of recent new messages, ascending.
+    window: VecDeque<Instant>,
+    cooldown_until: Option<Instant>,
+}
+
+impl ChatPacer {
+    /// Time left in an announced flood wait.
+    #[must_use]
+    pub fn cooldown_remaining(&self, now: Instant) -> Option<Duration> {
+        self.cooldown_until
+            .and_then(|until| until.checked_duration_since(now))
+            .filter(|left| !left.is_zero())
+    }
+
+    /// Records a flood refusal: nothing goes to the chat for `retry_after`.
+    pub fn note_flood_wait(&mut self, now: Instant, retry_after: Duration) {
+        let until = now + retry_after;
+        self.cooldown_until = Some(self.cooldown_until.map_or(until, |c| c.max(until)));
+    }
+
+    /// Admits a new message now and counts it, or returns the earliest time
+    /// it may be retried. A later refusal or another sender can move that
+    /// time, so callers check again after waiting.
+    ///
+    /// # Errors
+    /// The earliest admission time when the message may not go out now.
+    pub fn try_admit_new_message(&mut self, now: Instant, is_group: bool) -> Result<(), Instant> {
+        self.prune(now);
+        let mut at = now;
+        if let Some(until) = self.cooldown_until {
+            at = at.max(until);
+        }
+        if let Some(last) = self.last_new_message {
+            at = at.max(last + MIN_NEW_MESSAGE_SPACING);
+        }
+        if is_group && self.window.len() >= GROUP_WINDOW_MAX_NEW_MESSAGES {
+            let oldest_in_limit = self.window[self.window.len() - GROUP_WINDOW_MAX_NEW_MESSAGES];
+            at = at.max(oldest_in_limit + GROUP_WINDOW);
+        }
+        if at > now {
+            return Err(at);
+        }
+        self.record_new_message(now);
+        Ok(())
+    }
+
+    /// Counts a new message sent at `at` without waiting for admission.
+    pub fn record_new_message(&mut self, at: Instant) {
+        self.last_new_message = Some(self.last_new_message.map_or(at, |last| last.max(at)));
+        let idx = self.window.partition_point(|t| *t <= at);
+        self.window.insert(idx, at);
+    }
+
+    fn prune(&mut self, now: Instant) {
+        while let Some(first) = self.window.front() {
+            if *first + GROUP_WINDOW <= now {
+                self.window.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+}
+
+/// One Telegram call attempt, for the per-call log line.
+#[derive(Debug, Clone, Copy)]
+pub struct CallRecord<'a> {
+    /// `"bot"` (the bot runtime) or `"outbound"` (`zdx telegram`, the tool).
+    pub client: &'static str,
+    pub bot: &'a str,
+    pub method: &'a str,
+    pub chat: Option<i64>,
+    pub topic: Option<i64>,
+    /// Whether the call creates a new chat message.
+    pub new_message: bool,
+    pub attempt: u32,
+    pub waited: Duration,
+    pub duration: Duration,
+}
+
+/// Logs one call attempt. New messages log at `info` so message rates can be
+/// measured from the default log; other calls log at `debug`. Message bodies
+/// and tokens are never logged. `client` plus `pid` identify the sending
+/// process (the bot, or a tool/CLI process); a reply's delivery record logs
+/// the message ids it produced, which ties these lines to that record.
+pub fn log_call(record: &CallRecord<'_>, outcome: Result<Option<i64>, &anyhow::Error>) {
+    let waited_ms = u64::try_from(record.waited.as_millis()).unwrap_or(u64::MAX);
+    let duration_ms = u64::try_from(record.duration.as_millis()).unwrap_or(u64::MAX);
+    let pid = std::process::id();
+    match outcome {
+        Ok(message_id) => {
+            if record.new_message {
+                tracing::info!(
+                    client = record.client,
+                    pid,
+                    bot = record.bot,
+                    method = record.method,
+                    chat = record.chat,
+                    topic = record.topic,
+                    attempt = record.attempt,
+                    message_id,
+                    waited_ms,
+                    duration_ms,
+                    outcome = "ok",
+                    "Telegram call"
+                );
+            } else {
+                tracing::debug!(
+                    client = record.client,
+                    pid,
+                    bot = record.bot,
+                    method = record.method,
+                    chat = record.chat,
+                    topic = record.topic,
+                    attempt = record.attempt,
+                    waited_ms,
+                    duration_ms,
+                    outcome = "ok",
+                    "Telegram call"
+                );
+            }
+        }
+        Err(err) => {
+            let class = classify(err);
+            let retry_after_s = match class {
+                FailureClass::FloodWait(wait) => Some(wait.as_secs()),
+                _ => None,
+            };
+            let error = format!("{err:#}");
+            let skipped_locally = err
+                .chain()
+                .any(<dyn std::error::Error>::is::<FloodWaitActive>);
+            if record.new_message && !skipped_locally {
+                tracing::warn!(
+                    client = record.client,
+                    pid,
+                    bot = record.bot,
+                    method = record.method,
+                    chat = record.chat,
+                    topic = record.topic,
+                    attempt = record.attempt,
+                    retry_after_s,
+                    waited_ms,
+                    duration_ms,
+                    outcome = class.label(),
+                    error,
+                    "Telegram call failed"
+                );
+            } else {
+                tracing::debug!(
+                    client = record.client,
+                    pid,
+                    bot = record.bot,
+                    method = record.method,
+                    chat = record.chat,
+                    topic = record.topic,
+                    attempt = record.attempt,
+                    retry_after_s,
+                    waited_ms,
+                    duration_ms,
+                    outcome = if skipped_locally {
+                        "skipped_cooldown"
+                    } else {
+                        class.label()
+                    },
+                    error,
+                    "Telegram call failed"
+                );
+            }
+        }
+    }
+}
+
+/// Extracts `message_id` from a send result, for logs and delivery records.
+#[must_use]
+pub fn result_message_id(result: &Value) -> Option<i64> {
+    result.get("message_id").and_then(Value::as_i64)
+}
+
+/// Decodes an `ok: true` result and returns it with its `message_id`. A
+/// decode failure means Telegram accepted the call but the answer was not
+/// understood, so it classifies as ambiguous rather than as "not sent". The
+/// serde error is not kept: it can quote values from the response.
+///
+/// # Errors
+/// An ambiguous [`TelegramTransportError`] when `value` does not decode.
+pub fn decode_result<T: serde::de::DeserializeOwned>(
+    method: &str,
+    value: Value,
+) -> Result<(Option<i64>, T)> {
+    let message_id = result_message_id(&value);
+    serde_json::from_value(value)
+        .map(|decoded| (message_id, decoded))
+        .map_err(|_quotes_response_values| {
+            TelegramTransportError {
+                method: method.to_string(),
+                stage: TransportStage::Ambiguous,
+                detail: "accepted, but the result did not decode".to_string(),
+            }
+            .into()
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn api_error(code: u16, description: &str, retry_after: Option<u64>) -> anyhow::Error {
+        TelegramApiError {
+            method: "sendDocument".to_string(),
+            code: Some(code),
+            description: description.to_string(),
+            retry_after,
+        }
+        .into()
+    }
+
+    #[test]
+    fn bot_identity_keeps_only_the_numeric_id() {
+        assert_eq!(bot_identity("123456:secret-part"), "123456");
+        assert_eq!(bot_identity("no-colon"), "unknown");
+        assert_eq!(bot_identity("abc:secret"), "unknown");
+    }
+
+    #[test]
+    fn parses_flood_refusal_with_retry_after() {
+        let body = br#"{"ok":false,"error_code":429,"description":"Too Many Requests: retry after 11","parameters":{"retry_after":11}}"#;
+        let err = parse_response("sendDocument", body).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Telegram API error for sendDocument (429): Too Many Requests: retry after 11"
+        );
+        assert_eq!(
+            classify(&err),
+            FailureClass::FloodWait(Duration::from_secs(11))
+        );
+    }
+
+    #[test]
+    fn flood_wait_falls_back_to_the_description() {
+        let err = api_error(429, "Too Many Requests: retry after 7", None);
+        assert_eq!(
+            classify(&err),
+            FailureClass::FloodWait(Duration::from_secs(7))
+        );
+        let err = api_error(429, "Too Many Requests", None);
+        assert_eq!(
+            classify(&err),
+            FailureClass::FloodWait(FALLBACK_RETRY_AFTER)
+        );
+    }
+
+    #[test]
+    fn other_refusals_are_rejected_and_context_is_kept() {
+        let err = api_error(400, "Bad Request: chat not found", None).context("send reply");
+        assert_eq!(classify(&err), FailureClass::Rejected);
+    }
+
+    #[test]
+    fn unreadable_bodies_are_ambiguous_and_not_echoed() {
+        let body = b"<html>502 echo of bot123:secret-marker</html>";
+        let err = parse_response("sendMessage", body).unwrap_err();
+        assert_eq!(classify(&err), FailureClass::Unknown);
+        let text = format!("{err:#}");
+        assert!(text.contains("may have been delivered"));
+        assert!(!text.contains("secret-marker"));
+    }
+
+    #[test]
+    fn undecodable_results_are_ambiguous_and_not_echoed() {
+        #[derive(Debug, serde::Deserialize)]
+        struct Sent {
+            #[allow(dead_code)]
+            message_id: i64,
+        }
+        let value = parse_response(
+            "sendMessage",
+            br#"{"ok":true,"result":{"message_id":"secret-marker"}}"#,
+        )
+        .expect("ok envelope");
+        let err = decode_result::<Sent>("sendMessage", value).unwrap_err();
+        assert_eq!(classify(&err), FailureClass::Unknown);
+        assert!(!format!("{err:#}").contains("secret-marker"));
+    }
+
+    #[test]
+    fn local_errors_count_as_not_sent() {
+        let err = anyhow::anyhow!("read document file /tmp/missing");
+        assert_eq!(classify(&err), FailureClass::NotSent);
+    }
+
+    #[test]
+    fn ok_results_are_returned() {
+        let value =
+            parse_response("sendMessage", br#"{"ok":true,"result":{"message_id":5}}"#).expect("ok");
+        assert_eq!(result_message_id(&value), Some(5));
+    }
+
+    #[test]
+    fn retry_policy_honours_attempts_and_deadline() {
+        let policy = RetryPolicy::IMPORTANT;
+        let wait = Duration::from_secs(11);
+        assert_eq!(
+            policy.delay_before_retry(1, Duration::ZERO, wait),
+            Some(wait)
+        );
+        assert_eq!(policy.delay_before_retry(3, Duration::ZERO, wait), None);
+        // Never shortened to fit: a wait that overruns the deadline gives up.
+        assert_eq!(
+            policy.delay_before_retry(1, Duration::from_secs(115), wait),
+            None
+        );
+    }
+
+    /// Admits like a waiter would: retry at the returned time until admitted.
+    fn admit(pacer: &mut ChatPacer, mut now: Instant, is_group: bool) -> Instant {
+        loop {
+            match pacer.try_admit_new_message(now, is_group) {
+                Ok(()) => return now,
+                Err(at) => now = at,
+            }
+        }
+    }
+
+    #[test]
+    fn pacer_spaces_new_messages_by_one_second() {
+        let start = Instant::now();
+        let mut pacer = ChatPacer::default();
+        assert_eq!(admit(&mut pacer, start, false), start);
+        assert_eq!(
+            pacer.try_admit_new_message(start, false),
+            Err(start + MIN_NEW_MESSAGE_SPACING)
+        );
+        // An unpaced send also pushes the next slot.
+        pacer.record_new_message(start + Duration::from_secs(5));
+        assert_eq!(
+            admit(&mut pacer, start, false),
+            start + Duration::from_secs(6)
+        );
+    }
+
+    #[test]
+    fn pacer_caps_groups_at_twenty_per_minute() {
+        let start = Instant::now();
+        let mut pacer = ChatPacer::default();
+        let mut last = start;
+        for _ in 0..GROUP_WINDOW_MAX_NEW_MESSAGES {
+            last = admit(&mut pacer, last, true);
+        }
+        assert_eq!(last, start + Duration::from_secs(19));
+        // The 21st waits until the first one leaves the window.
+        assert_eq!(admit(&mut pacer, last, true), start + GROUP_WINDOW);
+    }
+
+    #[test]
+    fn private_chats_are_not_capped_per_minute() {
+        let start = Instant::now();
+        let mut pacer = ChatPacer::default();
+        let mut last = start;
+        for _ in 0..=GROUP_WINDOW_MAX_NEW_MESSAGES {
+            last = admit(&mut pacer, last, false);
+        }
+        assert_eq!(last, start + Duration::from_secs(20));
+    }
+
+    #[test]
+    fn waiters_released_by_a_cooldown_still_go_out_one_slot_apart() {
+        let start = Instant::now();
+        let mut pacer = ChatPacer::default();
+        pacer.note_flood_wait(start, Duration::from_secs(10));
+        let end = start + Duration::from_secs(10);
+        // Two senders both wake when the wait ends: one goes, one waits.
+        assert_eq!(pacer.try_admit_new_message(end, true), Ok(()));
+        assert_eq!(
+            pacer.try_admit_new_message(end, true),
+            Err(end + MIN_NEW_MESSAGE_SPACING)
+        );
+    }
+
+    #[test]
+    fn cooldown_delays_admission_and_reports_remaining() {
+        let start = Instant::now();
+        let mut pacer = ChatPacer::default();
+        pacer.note_flood_wait(start, Duration::from_secs(11));
+        assert_eq!(
+            pacer.cooldown_remaining(start + Duration::from_secs(1)),
+            Some(Duration::from_secs(10))
+        );
+        assert_eq!(
+            pacer.try_admit_new_message(start, true),
+            Err(start + Duration::from_secs(11))
+        );
+        assert_eq!(
+            pacer.cooldown_remaining(start + Duration::from_secs(11)),
+            None
+        );
+        // A shorter later wait does not shorten the running one.
+        pacer.note_flood_wait(start, Duration::from_secs(2));
+        assert_eq!(
+            pacer.cooldown_remaining(start),
+            Some(Duration::from_secs(11))
+        );
+    }
+}

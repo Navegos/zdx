@@ -10,6 +10,19 @@ use zdx_engine::core::thread_persistence::ThreadEvent;
 use crate::cell::HistoryCell;
 use crate::reasoning::reasoning_display_text;
 
+/// Warning cell for a delivery record with undelivered items. A record
+/// superseded by its later outcome shows nothing.
+fn delivery_cell(
+    record: &zdx_engine::core::delivery::DeliveryRecord,
+    superseded: bool,
+) -> Option<HistoryCell> {
+    if superseded {
+        return None;
+    }
+    zdx_engine::core::delivery::notice_text(record)
+        .map(|notice| HistoryCell::system(format!("⚠ {notice}")))
+}
+
 /// Builds transcript cells from thread events.
 ///
 /// Maps thread events to display cells:
@@ -18,6 +31,7 @@ use crate::reasoning::reasoning_display_text;
 /// - unmatched `ToolUse` → cancelled `Tool` cell (the historical turn ended without a result)
 /// - `Thinking`/`Reasoning` → `Thinking` cells
 /// - Skips `Meta` and `Interrupted` events
+/// - `Notice` and undelivered `Delivery` records → system warning cells
 ///
 /// Consecutive assistant `Message` events with the same `phase` coalesce
 /// into a single cell. Persistence emits one event per `ChatContentBlock::Text`,
@@ -33,8 +47,9 @@ pub fn build_transcript_from_events(events: &[ThreadEvent]) -> Vec<HistoryCell> 
     let mut tool_cells: HashMap<String, usize> = HashMap::new();
     // (phase, accumulated_text) for the in-progress assistant coalesce.
     let mut pending_assistant: Option<(Option<String>, String)> = None;
+    let superseded = zdx_engine::core::thread_persistence::superseded_deliveries(events);
 
-    for event in events {
+    for (idx, event) in events.iter().enumerate() {
         match event {
             ThreadEvent::Message {
                 role, text, phase, ..
@@ -56,6 +71,10 @@ pub fn build_transcript_from_events(events: &[ThreadEvent]) -> Vec<HistoryCell> 
             ThreadEvent::Notice { message, .. } => {
                 flush_pending_assistant(&mut pending_assistant, &mut cells);
                 cells.push(HistoryCell::system(format!("⚠ {message}")));
+            }
+            ThreadEvent::Delivery { record, .. } => {
+                flush_pending_assistant(&mut pending_assistant, &mut cells);
+                cells.extend(delivery_cell(record, superseded.contains(&idx)));
             }
             ThreadEvent::Message { role, text, .. } => {
                 flush_pending_assistant(&mut pending_assistant, &mut cells);

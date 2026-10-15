@@ -107,6 +107,27 @@ fn visible_char_count(input: &str) -> usize {
     count
 }
 
+/// Upper bound on Telegram's "characters after entities parsing" for HTML:
+/// tags are dropped and text is counted in UTF-16 code units. Entities count
+/// as 2 so a numeric entity outside the BMP is never undercounted.
+pub(crate) fn visible_utf16_len(input: &str) -> usize {
+    let mut count = 0;
+    let mut cursor = 0;
+    while cursor < input.len() {
+        let rest = &input[cursor..];
+        if let Some(tag) = parse_telegram_tag(rest) {
+            cursor += tag.len;
+        } else if let Some(len) = telegram_entity_len(rest) {
+            cursor += len;
+            count += 2;
+        } else if let Some(ch) = rest.chars().next() {
+            cursor += ch.len_utf8();
+            count += ch.len_utf16();
+        }
+    }
+    count
+}
+
 struct HtmlTag<'a> {
     name: &'a str,
     attributes: &'a str,

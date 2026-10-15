@@ -419,6 +419,162 @@ fn notice_thread_event_is_not_replayed_as_chat_message() {
     }
 }
 
+fn failed_file_delivery(
+    id_source: &crate::core::delivery::DeliveryRecord,
+) -> crate::core::delivery::DeliveryRecord {
+    let mut record = id_source.clone();
+    record.items[0].mark_sent(Some(10));
+    record.items[1].mark_failed("Telegram API error for sendDocument (429): Too Many Requests");
+    record
+}
+
+fn pending_delivery() -> crate::core::delivery::DeliveryRecord {
+    use crate::core::delivery::{DeliveryItem, DeliveryRecord};
+    DeliveryRecord::new(
+        "telegram",
+        Some(-100),
+        Some(7),
+        vec![
+            DeliveryItem::text(),
+            DeliveryItem::file("/tmp/out/report.html"),
+        ],
+    )
+}
+
+fn content_texts(message: &crate::providers::ChatMessage) -> Vec<String> {
+    use crate::providers::{ChatContentBlock, MessageContent};
+    match &message.content {
+        MessageContent::Text(text) => vec![text.clone()],
+        MessageContent::Blocks(blocks) => blocks
+            .iter()
+            .filter_map(|block| match block {
+                ChatContentBlock::Text { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect(),
+    }
+}
+
+#[test]
+fn undelivered_items_reach_the_next_user_message() {
+    // The incident this protects: the model said a file "was attached" when
+    // the send had failed. The outcome must reach the model, once, on the
+    // next user turn, and never as a conversation turn of its own.
+    let pending = pending_delivery();
+    let outcome = failed_file_delivery(&pending);
+    let events = vec![
+        ThreadEvent::user_message("make the diagram"),
+        ThreadEvent::assistant_message("Ready <media>/tmp/out/report.html</media>"),
+        ThreadEvent::delivery(pending),
+        ThreadEvent::delivery(outcome),
+        ThreadEvent::user_message("where is the file?"),
+        ThreadEvent::assistant_message("resent"),
+        ThreadEvent::user_message("thanks"),
+    ];
+
+    let replay = thread_events_to_replay(events);
+    assert_eq!(replay.trailing_delivery_note, None);
+    let messages = replay.messages;
+    assert_eq!(messages.len(), 5, "delivery adds no turn of its own");
+
+    let asked = content_texts(&messages[2]);
+    assert_eq!(asked.len(), 2);
+    assert!(asked[0].starts_with("<delivery_status>"));
+    assert!(asked[0].contains("file /tmp/out/report.html: not delivered"));
+    assert!(
+        !asked[0].contains("reply text"),
+        "sent items are not listed"
+    );
+    assert_eq!(asked[1], "where is the file?");
+
+    // Only the first user message after the record carries it.
+    assert_eq!(content_texts(&messages[4]), ["thanks"]);
+    assert_eq!(content_texts(&messages[0]), ["make the diagram"]);
+}
+
+#[test]
+fn delivery_after_the_last_user_message_is_returned_as_trailing_note() {
+    let pending = pending_delivery();
+    let events = vec![
+        ThreadEvent::user_message("go"),
+        ThreadEvent::assistant_message("done"),
+        ThreadEvent::delivery(failed_file_delivery(&pending)),
+    ];
+    let replay = thread_events_to_replay(events);
+    assert_eq!(replay.messages.len(), 2);
+    let note = replay.trailing_delivery_note.expect("trailing note");
+    assert!(note.contains("report.html: not delivered"));
+
+    // A pending record with no outcome (process stopped mid-send) is unknown.
+    let events = vec![
+        ThreadEvent::user_message("go"),
+        ThreadEvent::assistant_message("done"),
+        ThreadEvent::delivery(pending_delivery()),
+    ];
+    let note = thread_events_to_replay(events)
+        .trailing_delivery_note
+        .expect("trailing note");
+    assert!(note.contains("still running or was interrupted"));
+}
+
+#[test]
+fn fully_delivered_replies_add_nothing_to_replay() {
+    let mut record = pending_delivery();
+    record.items[0].mark_sent(Some(1));
+    record.items[1].mark_sent(Some(1));
+    let events = vec![
+        ThreadEvent::user_message("go"),
+        ThreadEvent::assistant_message("done"),
+        ThreadEvent::delivery(pending_delivery()),
+        ThreadEvent::delivery(record.clone()),
+        ThreadEvent::user_message("next"),
+    ];
+    // The pending record has a different id, so it would still be reported:
+    // only records whose final outcome is clean disappear.
+    let replay = thread_events_to_replay(events);
+    assert!(content_texts(&replay.messages[2])[0].starts_with("<delivery_status>"));
+
+    let mut pending = pending_delivery();
+    let events = vec![
+        ThreadEvent::user_message("go"),
+        ThreadEvent::assistant_message("done"),
+        ThreadEvent::delivery(pending.clone()),
+        ThreadEvent::delivery({
+            pending.items[0].mark_sent(Some(1));
+            pending.items[1].mark_sent(Some(1));
+            pending
+        }),
+        ThreadEvent::user_message("next"),
+    ];
+    let replay = thread_events_to_replay(events);
+    assert_eq!(content_texts(&replay.messages[2]), ["next"]);
+    assert_eq!(replay.trailing_delivery_note, None);
+}
+
+#[test]
+fn delivery_event_roundtrips_and_superseded_records_are_hidden_from_transcripts() {
+    let pending = pending_delivery();
+    let outcome = failed_file_delivery(&pending);
+    let line = serde_json::to_string(&ThreadEvent::delivery(outcome.clone())).expect("serialize");
+    assert!(line.contains("\"type\":\"delivery\""));
+    assert!(line.contains("\"surface\":\"telegram\""));
+    let parsed: ThreadEvent = serde_json::from_str(&line).expect("parse");
+    assert!(matches!(&parsed, ThreadEvent::Delivery { record, .. } if *record == outcome));
+
+    let events = vec![
+        ThreadEvent::user_message("go"),
+        ThreadEvent::delivery(pending),
+        parsed,
+    ];
+    assert_eq!(
+        superseded_deliveries(&events),
+        std::collections::HashSet::from([1])
+    );
+    let transcript = format_transcript(&events);
+    assert_eq!(transcript.matches("Telegram delivery:").count(), 1);
+    assert!(transcript.contains("file report.html: not delivered"));
+}
+
 #[test]
 fn notice_thread_event_wire_format_roundtrips_as_tagged_json() {
     // Locks the on-disk JSONL contract: notice events are written as

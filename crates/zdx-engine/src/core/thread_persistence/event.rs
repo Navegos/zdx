@@ -255,6 +255,16 @@ pub enum ThreadEvent {
         message: String,
         ts: String,
     },
+
+    /// What a chat surface actually delivered for the preceding final reply
+    /// (see `crate::core::delivery`). A pending record is written before the
+    /// sends and the outcome after them, with the same `record.id`; the later
+    /// one wins. Replay projects undelivered items into the next user message.
+    Delivery {
+        #[serde(flatten)]
+        record: crate::core::delivery::DeliveryRecord,
+        ts: String,
+    },
 }
 
 impl ThreadEvent {
@@ -399,6 +409,14 @@ impl ThreadEvent {
         }
     }
 
+    /// Creates a delivery event for a reply sent to a chat surface.
+    pub fn delivery(record: crate::core::delivery::DeliveryRecord) -> Self {
+        Self::Delivery {
+            record,
+            ts: chrono_timestamp(),
+        }
+    }
+
     /// Creates a new reasoning event.
     pub fn reasoning(text: Option<String>, replay: Option<crate::providers::ReplayToken>) -> Self {
         Self::Reasoning {
@@ -498,6 +516,23 @@ fn default_interrupted_text() -> String {
 }
 
 /// Returns an RFC3339 UTC timestamp string.
+/// Indices of `Delivery` events replaced by a later event with the same record
+/// id (a pending record followed by its outcome). Display paths skip them so
+/// one reply shows one delivery state.
+#[must_use]
+pub fn superseded_deliveries(events: &[ThreadEvent]) -> std::collections::HashSet<usize> {
+    let mut last_by_id: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    let mut superseded = std::collections::HashSet::new();
+    for (idx, event) in events.iter().enumerate() {
+        if let ThreadEvent::Delivery { record, .. } = event
+            && let Some(previous) = last_by_id.insert(record.id.as_str(), idx)
+        {
+            superseded.insert(previous);
+        }
+    }
+    superseded
+}
+
 pub(crate) fn chrono_timestamp() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }

@@ -72,7 +72,11 @@
   let workersBusy = $derived(isBusy(workerRollup));
   let workersAttention = $derived(needsAttention(workerRollup));
 
-  let live = $derived(data ? data.activity.some((a) => a.type === "tool_running") : false);
+  // A pending reply delivery also counts: its warning must be replaced by the
+  // outcome without a reload.
+  let live = $derived(
+    data ? data.delivering === true || data.activity.some((a) => a.type === "tool_running") : false,
+  );
 
   let dirty = $derived(
     currentGit

@@ -1,9 +1,12 @@
 //! Suggested-reply buttons using the internal `<followups>` protocol.
 //!
 //! The model appends a `<followups>` block to its final reply; the bot strips
-//! it, sends a separate message with one inline button per suggestion, and a
-//! tap dispatches that suggestion as the user's next message (a normal new
-//! turn). Nothing blocks while the buttons sit unanswered.
+//! it and attaches one inline button per suggestion to the reply message
+//! itself (a separate "Suggested replies" message only when the reply has no
+//! text). A tap dispatches that suggestion as the user's next message (a
+//! normal new turn). Taps change only the keyboard, never the message text,
+//! because the buttons usually sit on the answer. Nothing blocks while the
+//! buttons sit unanswered.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -25,18 +28,12 @@ pub(crate) fn new_followup_map() -> FollowupMap {
     Arc::new(Mutex::new(HashMap::new()))
 }
 
-/// Sends the suggested-replies message and registers the options for
-/// callback lookup.
-pub(crate) async fn send_followups(
-    context: &BotContext,
-    chat_id: i64,
-    topic_id: Option<i64>,
-    items: Vec<String>,
-) {
+/// Inline keyboard for `items`: one button per suggestion plus Dismiss.
+/// `None` when there are no suggestions.
+pub(crate) fn keyboard(items: &[String]) -> Option<InlineKeyboardMarkup> {
     if items.is_empty() {
-        return;
+        return None;
     }
-
     let mut rows: Vec<Vec<InlineKeyboardButton>> = items
         .iter()
         .enumerate()
@@ -48,12 +45,36 @@ pub(crate) async fn send_followups(
         })
         .collect();
     rows.push(vec![InlineKeyboardButton::callback("✕ Dismiss", "fu:x")]);
-    let markup = InlineKeyboardMarkup {
+    Some(InlineKeyboardMarkup {
         inline_keyboard: rows,
-    };
+    })
+}
 
+/// Registers the suggestions shown on message `message_id` for tap lookup.
+pub(crate) fn register(context: &BotContext, chat_id: i64, message_id: i64, items: Vec<String>) {
+    if items.is_empty() {
+        return;
+    }
+    context
+        .followup_map()
+        .lock()
+        .expect("followup lock poisoned")
+        .insert((chat_id, message_id), items);
+}
+
+/// Sends the suggestions as their own message, for replies without text.
+pub(crate) async fn send_followups(
+    context: &BotContext,
+    chat_id: i64,
+    topic_id: Option<i64>,
+    items: Vec<String>,
+) {
+    let Some(markup) = keyboard(&items) else {
+        return;
+    };
     match context
         .client()
+        .paced()
         .send_message_with_markup(
             chat_id,
             "💡 <i>Suggested replies</i>",
@@ -63,16 +84,23 @@ pub(crate) async fn send_followups(
         )
         .await
     {
-        Ok(message) => {
-            let mut map = context
-                .followup_map()
-                .lock()
-                .expect("followup lock poisoned");
-            map.insert((chat_id, message.id), items);
-        }
+        Ok(message) => register(context, chat_id, message.id, items),
         Err(err) => {
             tracing::warn!(chat_id, err = %format!("{err:#}"), "Failed to send follow-up buttons");
         }
+    }
+}
+
+/// Keyboard left after a tap: the chosen suggestion, inert.
+fn chosen_keyboard(item: &str) -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup {
+        inline_keyboard: vec![vec![InlineKeyboardButton::callback(
+            truncate_chars(
+                &format!("▶️ {}", strip_markdown_markers(item)),
+                MAX_BUTTON_CHARS,
+            ),
+            "fu:-",
+        )]],
     }
 }
 
@@ -93,7 +121,8 @@ pub(crate) async fn handle_callback(
     };
     let chat_id = message.chat.id;
 
-    // Dismiss: delete the suggestions message without starting a turn.
+    // Dismiss: remove the buttons without starting a turn. The message text
+    // stays, since it is usually the reply itself.
     if data == "x" {
         {
             let mut map = context
@@ -102,7 +131,9 @@ pub(crate) async fn handle_callback(
                 .expect("followup lock poisoned");
             map.remove(&(chat_id, message.id));
         }
-        let _ = client.delete_message(chat_id, message.id).await;
+        let _ = client
+            .edit_message_reply_markup(chat_id, message.id, &InlineKeyboardMarkup::empty())
+            .await;
         let _ = client.answer_callback_query(&callback.id, None).await;
         return;
     }
@@ -128,15 +159,7 @@ pub(crate) async fn handle_callback(
     };
 
     let _ = client
-        .edit_message_text(
-            chat_id,
-            message.id,
-            &format!(
-                "▶️ {}",
-                crate::handlers::message::escape_html(&strip_markdown_markers(&item))
-            ),
-            None,
-        )
+        .edit_message_reply_markup(chat_id, message.id, &chosen_keyboard(&item))
         .await;
     let _ = client.answer_callback_query(&callback.id, None).await;
 
@@ -191,6 +214,15 @@ mod tests {
         let label = truncate_chars(&long, 64);
         assert_eq!(label.chars().count(), 64);
         assert!(label.ends_with('…'));
+    }
+
+    #[test]
+    fn keyboard_has_one_row_per_item_plus_dismiss() {
+        assert!(keyboard(&[]).is_none());
+        let markup = keyboard(&["One".to_string(), "Two".to_string()]).expect("keyboard");
+        assert_eq!(markup.inline_keyboard.len(), 3);
+        let chosen = chosen_keyboard("Two");
+        assert_eq!(chosen.inline_keyboard.len(), 1);
     }
 
     #[test]

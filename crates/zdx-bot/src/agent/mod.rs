@@ -24,11 +24,17 @@ pub(crate) const STATUS_TRANSCRIBING: &str = "🎤 Transcribing audio...";
 ///
 /// # Errors
 /// Returns an error if the operation fails.
-pub(crate) fn load_thread_state(thread_id: &str) -> Result<(Thread, Vec<ChatMessage>)> {
+/// Opens a thread and replays its history. The third value is the delivery
+/// note for undelivered parts of the last reply; pass it to
+/// [`record_user_message`] so the new user message carries it, exactly as
+/// replay will rebuild it.
+pub(crate) fn load_thread_state(
+    thread_id: &str,
+) -> Result<(Thread, Vec<ChatMessage>, Option<String>)> {
     let thread = Thread::with_id(thread_id.to_string()).context("open thread log")?;
-    let messages =
-        thread_persistence::load_thread_as_messages(thread_id).context("load thread history")?;
-    Ok((thread, messages))
+    let replay =
+        thread_persistence::load_thread_replay(thread_id).context("load thread history")?;
+    Ok((thread, replay.messages, replay.trailing_delivery_note))
 }
 
 ///
@@ -54,6 +60,7 @@ pub(crate) fn record_user_message(
     messages: &mut Vec<ChatMessage>,
     incoming: &IncomingMessage,
     runtime_context: Option<&RuntimeContext>,
+    delivery_note: Option<&str>,
 ) -> Result<()> {
     let text = build_user_text(incoming);
     let last_key = thread_persistence::last_attached_context_key_from_messages(messages);
@@ -75,7 +82,7 @@ pub(crate) fn record_user_message(
         .iter()
         .filter_map(IncomingImage::inline)
         .collect();
-    if inline.is_empty() {
+    if inline.is_empty() && delivery_note.is_none() {
         messages.push(ChatMessage::user(text).with_runtime_context(block, key));
         return Ok(());
     }
@@ -88,13 +95,17 @@ pub(crate) fn record_user_message(
             data: data.to_string(),
         });
     }
+    let content = match delivery_note {
+        Some(note) => thread_persistence::user_message_with_delivery_note(note, blocks),
+        None => MessageContent::Blocks(blocks),
+    };
 
     messages.push(ChatMessage {
         role: "user".to_string(),
         phase: None,
         context: block,
         context_key: key,
-        content: MessageContent::Blocks(blocks),
+        content,
     });
     Ok(())
 }
@@ -920,5 +931,64 @@ mod tests {
         );
 
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A failed delivery must reach the model on the next user message, and
+    /// the live message must equal what replay rebuilds on the turn after.
+    #[test]
+    fn delivery_note_is_live_and_replayed_identically() {
+        use zdx_engine::core::delivery::{DeliveryItem, DeliveryRecord};
+        use zdx_engine::core::thread_persistence::{self, ThreadEvent};
+
+        let _home = zdx_engine::test_support::temp_zdx_home();
+        let id = format!("test-delivery-{}", uuid::Uuid::new_v4());
+        {
+            let mut thread =
+                zdx_engine::core::thread_persistence::Thread::with_id(id.clone()).expect("thread");
+            thread
+                .append(&ThreadEvent::user_message("make it"))
+                .expect("append");
+            thread
+                .append(&ThreadEvent::assistant_message(
+                    "Ready <media>/tmp/x.html</media>",
+                ))
+                .expect("append");
+            let mut file = DeliveryItem::file("/tmp/x.html");
+            file.mark_failed("Telegram API error for sendDocument (429): Too Many Requests");
+            thread
+                .append(&ThreadEvent::delivery(DeliveryRecord::new(
+                    "telegram",
+                    Some(-100),
+                    Some(7),
+                    vec![file],
+                )))
+                .expect("append");
+        }
+
+        let (mut thread, mut messages, note) = super::load_thread_state(&id).expect("load");
+        let note = note.expect("delivery note");
+        assert!(note.contains("file /tmp/x.html: not delivered"));
+        let incoming = crate::types::IncomingMessage {
+            chat_id: -100,
+            message_id: 5,
+            user_id: 1,
+            text: Some("where is it?".to_string()),
+            images: Vec::new(),
+            audios: Vec::new(),
+            documents: Vec::new(),
+            videos: Vec::new(),
+            notices: Vec::new(),
+            message_thread_id: Some(7),
+            is_forum: true,
+        };
+        super::record_user_message(&mut thread, &mut messages, &incoming, None, Some(&note))
+            .expect("record");
+
+        let replayed = thread_persistence::load_thread_replay(&id).expect("replay");
+        assert_eq!(replayed.trailing_delivery_note, None);
+        assert_eq!(
+            format!("{:?}", replayed.messages.last().map(|m| &m.content)),
+            format!("{:?}", messages.last().map(|m| &m.content)),
+        );
     }
 }

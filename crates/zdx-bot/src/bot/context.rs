@@ -9,6 +9,7 @@ use zdx_engine::core::agent::ToolConfig;
 use zdx_engine::core::workers::WorkerManager;
 
 use crate::command_picker::CommandPickerMap;
+use crate::delivery_tracker::ActiveDeliveries;
 use crate::followups::FollowupMap;
 use crate::handlers::message::LauncherMap;
 use crate::retry::RetryMap;
@@ -85,7 +86,9 @@ pub(crate) struct BotContext {
     orchestrator_routes: RwLock<HashMap<String, OrchestratorRoute>>,
     /// Thread id → (chat, message id) of the pinned header posted this
     /// process, so worker events can refresh an orchestrator's card in place.
-    thread_headers: RwLock<HashMap<String, (i64, i64)>>,
+    thread_headers: RwLock<HashMap<String, ThreadHeader>>,
+    /// Reply deliveries running now; shared with the Mini App server.
+    active_deliveries: ActiveDeliveries,
 }
 
 #[derive(Debug, Clone)]
@@ -153,7 +156,12 @@ impl BotContext {
             launcher_map,
             orchestrator_routes: RwLock::new(HashMap::new()),
             thread_headers: RwLock::new(HashMap::new()),
+            active_deliveries: ActiveDeliveries::default(),
         }
+    }
+
+    pub(crate) fn active_deliveries(&self) -> &ActiveDeliveries {
+        &self.active_deliveries
     }
 
     pub(crate) fn worker_manager(&self) -> &Arc<WorkerManager> {
@@ -355,22 +363,60 @@ impl BotContext {
             .copied()
     }
 
-    /// Remembers where a thread's pinned header lives (process-lifetime).
-    pub(crate) fn record_thread_header(&self, thread_id: &str, chat_id: i64, message_id: i64) {
+    /// Remembers where a thread's pinned header lives and what it last showed
+    /// (process-lifetime).
+    pub(crate) fn record_thread_header(&self, thread_id: &str, header: ThreadHeader) {
         self.thread_headers
             .write()
             .expect("thread header lock poisoned")
-            .insert(thread_id.to_string(), (chat_id, message_id));
+            .insert(thread_id.to_string(), header);
     }
 
-    /// `(chat_id, message_id)` of a thread's pinned header posted this process.
-    pub(crate) fn thread_header(&self, thread_id: &str) -> Option<(i64, i64)> {
+    /// A thread's pinned header posted this process.
+    pub(crate) fn thread_header(&self, thread_id: &str) -> Option<ThreadHeader> {
         self.thread_headers
             .read()
             .expect("thread header lock poisoned")
             .get(thread_id)
-            .copied()
+            .cloned()
     }
+}
+
+#[cfg(test)]
+impl BotContext {
+    /// A context with empty per-process maps, for tests that need a whole
+    /// context (for example with a client pointed at a fake Bot API).
+    pub(crate) fn for_test(client: TelegramClient, config: Config, root: PathBuf) -> Self {
+        Self::new(
+            client,
+            config,
+            BotContextDeps {
+                allowlist_user_ids: HashSet::new(),
+                allowlist_chat_ids: HashSet::new(),
+                root,
+                bot_instruction_layer: None,
+                tool_config: ToolConfig::default(),
+                worker_manager: WorkerManager::new().0,
+                cancel_map: new_cancel_map(),
+                queue_cancel_map: new_queue_cancel_map(),
+                followup_map: crate::followups::new_followup_map(),
+                retry_map: crate::retry::new_retry_map(),
+                staging_map: crate::staging::new_staging_map(),
+                command_picker_map: crate::command_picker::new_command_picker_map(),
+                launcher_map: crate::handlers::message::new_launcher_map(),
+            },
+        )
+    }
+}
+
+/// A thread's pinned header message and the content it last showed, so an
+/// unchanged re-render skips the edit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ThreadHeader {
+    pub(crate) chat_id: i64,
+    pub(crate) message_id: i64,
+    /// Rendered text plus serialized keyboard last accepted by Telegram.
+    pub(crate) rendered: String,
 }
 
 fn profile_root_path(profile: &TelegramProfileConfig) -> PathBuf {
@@ -433,7 +479,7 @@ fn load_profile_configs(base: &Config) -> HashMap<i64, Config> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, HashSet};
+    use std::collections::BTreeMap;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -692,25 +738,7 @@ mod tests {
     }
 
     fn test_context(config: Config, root: PathBuf) -> BotContext {
-        BotContext::new(
-            TelegramClient::new("token".to_string()),
-            config,
-            BotContextDeps {
-                allowlist_user_ids: HashSet::new(),
-                allowlist_chat_ids: HashSet::new(),
-                root,
-                bot_instruction_layer: None,
-                tool_config: ToolConfig::default(),
-                worker_manager: WorkerManager::new().0,
-                cancel_map: new_cancel_map(),
-                queue_cancel_map: new_queue_cancel_map(),
-                followup_map: crate::followups::new_followup_map(),
-                retry_map: crate::retry::new_retry_map(),
-                staging_map: crate::staging::new_staging_map(),
-                command_picker_map: crate::command_picker::new_command_picker_map(),
-                launcher_map: crate::handlers::message::new_launcher_map(),
-            },
-        )
+        BotContext::for_test(TelegramClient::new("token".to_string()), config, root)
     }
 
     fn unique_temp_dir(label: &str) -> PathBuf {

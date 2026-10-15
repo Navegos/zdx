@@ -24,6 +24,9 @@ export interface ThreadResponse {
   /** True when `activity` holds only items at or after the requested `after`
    *  cursor, so it must be merged into the existing transcript. */
   partial: boolean;
+  /** A reply delivery started recently and has no outcome yet; keep polling
+   *  so its pending warning is replaced by the outcome. */
+  delivering?: boolean;
   /** Orchestrator that owns this thread as a worker, when it has one. */
   parent_thread_id: string | null;
   /** Title of `parent_thread_id`, resolved server-side. */
@@ -204,7 +207,7 @@ export interface UsageActivity extends ActivityBase {
 
 export interface NoticeActivity extends ActivityBase {
   type: "notice";
-  kind: "refusal" | "context_window_exceeded" | "output_limit" | "output_loop";
+  kind: "refusal" | "context_window_exceeded" | "output_limit" | "output_loop" | "delivery";
   message: string;
 }
 

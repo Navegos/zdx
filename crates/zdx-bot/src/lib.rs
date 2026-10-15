@@ -23,6 +23,7 @@ mod agent;
 mod bot;
 mod command_picker;
 mod commands;
+mod delivery_tracker;
 mod followups;
 mod handlers;
 mod ingest;
@@ -197,6 +198,7 @@ async fn run_bot(config: Config, settings: TelegramSettings, root: PathBuf) -> R
             port,
             miniapp_root,
             Arc::clone(&worker_manager),
+            context.active_deliveries().clone(),
         );
     }
 

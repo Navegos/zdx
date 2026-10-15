@@ -8,12 +8,18 @@
 //!
 //! The Telegram bot runtime (`zdx-bot`) keeps its own richer client for the
 //! long-poll loop, message editing, callbacks, and media types; that client
-//! serves a different job and is not used here.
+//! serves a different job and is not used here. Both share [`flood`] for
+//! error classification, flood-wait retries, and per-call logging. This client
+//! has no pacing gate: it runs in other processes (and beside the bot), so it
+//! cannot see the bot's per-chat state.
+
+pub mod flood;
 
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use flood::{CallRecord, FailureClass, RetryPolicy, TelegramTransportError};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -101,6 +107,8 @@ impl TelegramOutbound {
         let value: Value = self
             .post(
                 "createForumTopic",
+                chat_id,
+                None,
                 &serde_json::json!({
                     "chat_id": chat_id,
                     "name": name,
@@ -145,7 +153,9 @@ impl TelegramOutbound {
             body["parse_mode"] = mode.into();
         }
 
-        let _: Value = self.post("sendMessage", &body).await?;
+        let _: Value = self
+            .post("sendMessage", chat_id, message_thread_id, &body)
+            .await?;
         Ok(())
     }
 
@@ -185,34 +195,25 @@ impl TelegramOutbound {
             |kind| kind.mime_type().to_string(),
         );
 
-        let part = reqwest::multipart::Part::bytes(bytes)
-            .file_name(file_name)
-            .mime_str(&mime)
-            .context("build Telegram document part")?;
-
-        let mut form = reqwest::multipart::Form::new()
-            .text("chat_id", chat_id.to_string())
-            .part("document", part);
-        if let Some(caption) = caption.map(str::trim).filter(|c| !c.is_empty()) {
-            form = form.text("caption", caption.to_string());
-        }
-        if let Some(thread) = message_thread_id {
-            form = form.text("message_thread_id", thread.to_string());
-        }
-
-        let url = self.url("sendDocument");
-        let response = self
-            .http
-            .post(url)
-            .multipart(form)
-            .send()
-            .await
-            .context("Telegram sendDocument request failed")?;
-        let bytes = response
-            .bytes()
-            .await
-            .context("read Telegram sendDocument response")?;
-        let _: Value = parse_response("sendDocument", &bytes)?;
+        let caption = caption.map(str::trim).filter(|c| !c.is_empty());
+        let _: Value = self
+            .send_with_retry("sendDocument", chat_id, message_thread_id, || {
+                let part = reqwest::multipart::Part::bytes(bytes.clone())
+                    .file_name(file_name.clone())
+                    .mime_str(&mime)
+                    .context("build Telegram document part")?;
+                let mut form = reqwest::multipart::Form::new()
+                    .text("chat_id", chat_id.to_string())
+                    .part("document", part);
+                if let Some(caption) = caption {
+                    form = form.text("caption", caption.to_string());
+                }
+                if let Some(thread) = message_thread_id {
+                    form = form.text("message_thread_id", thread.to_string());
+                }
+                Ok(self.http.post(self.url("sendDocument")).multipart(form))
+            })
+            .await?;
         Ok(())
     }
 
@@ -220,36 +221,84 @@ impl TelegramOutbound {
         format!("{}/bot{}/{}", self.base_url, self.token, method)
     }
 
-    async fn post<T: DeserializeOwned, B: Serialize>(&self, method: &str, body: &B) -> Result<T> {
-        let response = self
-            .http
-            .post(self.url(method))
-            .json(body)
+    async fn post<T: DeserializeOwned, B: Serialize>(
+        &self,
+        method: &str,
+        chat_id: i64,
+        message_thread_id: Option<i64>,
+        body: &B,
+    ) -> Result<T> {
+        self.send_with_retry(method, chat_id, message_thread_id, || {
+            Ok(self.http.post(self.url(method)).json(body))
+        })
+        .await
+    }
+
+    /// Sends a request, retrying only explicit flood refusals within
+    /// [`RetryPolicy::IMPORTANT`]. Ambiguous failures (timeouts, unreadable
+    /// answers) are returned as-is: the message may already be in the chat.
+    async fn send_with_retry<T: DeserializeOwned>(
+        &self,
+        method: &str,
+        chat_id: i64,
+        message_thread_id: Option<i64>,
+        build: impl Fn() -> Result<reqwest::RequestBuilder>,
+    ) -> Result<T> {
+        let policy = RetryPolicy::IMPORTANT;
+        let first_attempt = Instant::now();
+        let mut waited = Duration::ZERO;
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            let started = Instant::now();
+            let result = self
+                .send_once(method, build())
+                .await
+                .and_then(|value| flood::decode_result::<T>(method, value));
+            let record = CallRecord {
+                client: "outbound",
+                bot: flood::bot_identity(&self.token),
+                method,
+                chat: Some(chat_id),
+                topic: message_thread_id,
+                new_message: method != "createForumTopic",
+                attempt,
+                waited,
+                duration: started.elapsed(),
+            };
+            flood::log_call(&record, result.as_ref().map(|(message_id, _)| *message_id));
+            let err = match result {
+                Ok((_, decoded)) => return Ok(decoded),
+                Err(err) => err,
+            };
+            let FailureClass::FloodWait(retry_after) = flood::classify(&err) else {
+                return Err(err);
+            };
+            let Some(delay) =
+                policy.delay_before_retry(attempt, first_attempt.elapsed(), retry_after)
+            else {
+                return Err(err);
+            };
+            tokio::time::sleep(delay).await;
+            waited = delay;
+        }
+    }
+
+    async fn send_once(
+        &self,
+        method: &str,
+        request: Result<reqwest::RequestBuilder>,
+    ) -> Result<Value> {
+        let response = request?
             .send()
             .await
-            .with_context(|| format!("Telegram request failed for {method}"))?;
+            .map_err(|err| TelegramTransportError::from_reqwest(method, err))?;
         let bytes = response
             .bytes()
             .await
-            .with_context(|| format!("read Telegram response for {method}"))?;
-        parse_response(method, &bytes)
+            .map_err(|err| TelegramTransportError::from_reqwest(method, err))?;
+        flood::parse_response(method, &bytes)
     }
-}
-
-fn parse_response<T: DeserializeOwned>(method: &str, bytes: &[u8]) -> Result<T> {
-    let value: Value = serde_json::from_slice(bytes)
-        .with_context(|| format!("parse Telegram response for {method}"))?;
-
-    if value.get("ok").and_then(Value::as_bool) != Some(true) {
-        let description = value
-            .get("description")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown error");
-        bail!("Telegram API error on {method}: {description}");
-    }
-
-    let result = value.get("result").cloned().unwrap_or(Value::Bool(true));
-    serde_json::from_value(result).with_context(|| format!("decode Telegram result for {method}"))
 }
 
 /// Resolves the bot token from an explicit override, config, then environment.
@@ -301,14 +350,14 @@ mod tests {
     #[test]
     fn surfaces_telegram_api_errors() {
         let body = br#"{"ok":false,"description":"chat not found"}"#;
-        let err = parse_response::<Value>("sendMessage", body).unwrap_err();
+        let err = flood::parse_response("sendMessage", body).unwrap_err();
         assert!(format!("{err:#}").contains("chat not found"));
     }
 
     #[test]
     fn decodes_ok_results() {
         let body = br#"{"ok":true,"result":{"message_thread_id":42}}"#;
-        let value: Value = parse_response("createForumTopic", body).unwrap();
+        let value: Value = flood::parse_response("createForumTopic", body).unwrap();
         assert_eq!(value["message_thread_id"], 42);
     }
 }

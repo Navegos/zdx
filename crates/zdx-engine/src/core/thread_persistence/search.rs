@@ -436,7 +436,8 @@ pub(crate) fn latest_event_timestamp(events: &[ThreadEvent]) -> Option<DateTime<
                 | ThreadEvent::Interrupted { ts, .. }
                 | ThreadEvent::Reasoning { ts, .. }
                 | ThreadEvent::Usage { ts, .. }
-                | ThreadEvent::Notice { ts, .. } => ts,
+                | ThreadEvent::Notice { ts, .. }
+                | ThreadEvent::Delivery { ts, .. } => ts,
             };
             DateTime::parse_from_rfc3339(ts)
                 .ok()

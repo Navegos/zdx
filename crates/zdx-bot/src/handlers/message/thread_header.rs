@@ -3,7 +3,7 @@ use zdx_engine::core::thread_persistence;
 
 use super::status::current_thread_header_message;
 use super::{resolve_effective_thread_id, thread_id_for_chat};
-use crate::bot::context::BotContext;
+use crate::bot::context::{BotContext, ThreadHeader};
 use crate::telegram::{CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, TelegramClient};
 
 const REFRESH_CALLBACK: &str = "thread_header:refresh";
@@ -30,7 +30,14 @@ pub(crate) async fn post_thread_header(
         .send_message_with_markup(chat_id, &text, None, Some(topic_id), &keyboard)
         .await
         .context("post thread header")?;
-    context.record_thread_header(thread_id, chat_id, message.id);
+    context.record_thread_header(
+        thread_id,
+        ThreadHeader {
+            chat_id,
+            message_id: message.id,
+            rendered: rendered_header(&text, &keyboard),
+        },
+    );
 
     if let Err(err) = context
         .client()
@@ -51,29 +58,57 @@ pub(crate) async fn post_thread_header(
 
 /// Re-renders a thread's pinned header in place, when this process posted
 /// it. Used by the worker bridge so an orchestrator's card tracks its workers
-/// without a manual Refresh. Best-effort: unknown headers and unchanged text
-/// are no-ops.
+/// without a manual Refresh. Best-effort: unknown headers are no-ops, and a
+/// render identical to the last one Telegram accepted sends no edit. Runs on
+/// the immediate client, so a flood wait skips it (the next refresh catches
+/// up) instead of stalling the worker bridge.
 pub(crate) async fn refresh_thread_header(context: &BotContext, thread_id: &str) {
-    let Some((chat_id, message_id)) = context.thread_header(thread_id) else {
+    let Some(header) = context.thread_header(thread_id) else {
         return;
     };
+    let ThreadHeader {
+        chat_id,
+        message_id,
+        ..
+    } = header;
     let result = async {
         let text = header_text(context, chat_id, thread_id).await?;
         let keyboard = header_keyboard(context, chat_id, thread_id);
+        let rendered = rendered_header(&text, &keyboard);
+        if rendered == header.rendered {
+            return Ok(());
+        }
         match context
             .client()
             .edit_message_text(chat_id, message_id, &text, Some(&keyboard))
             .await
         {
-            Ok(()) => Ok(()),
-            Err(err) if is_message_not_modified(&err) => Ok(()),
-            Err(err) => Err(err),
+            Ok(()) => {}
+            Err(err) if is_message_not_modified(&err) => {}
+            Err(err) => return Err(err),
         }
+        context.record_thread_header(
+            thread_id,
+            ThreadHeader {
+                chat_id,
+                message_id,
+                rendered,
+            },
+        );
+        Ok(())
     }
     .await;
     if let Err(err) = result {
         tracing::warn!(thread_id, message_id, err = %format!("{err:#}"), "Failed to refresh thread header");
     }
+}
+
+/// Comparison key for a header render: text plus keyboard.
+fn rendered_header(text: &str, keyboard: &InlineKeyboardMarkup) -> String {
+    format!(
+        "{text}\n{}",
+        serde_json::to_string(keyboard).unwrap_or_default()
+    )
 }
 
 pub(crate) async fn handle_callback(
@@ -104,10 +139,24 @@ pub(crate) async fn handle_callback(
             .edit_message_text(chat_id, message.id, &text, Some(&keyboard))
             .await
         {
-            Ok(()) => Ok(()),
-            Err(err) if is_message_not_modified(&err) => Ok(()),
-            Err(err) => Err(err).context("refresh thread header"),
+            Ok(()) => {}
+            Err(err) if is_message_not_modified(&err) => {}
+            Err(err) => return Err(err).context("refresh thread header"),
         }
+        if context
+            .thread_header(&thread_id)
+            .is_some_and(|header| header.message_id == message.id)
+        {
+            context.record_thread_header(
+                &thread_id,
+                ThreadHeader {
+                    chat_id,
+                    message_id: message.id,
+                    rendered: rendered_header(&text, &keyboard),
+                },
+            );
+        }
+        Ok(())
     }
     .await;
 
@@ -127,7 +176,8 @@ pub(crate) async fn handle_callback(
 }
 
 fn is_message_not_modified(err: &anyhow::Error) -> bool {
-    err.to_string().contains("message is not modified")
+    crate::telegram::api_error_description(err)
+        .is_some_and(|description| description.contains("message is not modified"))
 }
 
 async fn header_text(context: &BotContext, chat_id: i64, thread_id: &str) -> Result<String> {
@@ -202,6 +252,7 @@ mod tests {
 
     use super::{
         REFRESH_CALLBACK, header_keyboard_for_url, is_message_not_modified, orchestrator_link,
+        rendered_header,
     };
 
     #[test]
@@ -294,13 +345,44 @@ mod tests {
         assert_eq!(orchestrator_link("no-such-thread", mini_app), None);
     }
 
+    fn api_error(description: &str) -> anyhow::Error {
+        zdx_engine::telegram::flood::TelegramApiError {
+            method: "editMessageText".to_string(),
+            code: Some(400),
+            description: description.to_string(),
+            retry_after: None,
+        }
+        .into()
+    }
+
     #[test]
     fn unchanged_refresh_is_successful() {
-        assert!(is_message_not_modified(&anyhow!(
-            "Telegram API error: message is not modified"
+        assert!(is_message_not_modified(&api_error(
+            "Bad Request: message is not modified"
+        )));
+        assert!(!is_message_not_modified(&api_error(
+            "Bad Request: message can't be edited"
         )));
         assert!(!is_message_not_modified(&anyhow!(
-            "Telegram API error: message can't be edited"
+            "local error mentioning message is not modified"
         )));
+    }
+
+    #[test]
+    fn header_render_key_covers_text_and_keyboard() {
+        let keyboard = header_keyboard_for_url(None, "thread-id", None);
+        let other = header_keyboard_for_url(Some("https://t.me/b/app"), "thread-id", None);
+        assert_eq!(
+            rendered_header("a", &keyboard),
+            rendered_header("a", &keyboard)
+        );
+        assert_ne!(
+            rendered_header("a", &keyboard),
+            rendered_header("b", &keyboard)
+        );
+        assert_ne!(
+            rendered_header("a", &keyboard),
+            rendered_header("a", &other)
+        );
     }
 }

@@ -239,6 +239,10 @@ fn render_event(event: &ThreadEvent) -> Option<Block> {
         ThreadEvent::Notice { message, .. } => {
             writeln!(text, "### Notice\n⚠ {message}\n").expect("write");
         }
+        ThreadEvent::Delivery { record, .. } => {
+            let notice = crate::core::delivery::notice_text(record)?;
+            writeln!(text, "### Notice\n⚠ {notice}\n").expect("write");
+        }
         ThreadEvent::Usage { .. } => return None,
     }
     Some(Block {
@@ -252,7 +256,11 @@ pub fn format_transcript(events: &[ThreadEvent]) -> String {
     let mut blocks: Vec<Block> = Vec::with_capacity(events.len());
     let mut models_used: Vec<String> = Vec::new();
 
-    for event in events {
+    let superseded = super::superseded_deliveries(events);
+    for (idx, event) in events.iter().enumerate() {
+        if superseded.contains(&idx) {
+            continue;
+        }
         if let ThreadEvent::Usage {
             model, provider, ..
         } = event

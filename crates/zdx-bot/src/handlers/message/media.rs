@@ -3,9 +3,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
-use super::ReplyContext;
-use crate::bot::context::BotContext;
 use crate::telegram::markdown::to_telegram_html;
+use crate::telegram::{MediaSend, Message, TelegramClient};
 
 const MEDIA_BLOCK_OPEN: &str = "<medias>";
 
@@ -15,109 +14,23 @@ const MEDIA_TAG_OPEN: &str = "<media";
 
 const MEDIA_TAG_CLOSE: &str = "</media>";
 
-pub(super) async fn send_media_responses(
-    context: &BotContext,
-    incoming: &crate::types::IncomingMessage,
-    reply_ctx: &ReplyContext,
-    media_paths: &[PathBuf],
-    sent_text: bool,
-) -> Result<()> {
-    if media_paths.is_empty() {
-        return Ok(());
+/// Sends one local file with the Telegram method that fits its type
+/// (photo, voice note, audio, or document).
+pub(super) async fn send_media_file(
+    client: &TelegramClient,
+    chat_id: i64,
+    path: &Path,
+    options: &MediaSend<'_>,
+) -> Result<Message> {
+    if is_image_path(path) {
+        client.send_photo_from_path(chat_id, path, options).await
+    } else if is_voice_note_path(path) {
+        client.send_voice_from_path(chat_id, path, options).await
+    } else if is_audio_path(path) {
+        client.send_audio_from_path(chat_id, path, options).await
+    } else {
+        client.send_document_from_path(chat_id, path, options).await
     }
-
-    let valid_media_paths: Vec<PathBuf> = media_paths
-        .iter()
-        .filter(|path| is_valid_media_path(path))
-        .cloned()
-        .collect();
-
-    if valid_media_paths.is_empty() {
-        if !sent_text {
-            context
-                .client()
-                .send_message(
-                    incoming.chat_id,
-                    "I couldn't find a valid local media file to send.",
-                    None,
-                    reply_ctx.topic_id,
-                )
-                .await?;
-        }
-        return Ok(());
-    }
-
-    for media_path in valid_media_paths {
-        let reply_parameters = reply_ctx.cross_topic_reply_parameters.clone();
-        let reply_to_message_id = if reply_parameters.is_some() {
-            None
-        } else {
-            reply_ctx.reply_to_message_id
-        };
-
-        let send_result = if is_image_path(&media_path) {
-            context
-                .client()
-                .send_photo_from_path(
-                    incoming.chat_id,
-                    &media_path,
-                    None,
-                    reply_to_message_id,
-                    reply_ctx.topic_id,
-                    reply_parameters,
-                )
-                .await
-        } else if is_voice_note_path(&media_path) {
-            context
-                .client()
-                .send_voice_from_path(
-                    incoming.chat_id,
-                    &media_path,
-                    reply_to_message_id,
-                    reply_ctx.topic_id,
-                    reply_parameters,
-                )
-                .await
-        } else if is_audio_path(&media_path) {
-            context
-                .client()
-                .send_audio_from_path(
-                    incoming.chat_id,
-                    &media_path,
-                    reply_to_message_id,
-                    reply_ctx.topic_id,
-                    reply_parameters,
-                )
-                .await
-        } else {
-            context
-                .client()
-                .send_document_from_path(
-                    incoming.chat_id,
-                    &media_path,
-                    None,
-                    reply_to_message_id,
-                    reply_ctx.topic_id,
-                    reply_parameters,
-                )
-                .await
-        };
-
-        if let Err(err) = send_result {
-            tracing::error!(path = %media_path.display(), err = %format!("{err:#}"), "Failed to send media file");
-            context
-                .client()
-                .send_message(
-                    incoming.chat_id,
-                    &format!("Failed to send media file {}: {err}", media_path.display()),
-                    None,
-                    reply_ctx.topic_id,
-                )
-                .await?;
-        }
-    }
-
-    Ok(())
 }
 
 #[derive(Default)]
@@ -227,7 +140,7 @@ fn parse_media_path(raw: &str) -> Option<PathBuf> {
     }
 }
 
-fn is_valid_media_path(path: &Path) -> bool {
+pub(super) fn is_valid_media_path(path: &Path) -> bool {
     path.is_absolute() && std::fs::metadata(path).is_ok_and(|meta| meta.is_file())
 }
 

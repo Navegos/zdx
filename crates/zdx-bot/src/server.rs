@@ -39,6 +39,8 @@ use zdx_engine::service::{self, Service};
 use zdx_engine::workspace_config::{self, WorkspaceReport};
 use zdx_engine::{agent_activity, background_activity, jobs};
 
+use crate::delivery_tracker::ActiveDeliveries;
+
 const INIT_DATA_MAX_AGE_SECS: u64 = 60 * 60;
 const INIT_DATA_FUTURE_SKEW_SECS: u64 = 30;
 const MONITOR_CACHE_TTL: Duration = Duration::from_secs(30);
@@ -79,6 +81,11 @@ pub struct ThreadResponse {
     /// Workers owned by this thread, live plus recovered from lineage. Gates
     /// the Workers tab without the client having to fetch the list first.
     pub worker_count: usize,
+    /// A reply delivery for this thread is running in this process. Clients
+    /// keep polling while it is set, so its pending warning is replaced by the
+    /// outcome without a reload. A pending record left by a crash is never
+    /// reported as running.
+    pub delivering: bool,
     pub activity: Vec<ThreadActivity>,
 }
 
@@ -586,6 +593,8 @@ pub(crate) struct ServerState {
     /// fetch. Every open Mini App polls `/api/monitor` every 30s, so without it
     /// a slow provider would accumulate overlapping refreshes.
     subscription_refresh: Arc<Mutex<()>>,
+    /// Reply deliveries running in this process (shared with the reply path).
+    deliveries: ActiveDeliveries,
 }
 
 impl ServerState {
@@ -604,7 +613,13 @@ impl ServerState {
             monitor_build: Mutex::new(()),
             subscription_cache: Mutex::new(None),
             subscription_refresh: Arc::new(Mutex::new(())),
+            deliveries: ActiveDeliveries::default(),
         }
+    }
+
+    fn with_deliveries(mut self, deliveries: ActiveDeliveries) -> Self {
+        self.deliveries = deliveries;
+        self
     }
 }
 
@@ -857,6 +872,7 @@ async fn get_thread(
     Query(query): Query<ThreadQuery>,
 ) -> Result<Json<ThreadResponse>, ApiError> {
     let workers = Arc::clone(&state.workers);
+    let deliveries = state.deliveries.clone();
     tokio::task::spawn_blocking(move || {
         let target_id = if id == "active" {
             thread_index::latest_thread_id_with_prefix("telegram-")
@@ -870,21 +886,36 @@ async fn get_thread(
             return Err((StatusCode::BAD_REQUEST, "Invalid thread ID"));
         }
 
-        let events = load_thread_events(&target_id).map_err(|error| {
-            tracing::warn!(thread_id = target_id, error = %format!("{error:#}"), "Failed to load Mini App thread");
+        // A resumed or mirror topic is an alias: its events, and the reply
+        // deliveries the bot tracks, live under the source thread. The
+        // response keeps the requested id and its topic link.
+        let source_id = resolve_alias_id(&target_id);
+        // Sampled around the read so the flag can never be false while the
+        // events still show a pending record.
+        let (events, delivering) =
+            deliveries.observe(&source_id, || load_thread_events(&source_id));
+        let events = events.map_err(|error| {
+            tracing::warn!(thread_id = source_id, error = %format!("{error:#}"), "Failed to load Mini App thread");
             (StatusCode::NOT_FOUND, "Thread not found")
         })?;
 
         let telegram_link = resolve_telegram_link(&target_id);
         let lineage = resolve_lineage(&workers, &target_id);
 
+        let events_for_cursor = delivery_ids(&events);
         let mut response = project_thread(target_id, events, telegram_link, lineage);
+        response.delivering = delivering;
         append_running_tools(&mut response);
 
         // Live polling asks only for what it has not seen. Dropping delivered
         // items keeps a steady-state poll small on a thread whose transcript is
         // hundreds of kilobytes, without changing what a first load returns.
-        if let Some(after) = query.after {
+        // A delivery outcome that replaces a record the client already holds
+        // (pending → sent/failed) needs the full projection instead, since a
+        // delta cannot remove the stale warning.
+        if let Some(after) = query.after
+            && !replaces_seen_delivery(&events_for_cursor, after)
+        {
             response.activity.retain(|item| item.sequence() >= after);
             response.partial = true;
         }
@@ -895,6 +926,28 @@ async fn get_thread(
         tracing::warn!(%error, "Mini App thread load task failed");
         (StatusCode::INTERNAL_SERVER_ERROR, "Thread load failed")
     })?
+}
+
+/// `(sequence, record id)` of every delivery event, for the poll cursor check.
+fn delivery_ids(events: &[ThreadEvent]) -> Vec<(usize, String)> {
+    events
+        .iter()
+        .enumerate()
+        .filter_map(|(sequence, event)| match event {
+            ThreadEvent::Delivery { record, .. } => Some((sequence, record.id.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Whether a delivery event at or after `after` replaces one before it.
+fn replaces_seen_delivery(deliveries: &[(usize, String)], after: usize) -> bool {
+    deliveries.iter().any(|(sequence, id)| {
+        *sequence >= after
+            && deliveries
+                .iter()
+                .any(|(earlier, other)| *earlier < after && other == id)
+    })
 }
 
 async fn get_thread_trajectory(
@@ -1288,6 +1341,7 @@ fn project_thread(
     let mut title = "Thread Transcript".to_string();
     let mut activity = Vec::new();
     let mut total_messages = 0;
+    let superseded = zdx_engine::core::thread_persistence::superseded_deliveries(&events);
 
     for (sequence, event) in events.into_iter().enumerate() {
         match event {
@@ -1398,6 +1452,20 @@ fn project_thread(
                 started_at,
                 completed_at,
             }),
+            ThreadEvent::Delivery { record, ts } => {
+                if superseded.contains(&sequence) {
+                    continue;
+                }
+                if let Some(message) = zdx_engine::core::delivery::notice_text(&record) {
+                    activity.push(ThreadActivity::Notice {
+                        sequence,
+                        time: event_time(&ts),
+                        ts,
+                        kind: "delivery",
+                        message,
+                    });
+                }
+            }
             ThreadEvent::Notice { kind, message, ts } => {
                 let kind = match kind {
                     NoticeKind::Refusal => "refusal",
@@ -1437,6 +1505,7 @@ fn project_thread(
         parent_thread_id: lineage.parent_thread_id,
         parent_title: lineage.parent_title,
         worker_count: lineage.worker_count,
+        delivering: false,
         activity,
     }
 }
@@ -2765,13 +2834,11 @@ pub(crate) fn spawn_server(
     port: u16,
     root: PathBuf,
     workers: Arc<WorkerManager>,
+    deliveries: ActiveDeliveries,
 ) {
-    let state = Arc::new(ServerState::new(
-        bot_token,
-        allowlist_user_ids,
-        root,
-        workers,
-    ));
+    let state = Arc::new(
+        ServerState::new(bot_token, allowlist_user_ids, root, workers).with_deliveries(deliveries),
+    );
     let app = create_router(state);
 
     tokio::spawn(async move {
@@ -2789,6 +2856,21 @@ pub(crate) fn spawn_server(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_delivery_outcome_for_a_seen_record_forces_a_full_poll() {
+        let deliveries = vec![
+            (4, "a".to_string()),
+            (9, "a".to_string()),
+            (12, "b".to_string()),
+        ];
+        // The outcome of `a` lands after the cursor; the client holds its
+        // pending record.
+        assert!(super::replaces_seen_delivery(&deliveries, 6));
+        // Both already seen, or both new: a delta is enough.
+        assert!(!super::replaces_seen_delivery(&deliveries, 10));
+        assert!(!super::replaces_seen_delivery(&deliveries, 0));
+    }
 
     #[test]
     fn worker_rollup_keeps_failed_out_of_settled() {
@@ -3037,6 +3119,239 @@ mod tests {
             .await
             .expect("request foreign path");
         assert_eq!(foreign.status(), StatusCode::NOT_FOUND);
+
+        server.abort();
+        drop(home);
+    }
+
+    /// Live polling over HTTP while a reply is delivered: the pending record
+    /// shows a warning; its outcome (sent or failed) replaces it through a
+    /// full, non-partial response, so the client never keeps a stale warning;
+    /// other new events still arrive as a partial delta.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // one scripted pending → outcome → delta sequence
+    async fn polling_replaces_a_pending_delivery_warning_with_its_outcome() {
+        use zdx_engine::core::delivery::{DeliveryItem, DeliveryRecord};
+
+        let home = zdx_engine::test_support::temp_zdx_home();
+        let deliveries = ActiveDeliveries::default();
+        let app = create_router(Arc::new(
+            ServerState::new(
+                SAMPLE_BOT_TOKEN.to_string(),
+                sample_allowlist(),
+                PathBuf::from("."),
+                WorkerManager::new().0,
+            )
+            .with_deliveries(deliveries.clone()),
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("read test server address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve test app");
+        });
+        let client = reqwest::Client::new();
+        let auth = format!("tma {}", fresh_init_data(279_058_397));
+        let fetch = |thread_id: String, after: Option<usize>| {
+            let client = client.clone();
+            let auth = auth.clone();
+            async move {
+                let query = after.map_or_else(String::new, |after| format!("?after={after}"));
+                let url = format!("http://{addr}/api/threads/{thread_id}{query}");
+                let response = client
+                    .get(url)
+                    .header(AUTHORIZATION, &auth)
+                    .send()
+                    .await
+                    .expect("request thread");
+                assert_eq!(response.status(), StatusCode::OK);
+                response
+                    .json::<serde_json::Value>()
+                    .await
+                    .expect("thread json")
+            }
+        };
+        let delivery_notices = |body: &serde_json::Value| -> Vec<String> {
+            body["activity"]
+                .as_array()
+                .expect("activity")
+                .iter()
+                .filter(|item| item["type"] == "notice" && item["kind"] == "delivery")
+                .map(|item| item["message"].as_str().unwrap_or_default().to_string())
+                .collect()
+        };
+
+        for (outcome_failed, expected_after) in [(false, 0), (true, 1)] {
+            let thread_id = format!("telegram-delivery-{}", uuid::Uuid::new_v4());
+            let mut thread =
+                thread_persistence::Thread::with_id(thread_id.clone()).expect("thread");
+            thread
+                .append(&ThreadEvent::user_message("make it"))
+                .expect("append");
+            thread
+                .append(&ThreadEvent::assistant_message("Ready"))
+                .expect("append");
+            let mut record = DeliveryRecord::new(
+                "telegram",
+                Some(-100),
+                Some(7),
+                vec![
+                    DeliveryItem::text(),
+                    DeliveryItem::file("/tmp/out/report.html"),
+                ],
+            );
+            let running = deliveries.start(&thread_id);
+            thread
+                .append(&ThreadEvent::delivery(record.clone()))
+                .expect("append pending");
+
+            let first = fetch(thread_id.clone(), None).await;
+            assert_eq!(first["partial"], false);
+            assert_eq!(first["delivering"], true, "clients keep polling");
+            assert_eq!(delivery_notices(&first).len(), 1, "pending shows a warning");
+            let cursor = first["cursor"].as_u64().expect("cursor") as usize;
+
+            record.items[0].mark_sent(Some(10));
+            if outcome_failed {
+                record.items[1].mark_failed("Telegram API error for sendDocument (429)");
+            } else {
+                record.items[1].mark_sent(Some(11));
+            }
+            thread
+                .append(&ThreadEvent::delivery(record.clone()))
+                .expect("append outcome");
+            drop(running);
+
+            let poll = fetch(thread_id.clone(), Some(cursor)).await;
+            assert_eq!(poll["partial"], false, "outcome must replace, not merge");
+            assert_eq!(poll["delivering"], false);
+            let notices = delivery_notices(&poll);
+            assert_eq!(notices.len(), expected_after, "{notices:?}");
+            if outcome_failed {
+                assert!(notices[0].contains("report.html: not delivered"));
+            }
+
+            thread
+                .append(&ThreadEvent::user_message("next"))
+                .expect("append");
+            let cursor = poll["cursor"].as_u64().expect("cursor") as usize;
+            let delta = fetch(thread_id.clone(), Some(cursor)).await;
+            assert_eq!(delta["partial"], true, "unrelated events stay a delta");
+            assert_eq!(delta["activity"].as_array().map(Vec::len), Some(1));
+        }
+
+        server.abort();
+        drop(home);
+    }
+
+    /// A thread browser can open a resumed topic by its alias id. Its events
+    /// and the running delivery live under the source thread, so the alias
+    /// response must show the source transcript, report `delivering` while
+    /// the source delivery runs, and settle when the outcome lands.
+    #[tokio::test]
+    async fn alias_requests_follow_the_source_thread_and_its_delivery() {
+        use zdx_engine::core::delivery::{DeliveryItem, DeliveryRecord};
+
+        let home = zdx_engine::test_support::temp_zdx_home();
+        let deliveries = ActiveDeliveries::default();
+        let app = create_router(Arc::new(
+            ServerState::new(
+                SAMPLE_BOT_TOKEN.to_string(),
+                sample_allowlist(),
+                PathBuf::from("."),
+                WorkerManager::new().0,
+            )
+            .with_deliveries(deliveries.clone()),
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("read test server address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve test app");
+        });
+        let client = reqwest::Client::new();
+        let auth = format!("tma {}", fresh_init_data(279_058_397));
+
+        let source_id = format!("telegram-source-{}", uuid::Uuid::new_v4());
+        let alias_id = "telegram--1001234567890-topic-4242".to_string();
+        let mut alias = thread_persistence::Thread::with_id(alias_id.clone()).expect("alias");
+        alias.set_alias(Some(source_id.clone())).expect("set alias");
+        let mut source = thread_persistence::Thread::with_id(source_id.clone()).expect("source");
+        source
+            .append(&ThreadEvent::user_message("make it"))
+            .expect("append");
+        source
+            .append(&ThreadEvent::assistant_message("Ready"))
+            .expect("append");
+        let running = deliveries.start(&source_id);
+        let mut record = DeliveryRecord::new(
+            "telegram",
+            Some(-1_001_234_567_890),
+            Some(4242),
+            vec![
+                DeliveryItem::text(),
+                DeliveryItem::file("/tmp/out/report.html"),
+            ],
+        );
+        source
+            .append(&ThreadEvent::delivery(record.clone()))
+            .expect("append pending");
+
+        let fetch = |after: Option<usize>| {
+            let client = client.clone();
+            let auth = auth.clone();
+            let alias_id = alias_id.clone();
+            async move {
+                let query = after.map_or_else(String::new, |after| format!("?after={after}"));
+                let response = client
+                    .get(format!("http://{addr}/api/threads/{alias_id}{query}"))
+                    .header(AUTHORIZATION, &auth)
+                    .send()
+                    .await
+                    .expect("request alias thread");
+                assert_eq!(response.status(), StatusCode::OK);
+                response
+                    .json::<serde_json::Value>()
+                    .await
+                    .expect("thread json")
+            }
+        };
+        let delivery_notices = |body: &serde_json::Value| {
+            body["activity"]
+                .as_array()
+                .expect("activity")
+                .iter()
+                .filter(|item| item["type"] == "notice" && item["kind"] == "delivery")
+                .count()
+        };
+
+        let first = fetch(None).await;
+        assert_eq!(first["id"], alias_id.as_str(), "requested id is kept");
+        assert_eq!(
+            first["telegram_link"], "https://t.me/c/1234567890/4242",
+            "the alias topic link is kept"
+        );
+        assert_eq!(first["total_messages"], 2, "source transcript is shown");
+        assert_eq!(first["delivering"], true, "source delivery is running");
+        assert_eq!(delivery_notices(&first), 1);
+        let cursor = first["cursor"].as_u64().expect("cursor") as usize;
+
+        record.items[0].mark_sent(Some(10));
+        record.items[1].mark_sent(Some(11));
+        source
+            .append(&ThreadEvent::delivery(record))
+            .expect("append outcome");
+        drop(running);
+
+        let settled = fetch(Some(cursor)).await;
+        assert_eq!(settled["delivering"], false);
+        assert_eq!(
+            settled["partial"], false,
+            "outcome replaces the pending warning"
+        );
+        assert_eq!(delivery_notices(&settled), 0);
 
         server.abort();
         drop(home);

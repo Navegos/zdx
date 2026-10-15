@@ -41,7 +41,7 @@ pub(super) async fn run_agent_turn(
         model_override.as_deref(),
         thinking_override,
     );
-    let (mut thread, mut messages) = agent::load_thread_state(thread_id)?;
+    let (mut thread, mut messages, delivery_note) = agent::load_thread_state(thread_id)?;
     // Bot threads are opened by id, so their meta has no root until now. Record
     // the chat's project root so they group by project like CLI/TUI threads.
     if stored_root.is_none() {
@@ -68,8 +68,13 @@ pub(super) async fn run_agent_turn(
             // path below never runs, so nothing is double-written.
             tracing::error!(err = %format!("{err:#}"), "Failed to prepare bot turn");
             if record_user
-                && let Err(persist_err) =
-                    agent::record_user_message(&mut thread, &mut messages, &incoming, None)
+                && let Err(persist_err) = agent::record_user_message(
+                    &mut thread,
+                    &mut messages,
+                    &incoming,
+                    None,
+                    delivery_note.as_deref(),
+                )
             {
                 tracing::error!(
                     %persist_err,
@@ -105,6 +110,7 @@ pub(super) async fn run_agent_turn(
             &mut messages,
             &incoming,
             prepared.runtime_context.as_ref(),
+            delivery_note.as_deref(),
         )?;
     }
 
@@ -312,7 +318,7 @@ async fn finalize_turn(
     incoming: &crate::types::IncomingMessage,
     reply_ctx: &ReplyContext,
     thread_id: &str,
-    _thread: &mut zdx_engine::core::thread_persistence::Thread,
+    thread: &mut zdx_engine::core::thread_persistence::Thread,
     status: &TurnStatus,
     result: TurnResult,
     is_orchestrator: bool,
@@ -374,6 +380,7 @@ async fn finalize_turn(
         &result.final_text,
         thread_id,
         &result.touched_workers,
+        thread,
     )
     .await?;
 

@@ -15,6 +15,38 @@ pub fn load_thread_as_messages(id: &str) -> Result<Vec<crate::providers::ChatMes
     Ok(thread_events_to_messages(events))
 }
 
+/// Replayed messages plus the delivery note still waiting for a user message.
+#[derive(Debug, Default)]
+pub struct ThreadReplay {
+    pub messages: Vec<crate::providers::ChatMessage>,
+    /// Model note for undelivered reply items recorded after the last user
+    /// message (see `crate::core::delivery::model_note`). A caller that
+    /// appends a new user message prepends this as its first text block, which
+    /// is exactly what replay rebuilds once that message is persisted.
+    pub trailing_delivery_note: Option<String>,
+}
+
+/// Like [`load_thread_as_messages`], but also returns the trailing delivery
+/// note for the next user message.
+///
+/// # Errors
+/// Returns an error if the operation fails.
+pub fn load_thread_replay(id: &str) -> Result<ThreadReplay> {
+    let events = load_thread_events(id)?;
+    Ok(thread_events_to_replay(events))
+}
+
+/// Builds a user message whose first text block is the delivery note, matching
+/// how replay projects a `Delivery` event onto the next user message.
+#[must_use]
+pub fn user_message_with_delivery_note(
+    note: &str,
+    mut blocks: Vec<crate::providers::ChatContentBlock>,
+) -> crate::providers::MessageContent {
+    blocks.insert(0, crate::providers::ChatContentBlock::text(note));
+    crate::providers::MessageContent::Blocks(blocks)
+}
+
 /// Returns the runtime-context change key attached to the most recent user
 /// message that carries one in a thread's persisted events. `None` when no
 /// context has been attached yet (e.g. legacy threads predating the field).
@@ -190,6 +222,11 @@ pub(crate) fn emit_message_events(
 
 /// Converts thread events to chat messages for API replay.
 pub fn thread_events_to_messages(events: Vec<ThreadEvent>) -> Vec<crate::providers::ChatMessage> {
+    thread_events_to_replay(events).messages
+}
+
+/// Converts thread events to chat messages and the trailing delivery note.
+pub fn thread_events_to_replay(events: Vec<ThreadEvent>) -> ThreadReplay {
     let mut replay = MessageReplay::new();
     for event in events {
         replay.handle_event(event);
@@ -211,6 +248,8 @@ struct MessageReplay {
     pending_assistant_phase: Option<String>,
     pending_tool_results: Vec<crate::tools::ToolResult>,
     open_tool_uses: Vec<String>,
+    /// Delivery records since the last user message, folded by id.
+    pending_deliveries: Vec<crate::core::delivery::DeliveryRecord>,
 }
 
 impl MessageReplay {
@@ -221,7 +260,13 @@ impl MessageReplay {
             pending_assistant_phase: None,
             pending_tool_results: Vec::new(),
             open_tool_uses: Vec::new(),
+            pending_deliveries: Vec::new(),
         }
+    }
+
+    fn take_delivery_note(&mut self) -> Option<String> {
+        let records = std::mem::take(&mut self.pending_deliveries);
+        crate::core::delivery::model_note(&records)
     }
 
     fn handle_event(&mut self, event: ThreadEvent) {
@@ -230,6 +275,11 @@ impl MessageReplay {
             // (the latter are UI-only and MUST NOT be sent back to the
             // provider as part of the conversation).
             ThreadEvent::Meta { .. } | ThreadEvent::Usage { .. } | ThreadEvent::Notice { .. } => {}
+            // Delivery outcomes are not conversation turns. Undelivered items
+            // reach the model as a note on the next user message.
+            ThreadEvent::Delivery { record, .. } => {
+                crate::core::delivery::fold_latest(&mut self.pending_deliveries, record);
+            }
             ThreadEvent::Message {
                 role,
                 text,
@@ -303,12 +353,23 @@ impl MessageReplay {
         // cancel orphaned tool_uses, then push the user/system message.
         self.flush_pending_assistant_blocks();
         self.cancel_open_tool_uses();
+        let note = if role == "user" {
+            self.take_delivery_note()
+        } else {
+            None
+        };
+        let message_content = match note {
+            Some(note) => {
+                user_message_with_delivery_note(&note, vec![ChatContentBlock::text(text)])
+            }
+            None => MessageContent::Text(text),
+        };
         self.messages.push(ChatMessage {
             role,
             phase,
             context,
             context_key,
-            content: MessageContent::Text(text),
+            content: message_content,
         });
     }
 
@@ -373,10 +434,14 @@ impl MessageReplay {
         self.flush_tool_results();
     }
 
-    fn finalize(mut self) -> Vec<crate::providers::ChatMessage> {
+    fn finalize(mut self) -> ThreadReplay {
         self.flush_pending_assistant_blocks();
         self.cancel_open_tool_uses();
-        self.messages
+        let trailing_delivery_note = self.take_delivery_note();
+        ThreadReplay {
+            messages: self.messages,
+            trailing_delivery_note,
+        }
     }
 }
 

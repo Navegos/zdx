@@ -12,7 +12,9 @@ use zdx_engine::providers::{ProviderAuthMode, provider_for_model};
 use super::{TurnStatus, escape_html};
 use crate::agent;
 use crate::bot::context::BotContext;
-use crate::telegram::{InlineKeyboardButton, InlineKeyboardMarkup, Message};
+use crate::telegram::{
+    InlineKeyboardButton, InlineKeyboardMarkup, Message, is_invalid_reply_error,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SelectionSource {
@@ -133,34 +135,15 @@ pub(super) async fn setup_turn_status(
         map.insert(key, token.clone());
     }
 
-    let mut message_id = context
-        .client()
-        .send_message_with_markup(
-            incoming.chat_id,
-            agent::STATUS_WAITING,
-            reply_to_message_id,
-            topic_id,
-            &cancel_markup,
-        )
-        .await
-        .ok()
-        .map(|m| m.id);
-
-    // Retry without reply_to on REPLY_MESSAGE_ID_INVALID
-    if message_id.is_none() && reply_to_message_id.is_some() {
-        message_id = context
-            .client()
-            .send_message_with_markup(
-                incoming.chat_id,
-                agent::STATUS_WAITING,
-                None,
-                topic_id,
-                &cancel_markup,
-            )
-            .await
-            .ok()
-            .map(|m| m.id);
-    }
+    let message_id = send_status_message(
+        context,
+        incoming.chat_id,
+        agent::STATUS_WAITING,
+        reply_to_message_id,
+        topic_id,
+        &cancel_markup,
+    )
+    .await;
 
     TurnStatus {
         key,
@@ -191,39 +174,55 @@ pub(super) async fn setup_preprocessing_status(
         Some(message.id)
     };
 
-    let mut message_id = context
-        .client()
-        .send_message_with_markup(
-            message.chat.id,
-            agent::STATUS_TRANSCRIBING,
-            reply_to_message_id,
-            message.effective_thread_id(),
-            &cancel_markup,
-        )
-        .await
-        .ok()
-        .map(|m| m.id);
-
-    if message_id.is_none() && reply_to_message_id.is_some() {
-        message_id = context
-            .client()
-            .send_message_with_markup(
-                message.chat.id,
-                agent::STATUS_TRANSCRIBING,
-                None,
-                message.effective_thread_id(),
-                &cancel_markup,
-            )
-            .await
-            .ok()
-            .map(|m| m.id);
-    }
+    let message_id = send_status_message(
+        context,
+        message.chat.id,
+        agent::STATUS_TRANSCRIBING,
+        reply_to_message_id,
+        message.effective_thread_id(),
+        &cancel_markup,
+    )
+    .await;
 
     TurnStatus {
         key,
         token,
         markup: cancel_markup,
         message_id,
+    }
+}
+
+/// Posts a status message with its Cancel keyboard. Paced: during a flood
+/// wait the turn starts after the wait instead of without a Cancel button.
+/// The reply target is dropped and the send repeated only when Telegram
+/// refused the target itself; any other failure could have been a delivered
+/// message (or a flood refusal), so it is not repeated.
+async fn send_status_message(
+    context: &BotContext,
+    chat_id: i64,
+    text: &str,
+    reply_to_message_id: Option<i64>,
+    topic_id: Option<i64>,
+    markup: &InlineKeyboardMarkup,
+) -> Option<i64> {
+    let client = context.client().paced();
+    let first = client
+        .send_message_with_markup(chat_id, text, reply_to_message_id, topic_id, markup)
+        .await;
+    let sent = match first {
+        Err(err) if reply_to_message_id.is_some() && is_invalid_reply_error(&err) => {
+            client
+                .send_message_with_markup(chat_id, text, None, topic_id, markup)
+                .await
+        }
+        other => other,
+    };
+    match sent {
+        Ok(message) => Some(message.id),
+        Err(err) => {
+            tracing::warn!(chat_id, err = %format!("{err:#}"), "Failed to post turn status");
+            None
+        }
     }
 }
 
