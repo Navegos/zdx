@@ -93,6 +93,10 @@ pub struct Message {
     pub id: i64,
     pub chat: Chat,
     pub from: Option<User>,
+    /// Unix time (seconds) Telegram assigned to the message. Telegram always
+    /// sends it; synthetic messages leave it `0`.
+    #[serde(default)]
+    pub date: i64,
     #[serde(default)]
     pub media_group_id: Option<String>,
     pub text: Option<String>,
@@ -118,6 +122,9 @@ pub struct Message {
     /// GIF or silent H.264/MPEG-4 clip.
     #[serde(default)]
     pub animation: Option<Video>,
+    /// Paid media. Not handled by ingest; read only for intake metadata.
+    #[serde(default)]
+    pub paid_media: Option<PaidMediaInfo>,
     /// Unique identifier of a message thread or forum topic.
     #[serde(default, rename = "message_thread_id")]
     pub thread_id: Option<i64>,
@@ -167,6 +174,14 @@ impl Message {
             .and_then(RichMessage::to_text)
             .map(Cow::Owned)
     }
+}
+
+/// Telegram `PaidMediaInfo`. Items are counted but never kept, so nothing
+/// from their bodies can reach a log or a prompt.
+#[derive(Debug, Deserialize)]
+pub struct PaidMediaInfo {
+    #[serde(default)]
+    pub paid_media: Vec<serde::de::IgnoredAny>,
 }
 
 #[derive(Debug, Deserialize)]

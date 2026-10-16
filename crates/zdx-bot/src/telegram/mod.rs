@@ -28,8 +28,8 @@ mod types;
 pub use rich::RichMessage;
 #[allow(unused_imports)]
 pub use types::{
-    Audio, CallbackQuery, Document, InlineKeyboardButton, InlineKeyboardMarkup, Message, PhotoSize,
-    TelegramFile, Update, Video, Voice, WebAppInfo,
+    Audio, CallbackQuery, Document, InlineKeyboardButton, InlineKeyboardMarkup, Message,
+    PaidMediaInfo, PhotoSize, TelegramFile, Update, Video, Voice, WebAppInfo,
 };
 
 pub struct TelegramSettings {

@@ -40,3 +40,5 @@ uuid.workspace = true
 # Isolated ZDX_HOME for tests that reach thread listing, so they never touch
 # the developer's real ~/.zdx.
 zdx-engine = { path = "../zdx-engine", features = ["testing"] }
+# Captures emitted log lines in intake-log redaction tests.
+tracing-subscriber.workspace = true

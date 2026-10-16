@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
@@ -23,6 +24,9 @@ pub(crate) struct QueueItem {
     message: Message,
     /// Cancellation token for this queued item. Checked before processing.
     cancel_token: CancellationToken,
+    /// When the item's queue slot was reserved, before the "Queued" status
+    /// send, so `queue_wait_ms` covers that send too.
+    enqueued_at: Instant,
     /// If this item was queued (not first), holds the status message info
     /// so the worker can clean it up.
     queued_status: Option<QueuedStatus>,
@@ -377,12 +381,13 @@ fn spawn_standalone(context: Arc<BotContext>, queues: ChatQueueMap, message: Mes
 async fn enqueue_message(queues: &ChatQueueMap, context: &Arc<BotContext>, message: Message) {
     let key = (message.chat.id, message.effective_thread_id().unwrap_or(0));
     let queues_map = Arc::clone(queues);
-    let (sender, should_show_queued) = {
+    let enqueued_at = Instant::now();
+    let (sender, ahead) = {
         let mut map = queues.lock().await;
         if let Some(state) = map.get_mut(&key) {
-            let should_show = state.pending > 0;
+            let ahead = state.pending;
             state.pending += 1;
-            (state.sender.clone(), should_show)
+            (state.sender.clone(), ahead)
         } else {
             let (sender, receiver) = mpsc::unbounded_channel();
             spawn_queue_worker(key, receiver, Arc::clone(context), Arc::clone(&queues_map));
@@ -393,15 +398,16 @@ async fn enqueue_message(queues: &ChatQueueMap, context: &Arc<BotContext>, messa
                     pending: 1,
                 },
             );
-            (sender, false)
+            (sender, 0)
         }
     };
+    log_enqueued(key, &message, ahead);
 
     let cancel_token = CancellationToken::new();
     let mut queued_status = None;
 
     // If there's already a queue worker (potentially busy), show "Queued" status
-    if should_show_queued {
+    if ahead > 0 {
         let chat_id = message.chat.id;
         let topic_id = message.effective_thread_id();
         let user_message_id = message.id;
@@ -454,6 +460,7 @@ async fn enqueue_message(queues: &ChatQueueMap, context: &Arc<BotContext>, messa
     let item = QueueItem {
         message,
         cancel_token,
+        enqueued_at,
         queued_status,
     };
 
@@ -479,6 +486,19 @@ async fn enqueue_message(queues: &ChatQueueMap, context: &Arc<BotContext>, messa
         }
         let _ = sender.send(item);
     }
+}
+
+/// `ahead` counts items already pending for the key, the running one included.
+fn log_enqueued(key: QueueKey, message: &Message, ahead: usize) {
+    tracing::info!(
+        chat_id = key.0,
+        topic_id = key.1,
+        message_id = message.id,
+        member_ids = %crate::intake_log::member_ids(message),
+        ahead,
+        synthetic = message.synthetic.is_some(),
+        "Message queued"
+    );
 }
 
 /// Pops every worker update already waiting behind `head` so they are handled
@@ -565,6 +585,7 @@ fn spawn_queue_worker(
                 release_slots(&queues, key, slots).await;
                 continue;
             }
+            let queue_wait_ms = item.enqueued_at.elapsed().as_millis() as u64;
             let mut message = item.message;
 
             // Worker updates that piled up during the previous turn ride along
@@ -589,6 +610,14 @@ fn spawn_queue_worker(
                 );
             }
 
+            tracing::info!(
+                chat_id = key.0,
+                topic_id = key.1,
+                message_id = message.id,
+                member_ids = %crate::intake_log::member_ids(&message),
+                queue_wait_ms,
+                "Queued message started"
+            );
             if let Err(err) = Box::pin(handle_message(&context, &queues, message)).await {
                 tracing::error!(?key, err = %format!("{err:#}"), "Message handling error");
             }
@@ -676,6 +705,7 @@ mod tests {
         QueueItem {
             message,
             cancel_token: CancellationToken::new(),
+            enqueued_at: Instant::now(),
             queued_status: None,
         }
     }

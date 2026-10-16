@@ -43,6 +43,31 @@ impl RichMessage {
         let trimmed = rendered.trim();
         (!trimmed.is_empty()).then(|| trimmed.to_string())
     }
+
+    /// Number of top-level blocks, and how many of them are media blocks.
+    /// Only counts, never block content, so it is safe to log.
+    pub fn block_counts(&self) -> (usize, usize) {
+        let media = self
+            .blocks
+            .iter()
+            .filter(|block| {
+                matches!(
+                    block.get("type").and_then(Value::as_str),
+                    Some(
+                        "animation"
+                            | "audio"
+                            | "document"
+                            | "photo"
+                            | "video"
+                            | "voice_note"
+                            | "collage"
+                            | "slideshow"
+                    )
+                )
+            })
+            .count();
+        (self.blocks.len(), media)
+    }
 }
 
 fn render_block(block: &Value) -> Option<String> {

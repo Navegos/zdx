@@ -94,6 +94,7 @@ pub(crate) async fn handle_message(
         user_id = incoming.user_id,
         chat_id = incoming.chat_id,
         topic_id = ?reply_ctx.topic_id,
+        message_id = incoming.message_id,
         "Accepted message",
     );
 

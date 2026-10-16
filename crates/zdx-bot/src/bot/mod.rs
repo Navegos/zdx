@@ -1,4 +1,5 @@
 pub(crate) mod context;
+pub(crate) mod media_group;
 pub(crate) mod queue;
 pub(crate) mod synthetic;
 

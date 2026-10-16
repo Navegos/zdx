@@ -8,6 +8,7 @@ use tokio::sync::Mutex;
 use zdx_engine::config::Config;
 use zdx_engine::core::agent::ToolConfig;
 
+use crate::bot::media_group::{MEDIA_GROUP_DEBOUNCE, MediaGroupKey, MediaGroups, Offer};
 use crate::bot::queue::ChatQueueMap;
 use crate::bot::{
     BotContext, BotContextDeps, CancelKey, QueueCancelKey, dispatch_message, new_cancel_map,
@@ -27,6 +28,7 @@ mod delivery_tracker;
 mod followups;
 mod handlers;
 mod ingest;
+mod intake_log;
 mod orchestrator;
 mod restart_queue;
 mod retry;
@@ -38,11 +40,7 @@ mod transcribe;
 mod types;
 
 const TELEGRAM_INSTRUCTION_LAYER: &str = zdx_engine::prompts::TELEGRAM_INSTRUCTION_LAYER;
-const MEDIA_GROUP_DEBOUNCE: Duration = Duration::from_millis(1500);
-
-type MediaGroupKey = (i64, Option<i64>, i64, String);
-type PendingMediaGroups =
-    Arc<Mutex<std::collections::HashMap<MediaGroupKey, crate::telegram::Message>>>;
+type PendingMediaGroups = Arc<Mutex<MediaGroups>>;
 
 /// Exit code used to signal an active supervisor to restart the bot.
 pub const EXIT_REQUESTED: i32 = 42;
@@ -179,8 +177,7 @@ async fn run_bot(config: Config, settings: TelegramSettings, root: PathBuf) -> R
         Arc::clone(&worker_manager),
     );
     let chat_queues = new_chat_queues();
-    let pending_media_groups: PendingMediaGroups =
-        Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let pending_media_groups: PendingMediaGroups = Arc::new(Mutex::new(MediaGroups::default()));
 
     // Worker completions wake the owning orchestrator topic (best-effort).
     crate::orchestrator::spawn_completion_bridge(
@@ -237,14 +234,22 @@ async fn run_bot(config: Config, settings: TelegramSettings, root: PathBuf) -> R
                 if !updates.is_empty() {
                     tracing::debug!(count = updates.len(), "Received updates");
                 }
-                for update in updates {
+                let received_ms = intake_log::now_unix_ms();
+                let poll_size = updates.len();
+                for (index, update) in updates.into_iter().enumerate() {
                     offset = Some(update.id + 1);
                     if let Some(message) = update.message {
+                        let receipt = Receipt {
+                            update_id: update.id,
+                            received_ms,
+                            poll: intake_log::PollPosition { index, size: poll_size },
+                        };
                         route_message_update(
                             &chat_queues,
                             &context,
                             &pending_media_groups,
                             message,
+                            receipt,
                         )
                         .await;
                     }
@@ -259,48 +264,85 @@ async fn run_bot(config: Config, settings: TelegramSettings, root: PathBuf) -> R
     Ok(())
 }
 
+/// When and how an update was received, for the intake log.
+struct Receipt {
+    update_id: i64,
+    received_ms: i64,
+    poll: intake_log::PollPosition,
+}
+
 async fn route_message_update(
     chat_queues: &ChatQueueMap,
     context: &Arc<BotContext>,
     pending_media_groups: &PendingMediaGroups,
     message: crate::telegram::Message,
+    receipt: Receipt,
 ) {
-    let Some(key) = media_group_key(&message) else {
-        dispatch_message(chat_queues, context, message).await;
-        return;
+    // Metadata is stamped before grouping, and only for senders ZDX serves.
+    let meta = intake_log::is_allowlisted(
+        context.allowlist_user_ids(),
+        context.allowlist_chat_ids(),
+        &message,
+    )
+    .then(|| {
+        intake_log::IntakeMeta::of(
+            receipt.update_id,
+            &message,
+            receipt.received_ms,
+            receipt.poll,
+        )
+    });
+
+    let offer = pending_media_groups
+        .lock()
+        .await
+        .offer(message, std::time::Instant::now());
+    let (grouping, flush_key) = match offer {
+        Offer::Ungrouped(message) => {
+            if let Some(meta) = &meta {
+                intake_log::log_received(meta, intake_log::Grouping::None);
+            }
+            dispatch_message(chat_queues, context, *message).await;
+            return;
+        }
+        Offer::Joined { grouping } => (grouping, None),
+        Offer::Opened { key, grouping } => (grouping, Some(key)),
     };
-
-    let mut pending = pending_media_groups.lock().await;
-    if let Some(existing) = pending.get_mut(&key) {
-        existing.grouped_messages.push(message);
-        return;
+    if let Some(meta) = &meta {
+        intake_log::log_received(meta, grouping);
     }
+    if let Some(key) = flush_key {
+        spawn_media_group_flush(chat_queues, context, pending_media_groups, key);
+    }
+}
 
-    pending.insert(key.clone(), message);
-    drop(pending);
-
+fn spawn_media_group_flush(
+    chat_queues: &ChatQueueMap,
+    context: &Arc<BotContext>,
+    pending_media_groups: &PendingMediaGroups,
+    key: MediaGroupKey,
+) {
     let queues = Arc::clone(chat_queues);
     let context = Arc::clone(context);
     let pending_media_groups = Arc::clone(pending_media_groups);
     tokio::spawn(async move {
         tokio::time::sleep(MEDIA_GROUP_DEBOUNCE).await;
-        let message = {
-            let mut pending = pending_media_groups.lock().await;
-            pending.remove(&key)
+        let flushed = pending_media_groups
+            .lock()
+            .await
+            .flush(&key, std::time::Instant::now());
+        let Some(flushed) = flushed else {
+            return;
         };
-        if let Some(message) = message {
-            dispatch_message(&queues, &context, message).await;
+        if intake_log::is_allowlisted(
+            context.allowlist_user_ids(),
+            context.allowlist_chat_ids(),
+            &flushed.message,
+        ) {
+            intake_log::log_flushed(&flushed);
         }
+        dispatch_message(&queues, &context, flushed.message).await;
     });
-}
-
-fn media_group_key(message: &crate::telegram::Message) -> Option<MediaGroupKey> {
-    Some((
-        message.chat.id,
-        message.effective_thread_id(),
-        message.from.as_ref()?.id,
-        message.media_group_id.clone()?,
-    ))
 }
 
 /// Handle a callback query from an inline keyboard button.
@@ -895,21 +937,8 @@ mod tests {
 
     use serde_json::json;
 
-    use super::{
-        callback_is_allowed, media_group_key, parse_cancel_callback, parse_queue_cancel_callback,
-    };
-    use crate::telegram::{CallbackQuery, Message};
-
-    fn test_message(id: i64, media_group_id: Option<&str>, text: Option<&str>) -> Message {
-        serde_json::from_value(json!({
-            "message_id": id,
-            "chat": { "id": 42, "type": "private", "is_forum": false },
-            "from": { "id": 7, "is_bot": false },
-            "media_group_id": media_group_id,
-            "text": text,
-        }))
-        .expect("valid test message")
-    }
+    use super::{callback_is_allowed, parse_cancel_callback, parse_queue_cancel_callback};
+    use crate::telegram::CallbackQuery;
 
     fn test_callback(user_id: i64, chat_id: i64, chat_type: &str) -> CallbackQuery {
         serde_json::from_value(json!({
@@ -924,17 +953,6 @@ mod tests {
             "data": "retry:go",
         }))
         .expect("valid test callback")
-    }
-
-    #[test]
-    fn derives_media_group_key_from_message() {
-        let message = test_message(100, Some("album-1"), Some("first"));
-        assert_eq!(
-            media_group_key(&message),
-            Some((42, None, 7, "album-1".to_string()))
-        );
-        let non_album = test_message(101, None, Some("solo"));
-        assert_eq!(media_group_key(&non_album), None);
     }
 
     #[test]
