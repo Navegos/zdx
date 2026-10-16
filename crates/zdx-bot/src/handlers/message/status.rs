@@ -1,13 +1,14 @@
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use anyhow::Result;
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
-use zdx_engine::core::events::AgentEvent;
 use zdx_engine::core::thread_persistence;
 use zdx_engine::models::{ModelOption, ModelPricing};
 use zdx_engine::providers::{ProviderAuthMode, provider_for_model};
+use zdx_engine::telegram::flood::{self, FailureClass};
 
 use super::{TurnStatus, escape_html};
 use crate::agent;
@@ -122,7 +123,8 @@ pub(super) async fn setup_turn_status(
         // The provisional (transcription) status was created before the thread
         // was known, so it only had Cancel. Give it the thread link now.
         status.markup = turn_status_markup(context, incoming.chat_id, status.key, Some(thread_id));
-        update_turn_status_text(context, incoming.chat_id, &status, agent::STATUS_WAITING).await;
+        let _ = update_turn_status_text(context, incoming.chat_id, &status, agent::STATUS_WAITING)
+            .await;
         return status;
     }
 
@@ -231,14 +233,14 @@ async fn update_turn_status_text(
     chat_id: i64,
     status: &TurnStatus,
     text: &str,
-) {
+) -> Result<()> {
     let Some(msg_id) = status.message_id else {
-        return;
+        return Ok(());
     };
-    let _ = context
+    context
         .client()
         .edit_message_text(chat_id, msg_id, text, Some(&status.markup))
-        .await;
+        .await
 }
 
 pub(super) async fn discard_turn_status(
@@ -271,31 +273,96 @@ pub(super) async fn finalize_preprocessing_cancelled(
     cleanup_turn_status(context, status).await;
 }
 
-pub(super) async fn update_status(
+/// Progress line of a running turn, edited at most once per
+/// [`STATUS_DEBOUNCE`].
+///
+/// `desired` is the newest status the agent reported; `shown` is the last
+/// one an edit was sent (or attempted) for. A change that arrives inside the
+/// interval is kept, not dropped: [`Self::next_flush_at`] tells the turn loop
+/// when to send it, even if no further event comes. Only the newest status is
+/// sent, and the state lives in the turn task, so it is dropped with the turn.
+pub(super) struct StatusDebounce {
+    shown: String,
+    desired: String,
+    last_edit: Instant,
+}
+
+/// What an edit attempt means for the next one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditOutcome {
+    /// Sent, or not worth repeating (refused, or the outcome is unknown).
+    Done,
+    /// Skipped or refused by flood control: keep it pending and try again
+    /// after one more interval. During a known flood wait that next try is
+    /// skipped locally too, so no request goes out until the wait ends.
+    FloodWait,
+}
+
+impl StatusDebounce {
+    /// Starts from the status the message shows now. The first change may be
+    /// sent at once.
+    pub(super) fn new(shown: &str, now: Instant) -> Self {
+        Self {
+            shown: shown.to_string(),
+            desired: shown.to_string(),
+            last_edit: now.checked_sub(STATUS_DEBOUNCE).unwrap_or(now),
+        }
+    }
+
+    /// Records the newest status from an agent event (`None`: unchanged).
+    pub(super) fn observe(&mut self, status: Option<String>) {
+        if let Some(status) = status {
+            self.desired = status;
+        }
+    }
+
+    /// When the pending status may be sent; `None` when nothing is pending.
+    pub(super) fn next_flush_at(&self) -> Option<Instant> {
+        (self.desired != self.shown).then(|| self.last_edit + STATUS_DEBOUNCE)
+    }
+
+    /// The status to send now, if one is pending and the interval passed.
+    fn due(&self, now: Instant) -> Option<String> {
+        self.next_flush_at()
+            .is_some_and(|at| at <= now)
+            .then(|| self.desired.clone())
+    }
+
+    fn record(&mut self, text: String, now: Instant, outcome: EditOutcome) {
+        self.last_edit = now;
+        if outcome == EditOutcome::Done {
+            self.shown = text;
+        }
+    }
+}
+
+/// Sends the pending status if it is due. Called after every agent event and
+/// when the turn loop's flush timer fires; `now` is when the caller decided
+/// the flush is due.
+pub(super) async fn flush_status(
     context: &BotContext,
     chat_id: i64,
     status: &TurnStatus,
-    event: &AgentEvent,
-    current_status: &mut String,
-    last_edit: &mut std::time::Instant,
+    debounce: &mut StatusDebounce,
+    now: Instant,
 ) {
-    let Some(new_status) = agent::event_to_status(event) else {
+    let Some(text) = debounce.due(now) else {
         return;
     };
-    if new_status == *current_status {
-        return;
-    }
-
-    *current_status = new_status;
     if status.message_id.is_none() {
+        // Nothing to edit: never keep a pending flush alive.
+        debounce.record(text, now, EditOutcome::Done);
         return;
     }
-    let now = std::time::Instant::now();
-    if now.duration_since(*last_edit) < STATUS_DEBOUNCE {
-        return;
-    }
-    *last_edit = now;
-    update_turn_status_text(context, chat_id, status, current_status).await;
+    let result = update_turn_status_text(context, chat_id, status, &text).await;
+    let outcome = match result {
+        Err(err) if matches!(flood::classify(&err), FailureClass::FloodWait(_)) => {
+            EditOutcome::FloodWait
+        }
+        // Sent, refused, or outcome unknown: not repeated.
+        _ => EditOutcome::Done,
+    };
+    debounce.record(text, now, outcome);
 }
 
 pub(super) async fn cleanup_turn_status(context: &BotContext, status: &TurnStatus) {
@@ -625,9 +692,90 @@ fn trim_price(value: f64) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use super::{
-        SelectionSource, format_worker_lines, selection_sources, turn_status_markup_for_url,
+        EditOutcome, STATUS_DEBOUNCE, SelectionSource, StatusDebounce, format_worker_lines,
+        selection_sources, turn_status_markup_for_url,
     };
+
+    fn sent(debounce: &mut StatusDebounce, now: Instant) -> Option<String> {
+        let text = debounce.due(now)?;
+        debounce.record(text.clone(), now, EditOutcome::Done);
+        Some(text)
+    }
+
+    #[test]
+    fn a_change_inside_the_interval_is_kept_and_sent_when_it_ends() {
+        let start = Instant::now();
+        let mut debounce = StatusDebounce::new("waiting", start);
+        debounce.observe(Some("running bash".to_string()));
+        assert_eq!(sent(&mut debounce, start).as_deref(), Some("running bash"));
+
+        // Skipped by the interval, not lost.
+        let soon = start + Duration::from_secs(1);
+        debounce.observe(Some("thinking".to_string()));
+        assert_eq!(sent(&mut debounce, soon), None);
+        assert_eq!(debounce.next_flush_at(), Some(start + STATUS_DEBOUNCE));
+
+        // No further event: the trailing flush sends it.
+        let end = start + STATUS_DEBOUNCE;
+        assert_eq!(sent(&mut debounce, end).as_deref(), Some("thinking"));
+        assert_eq!(debounce.next_flush_at(), None);
+    }
+
+    #[test]
+    fn several_changes_coalesce_into_the_newest() {
+        let start = Instant::now();
+        let mut debounce = StatusDebounce::new("waiting", start);
+        debounce.observe(Some("a".to_string()));
+        assert!(sent(&mut debounce, start).is_some());
+        for status in ["b", "c", "d"] {
+            debounce.observe(Some(status.to_string()));
+            assert_eq!(
+                sent(&mut debounce, start + Duration::from_millis(500)),
+                None
+            );
+        }
+        assert_eq!(
+            sent(&mut debounce, start + STATUS_DEBOUNCE).as_deref(),
+            Some("d")
+        );
+    }
+
+    #[test]
+    fn identical_or_returning_statuses_send_nothing() {
+        let start = Instant::now();
+        let mut debounce = StatusDebounce::new("waiting", start);
+        debounce.observe(Some("waiting".to_string()));
+        debounce.observe(None);
+        assert_eq!(debounce.next_flush_at(), None);
+
+        debounce.observe(Some("a".to_string()));
+        assert!(sent(&mut debounce, start).is_some());
+        // a → b → a inside the interval: the message already shows `a`.
+        debounce.observe(Some("b".to_string()));
+        debounce.observe(Some("a".to_string()));
+        assert_eq!(debounce.next_flush_at(), None);
+    }
+
+    #[test]
+    fn a_flood_wait_keeps_the_status_pending_without_spinning() {
+        let start = Instant::now();
+        let mut debounce = StatusDebounce::new("waiting", start);
+        debounce.observe(Some("a".to_string()));
+        let text = debounce.due(start).expect("due");
+        debounce.record(text, start, EditOutcome::FloodWait);
+        // Still pending, next try one full interval later.
+        assert_eq!(debounce.next_flush_at(), Some(start + STATUS_DEBOUNCE));
+        assert_eq!(debounce.due(start + Duration::from_secs(1)), None);
+
+        // Any other failure is not repeated.
+        let later = start + STATUS_DEBOUNCE;
+        let text = debounce.due(later).expect("due again");
+        debounce.record(text, later, EditOutcome::Done);
+        assert_eq!(debounce.next_flush_at(), None);
+    }
 
     #[test]
     fn selection_provenance_distinguishes_orchestrator_and_topic_layers() {

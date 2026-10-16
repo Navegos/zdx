@@ -3,7 +3,7 @@ use zdx_engine::core::events::{AgentEvent, TurnStatus as AgentTurnStatus};
 use zdx_engine::core::thread_persistence;
 
 use super::response::send_final_response;
-use super::status::{STATUS_DEBOUNCE, cleanup_turn_status, setup_turn_status, update_status};
+use super::status::{StatusDebounce, cleanup_turn_status, flush_status, setup_turn_status};
 use super::{ReplyContext, SpawnRequest, TurnResult, TurnStatus, format_user_error_message};
 use crate::agent;
 use crate::bot::context::BotContext;
@@ -167,7 +167,14 @@ pub(super) async fn run_agent_turn(
         spawn.thread,
         context.tool_config(),
     );
-    let result = stream_turn_events(context, &incoming, &mut handle, &mut status).await;
+    let result = stream_turn_events(
+        context,
+        &incoming,
+        &mut handle.rx,
+        &handle.cancel,
+        &mut status,
+    )
+    .await;
     // Barrier: the next queued message rebuilds its history from the thread log,
     // so the turn must be fully written before this one releases the queue slot.
     handle.await_persisted().await;
@@ -202,16 +209,20 @@ fn turn_config(
     config
 }
 
+/// Consumes one turn's agent events until it ends, keeping the status
+/// message's progress line current. A progress change that arrives inside the
+/// debounce interval is sent when the interval ends, even with no further
+/// event. Ready events are handled before a due flush, and the pending status
+/// is dropped when the loop exits (turn finished or cancelled), so no
+/// progress edit is sent after that.
 async fn stream_turn_events(
     context: &BotContext,
     incoming: &crate::types::IncomingMessage,
-    handle: &mut agent::AgentTurnHandle,
+    rx: &mut zdx_engine::core::agent::AgentEventRx,
+    agent_cancel: &tokio_util::sync::CancellationToken,
     status: &mut TurnStatus,
 ) -> TurnResult {
-    let mut current_status = agent::STATUS_WAITING.to_string();
-    let mut last_edit = std::time::Instant::now()
-        .checked_sub(STATUS_DEBOUNCE)
-        .expect("debounce subtraction should always succeed");
+    let mut progress = StatusDebounce::new(agent::STATUS_WAITING, std::time::Instant::now());
     let mut final_text = String::new();
     let mut got_result = false;
     let mut had_error = false;
@@ -223,13 +234,16 @@ async fn stream_turn_events(
         std::collections::HashMap::new();
 
     loop {
+        let flush_at = progress.next_flush_at();
+        let flush_deadline =
+            tokio::time::Instant::from_std(flush_at.unwrap_or_else(std::time::Instant::now));
         tokio::select! {
             biased;
             () = status.token.cancelled() => {
-                handle.cancel.cancel();
+                agent_cancel.cancel();
                 break;
             }
-            event = handle.rx.recv() => {
+            event = rx.recv() => {
                 let Some(event) = event else { break; };
                 match &*event {
                     AgentEvent::TurnFinished {
@@ -272,9 +286,18 @@ async fn stream_turn_events(
                             }
                             _ => {}
                         }
-                        update_status(context, incoming.chat_id, status, other, &mut current_status, &mut last_edit).await;
+                        progress.observe(agent::event_to_status(other));
                     }
                 }
+                // Every non-terminal event can send a due status, so a steady
+                // stream of events cannot starve the flush below.
+                flush_status(context, incoming.chat_id, status, &mut progress, std::time::Instant::now()).await;
+            }
+            () = tokio::time::sleep_until(flush_deadline), if flush_at.is_some() => {
+                // The timer never fires early; `max` keeps a clock rounding
+                // difference from turning into an immediate re-wake.
+                let now = std::time::Instant::now().max(flush_at.unwrap_or_else(std::time::Instant::now));
+                flush_status(context, incoming.chat_id, status, &mut progress, now).await;
             }
         }
     }
@@ -385,4 +408,176 @@ async fn finalize_turn(
     .await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use tokio::sync::mpsc;
+    use tokio_util::sync::CancellationToken;
+    use zdx_engine::core::events::{AgentEvent, TurnStatus as AgentTurnStatus};
+
+    use super::stream_turn_events;
+    use crate::bot::context::BotContext;
+    use crate::handlers::message::TurnStatus;
+    use crate::telegram::fake::{FakeTelegram, TOKEN};
+    use crate::telegram::{InlineKeyboardMarkup, TelegramClient};
+
+    const CHAT: i64 = -1001;
+
+    fn incoming() -> crate::types::IncomingMessage {
+        crate::types::IncomingMessage {
+            chat_id: CHAT,
+            message_id: 42,
+            user_id: 1,
+            text: Some("go".to_string()),
+            images: Vec::new(),
+            audios: Vec::new(),
+            documents: Vec::new(),
+            videos: Vec::new(),
+            notices: Vec::new(),
+            message_thread_id: Some(7),
+            is_forum: true,
+        }
+    }
+
+    fn turn_status() -> TurnStatus {
+        TurnStatus {
+            key: (CHAT, 42),
+            token: CancellationToken::new(),
+            markup: InlineKeyboardMarkup::empty(),
+            message_id: Some(55),
+        }
+    }
+
+    fn tool_started(name: &str) -> Arc<AgentEvent> {
+        Arc::new(AgentEvent::ToolStarted {
+            id: format!("id-{name}"),
+            name: name.to_string(),
+        })
+    }
+
+    fn thinking() -> Arc<AgentEvent> {
+        Arc::new(AgentEvent::ReasoningDelta {
+            text: "…".to_string(),
+        })
+    }
+
+    fn finished() -> Arc<AgentEvent> {
+        Arc::new(AgentEvent::TurnFinished {
+            status: AgentTurnStatus::Completed,
+            final_text: "done".to_string(),
+            messages: Vec::new(),
+            prior_message_count: 0,
+        })
+    }
+
+    /// Bodies of the status edits the fake received, in order.
+    fn edits(fake: &FakeTelegram) -> Vec<String> {
+        fake.seen()
+            .into_iter()
+            .filter(|seen| seen.method == "editMessageText")
+            .map(|seen| seen.body)
+            .collect()
+    }
+
+    fn context(fake: &FakeTelegram) -> Arc<BotContext> {
+        Arc::new(BotContext::for_test(
+            TelegramClient::with_base_url(TOKEN.to_string(), fake.base_url.clone()),
+            zdx_engine::config::Config::default(),
+            std::env::temp_dir(),
+        ))
+    }
+
+    /// The reported bug: the newest progress arrived inside the 3 s interval,
+    /// no further event came, and the message kept the old text.
+    #[tokio::test]
+    async fn the_newest_skipped_status_is_sent_when_the_interval_ends() {
+        let _home = zdx_engine::test_support::temp_zdx_home();
+        let fake = Arc::new(FakeTelegram::start().await);
+        let context = context(&fake);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let cancel = CancellationToken::new();
+        let mut status = turn_status();
+
+        tx.send(tool_started("bash")).expect("send");
+        tx.send(tool_started("read")).expect("send");
+        tx.send(thinking()).expect("send");
+        // No further progress event. Finish only after the second edit landed
+        // (bounded wait), so the check does not depend on scheduling slack.
+        let watched = Arc::clone(&fake);
+        let driver = tokio::spawn(async move {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            while edits(&watched).len() < 2 && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            tx.send(finished()).expect("send");
+        });
+        let started = std::time::Instant::now();
+        let result = stream_turn_events(&context, &incoming(), &mut rx, &cancel, &mut status).await;
+        driver.await.expect("driver");
+
+        assert!(result.got_result);
+        let edits = edits(&fake);
+        assert_eq!(edits.len(), 2, "{edits:?}");
+        assert!(edits[0].contains("bash"));
+        // `read` was overtaken by `thinking`: only the newest is sent, and
+        // only after the 3 s interval.
+        assert!(edits[1].contains("Thinking"), "{}", edits[1]);
+        assert!(started.elapsed() >= Duration::from_millis(2900));
+    }
+
+    /// A turn that ends (or is cancelled) before the interval passes sends no
+    /// progress edit afterwards: the pending status ends with the loop.
+    #[tokio::test]
+    async fn completion_or_cancel_before_the_flush_drops_the_pending_status() {
+        let _home = zdx_engine::test_support::temp_zdx_home();
+        let fake = FakeTelegram::start().await;
+        let context = context(&fake);
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let cancel = CancellationToken::new();
+        let mut status = turn_status();
+        tx.send(tool_started("bash")).expect("send");
+        tx.send(thinking()).expect("send");
+        tx.send(finished()).expect("send");
+        let result = stream_turn_events(&context, &incoming(), &mut rx, &cancel, &mut status).await;
+        assert!(result.got_result);
+
+        let (tx2, mut rx2) = mpsc::unbounded_channel();
+        let agent_cancel = CancellationToken::new();
+        let mut cancelled = turn_status();
+        tx2.send(tool_started("edit")).expect("send");
+        tx2.send(thinking()).expect("send");
+        let token = cancelled.token.clone();
+        let cancel_task = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            token.cancel();
+        });
+        let _ = stream_turn_events(
+            &context,
+            &incoming(),
+            &mut rx2,
+            &agent_cancel,
+            &mut cancelled,
+        )
+        .await;
+        cancel_task.await.expect("cancel task");
+        assert!(agent_cancel.is_cancelled());
+
+        tokio::time::sleep(STATUS_DEBOUNCE_PLUS).await;
+        let edits = edits(&fake);
+        assert_eq!(
+            edits.len(),
+            2,
+            "one immediate edit per turn only: {edits:?}"
+        );
+        assert!(edits.iter().all(|body| !body.contains("Thinking")));
+        drop(tx);
+        drop(tx2);
+    }
+
+    const STATUS_DEBOUNCE_PLUS: Duration = Duration::from_millis(3300);
 }

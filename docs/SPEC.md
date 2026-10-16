@@ -690,7 +690,7 @@ When the Telegram bot is used in a forum-enabled supergroup:
 
 ## 17) Telegram turn status and final reply (`zdx-bot`)
 
-- While a turn runs, the bot keeps one live status message carrying the current activity and the Cancel button, edited in place with a debounce.
+- While a turn runs, the bot keeps one live status message carrying the current activity and the Cancel button, edited in place at most once per 3 s. A change inside that interval is not dropped: the newest activity is shown when the interval ends, even if no further event arrives, and a pending change is discarded when the turn ends. During a known flood wait the edit is skipped and tried again one interval later.
 - The status message also offers an `Open Thread` button that deep-links the Mini App to that turn's effective thread, on the same terms as the topic header: only when `[telegram.server]` is enabled with `mini_app_url` set, otherwise Cancel stands alone. Audio turns show it once transcription hands over to the agent, since the thread is not known while transcribing.
 - When the turn completes, the status message is deleted and the assistant reply is sent as a new message. The reply's Telegram timestamp is the turn's end time, it carries no `edited` marker, and it raises a normal message notification (Telegram does not notify on edits).
 - The new reply keeps the same reply target the status message used. Only a refusal of the reply target itself (`message to be replied not found` / `REPLY_MESSAGE_ID_INVALID`) falls back to sending without one; any other failure is not repeated, because it may have been delivered. The status message follows the same rule.
