@@ -16,6 +16,7 @@ pub mod memory_search;
 pub mod orchestrator;
 pub mod read_thread;
 pub mod subagent;
+pub mod subagent_job;
 pub mod telegram;
 pub mod thread_search;
 pub mod todo_write;
@@ -84,14 +85,15 @@ pub struct ToolContext {
     /// Tool use ID for the current execution (needed for `ToolOutputDelta` events).
     pub tool_use_id: Option<String>,
 
-    /// Whether this run may move a long-running foreground `Bash` command to
-    /// the background instead of waiting for it.
-    ///
-    /// Only true on surfaces that outlive a single agent run. An adopted job is
-    /// held by this process's supervisor lease, so a one-shot process would
-    /// kill it on exit — exactly the work the handoff is meant to preserve.
-    /// See [`surface_keeps_background_jobs`].
-    pub background_handoff: bool,
+    /// Whether this run may run work in the background. Resolved once per run
+    /// by [`BackgroundExecution::resolve`]; runtime enforcement reads it here.
+    pub background_execution: BackgroundExecution,
+
+    /// Background work owned by the agent turn running this tool call. Set
+    /// for every engine turn; work registered here is stopped when the turn
+    /// ends. `None` outside an engine turn, where nothing may be started that
+    /// needs an owner.
+    pub turn_tasks: Option<Arc<subagent_job::TurnTasks>>,
 }
 
 impl std::fmt::Debug for ToolContext {
@@ -110,8 +112,72 @@ impl std::fmt::Debug for ToolContext {
             .field("allowed_subagents", &self.allowed_subagents)
             .field("event_sender", &self.event_sender.as_ref().map(|_| ".."))
             .field("tool_use_id", &self.tool_use_id)
-            .field("background_handoff", &self.background_handoff)
+            .field("background_execution", &self.background_execution)
+            .field("turn_tasks", &self.turn_tasks.is_some())
             .finish()
+    }
+}
+
+/// Names of the tools that read and stop background jobs. They are present
+/// exactly when a run has background execution and a tool that can start
+/// background work ([`BACKGROUND_STARTING_TOOLS`]).
+pub const BACKGROUND_MANAGEMENT_TOOLS: [&str; 2] = ["background_output", "background_kill"];
+
+/// Tools that can start background work: `bash` (`background: true` and the
+/// auto-background handoff) and `invoke_subagent` (`background: true`).
+pub const BACKGROUND_STARTING_TOOLS: [&str; 2] = ["bash", "invoke_subagent"];
+
+/// Whether a run may run work in the background: the single policy that the
+/// tool list, the `Bash` and `invoke_subagent` schemas and text, and runtime
+/// enforcement derive from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackgroundExecution {
+    /// Background execution is available. `Bash` accepts `background: true`,
+    /// `invoke_subagent` accepts `background: true`, and
+    /// `background_output`/`background_kill` manage the jobs.
+    ///
+    /// `handoff_bound` is when a foreground `Bash` command that is still
+    /// running moves to the background. `None` means a foreground command is
+    /// waited on however long it runs: the surface cannot keep a job alive,
+    /// the bound is configured as 0, or the platform has no handoff.
+    Enabled { handoff_bound: Option<Duration> },
+    /// No background execution. `background: true` is rejected by both tools,
+    /// the management tools are absent, nothing is ever moved to the
+    /// background, and a normal `invoke_subagent` call blocks. A `Bash`
+    /// command stays in the foreground until it finishes; there is no implicit
+    /// time limit, only the caller's `timeout_secs` and the run's deadline.
+    Disabled,
+}
+
+impl BackgroundExecution {
+    /// Resolves the policy for one run.
+    ///
+    /// `background_commands` is the run's explicit permission (a subagent
+    /// definition's `background_commands`, default off for subagents and on
+    /// everywhere else). Without it the run is [`Self::Disabled`], whatever
+    /// the surface. With it, the `Bash` handoff applies only where the surface
+    /// can keep a relocated job alive (see [`surface_keeps_background_jobs`]).
+    ///
+    /// The handoff bound is only ever a relocation bound: nothing in this
+    /// policy kills a command.
+    #[must_use]
+    pub fn resolve(
+        background_commands: bool,
+        surface: Option<&str>,
+        config: &crate::config::Config,
+    ) -> Self {
+        if !background_commands {
+            return Self::Disabled;
+        }
+        let handoff_bound = (cfg!(unix) && surface_keeps_background_jobs(surface))
+            .then(|| config.bash_foreground_bound())
+            .flatten();
+        Self::Enabled { handoff_bound }
+    }
+
+    #[must_use]
+    pub fn is_enabled(self) -> bool {
+        matches!(self, Self::Enabled { .. })
     }
 }
 
@@ -124,10 +190,10 @@ impl std::fmt::Debug for ToolContext {
 ///
 /// - it outlives the run: the interactive TUI (`chat`) and the bot daemon
 ///   (`telegram`) keep running and can poll or kill the job afterwards;
-/// - it drains before exiting: `zdx exec` — which is also how every
-///   `invoke_subagent` child and orchestrator worker runs — waits for adopted
-///   jobs to finish at the end of the command, holding the lease throughout.
-///   See `zdx_tools::adopted::drain`.
+/// - it drains before exiting: `zdx exec` — which is also how orchestrator
+///   workers and the `invoke_subagent` children that opt into background
+///   commands run — waits for adopted jobs to finish at the end of the
+///   command, holding the lease throughout. See `zdx_tools::adopted::drain`.
 ///
 /// Unknown and absent surfaces are excluded: an embedder that neither outlives
 /// its runs nor drains would kill relocated work at exit, so the failure
@@ -153,7 +219,10 @@ impl ToolContext {
             allowed_subagents: None,
             event_sender: None,
             tool_use_id: None,
-            background_handoff: false,
+            background_execution: BackgroundExecution::Enabled {
+                handoff_bound: None,
+            },
+            turn_tasks: None,
         }
     }
 
@@ -174,11 +243,10 @@ impl ToolContext {
         self
     }
 
-    /// Enables auto-backgrounding of foreground `Bash` commands for runs on a
-    /// surface that outlives the run itself.
+    /// Sets the run's resolved `Bash` execution policy.
     #[must_use]
-    pub fn with_background_handoff(mut self, enabled: bool) -> Self {
-        self.background_handoff = enabled;
+    pub fn with_background_execution(mut self, background_execution: BackgroundExecution) -> Self {
+        self.background_execution = background_execution;
         self
     }
 
@@ -458,7 +526,7 @@ impl ToolRegistry {
 /// `Value::as_bool` rejects — that silently ran long-lived servers on the
 /// blocking path until the turn timed out. Vocabulary mirrors
 /// `zdx_tools::bool_or_string`.
-fn wants_background(input: &Value) -> bool {
+pub(crate) fn wants_background(input: &Value) -> bool {
     match input.get("background") {
         Some(Value::Bool(flag)) => *flag,
         Some(Value::String(raw)) => matches!(
@@ -478,62 +546,74 @@ impl Tool for Bash {
         let input = input.clone();
         let ctx = ctx.clone();
         Box::pin(async move {
-            // Background mode: spawn a detached, tracked process and return a
-            // bg_id instead of blocking the turn.
+            let background = ctx.background_execution.is_enabled();
             if wants_background(&input) {
+                if !background {
+                    return background_disabled_output();
+                }
+                // Background mode: spawn a detached, tracked process and
+                // return a bg_id instead of blocking the turn.
                 return background::run_background(&input, &ctx).await;
             }
 
-            // Foreground commands are auto-backgrounded rather than killed when
-            // they outrun their bound; this supplies the registry hooks needed
-            // if that happens.
+            // With background execution, a foreground command is
+            // auto-backgrounded rather than killed when it outruns its bound;
+            // this supplies the registry hooks needed if that happens.
             #[cfg(unix)]
             let handoff = input
                 .get("command")
                 .and_then(Value::as_str)
                 .and_then(|command| background::prepare_handoff(command, &ctx));
 
+            let leaf = ctx.as_leaf();
+            let timeout = ctx.timeout;
+            let run = move |output_tx| async move {
+                if background {
+                    bash::execute(
+                        &input,
+                        &leaf,
+                        timeout,
+                        output_tx,
+                        #[cfg(unix)]
+                        handoff,
+                    )
+                    .await
+                } else {
+                    bash::execute_without_background(&input, &leaf, timeout, output_tx).await
+                }
+            };
+
             let event_sender = ctx.event_sender.clone();
             let tool_use_id = ctx.tool_use_id.clone();
 
             if let (Some(sender), Some(id)) = (event_sender, tool_use_id) {
                 let (output_tx, mut output_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-
-                let leaf = ctx.as_leaf();
-                let timeout = ctx.timeout;
-
-                tokio::join!(
-                    bash::execute(
-                        &input,
-                        &leaf,
-                        timeout,
-                        Some(output_tx),
-                        #[cfg(unix)]
-                        handoff
-                    ),
-                    async {
-                        while let Some(chunk) = output_rx.recv().await {
-                            sender.send(AgentEvent::ToolOutputDelta {
-                                id: id.clone(),
-                                chunk,
-                            });
-                        }
+                tokio::join!(run(Some(output_tx)), async {
+                    while let Some(chunk) = output_rx.recv().await {
+                        sender.send(AgentEvent::ToolOutputDelta {
+                            id: id.clone(),
+                            chunk,
+                        });
                     }
-                )
+                })
                 .0
             } else {
-                bash::execute(
-                    &input,
-                    &ctx.as_leaf(),
-                    ctx.timeout,
-                    None,
-                    #[cfg(unix)]
-                    handoff,
-                )
-                .await
+                run(None).await
             }
         })
     }
+}
+
+/// The result of `background: true` in a run without background execution.
+fn background_disabled_output() -> ToolOutput {
+    ToolOutput::failure(
+        "background_disabled",
+        "background: true is not available: this run has no background execution. Run the \
+         command in the foreground instead; this turn waits until it finishes, so do not start \
+         servers, watchers, or other processes that never exit, and set timeout_secs on a \
+         command that might hang.",
+        None,
+    )
 }
 
 struct ApplyPatch;
@@ -962,6 +1042,102 @@ mod tests {
         assert!(!wants_background(
             &json!({ "command": "x", "background": "maybe" })
         ));
+    }
+
+    /// Without explicit permission a run has no background execution on any
+    /// surface, whatever the bound; the bound is never a kill limit. With
+    /// permission, the handoff applies only where the surface can keep a job
+    /// alive.
+    #[test]
+    fn bash_execution_resolves_from_permission_surface_and_bound() {
+        let bound = |secs| crate::config::Config {
+            bash_foreground_bound_secs: secs,
+            ..crate::config::Config::default()
+        };
+
+        for surface in [Some("exec"), Some("chat"), Some("telegram"), None] {
+            for secs in [0, 7] {
+                assert_eq!(
+                    BackgroundExecution::resolve(false, surface, &bound(secs)),
+                    BackgroundExecution::Disabled
+                );
+            }
+        }
+
+        let handoff = if cfg!(unix) {
+            Some(Duration::from_secs(7))
+        } else {
+            None
+        };
+        assert_eq!(
+            BackgroundExecution::resolve(true, Some("exec"), &bound(7)),
+            BackgroundExecution::Enabled {
+                handoff_bound: handoff
+            }
+        );
+        assert_eq!(
+            BackgroundExecution::resolve(true, Some("unknown-surface"), &bound(7)),
+            BackgroundExecution::Enabled {
+                handoff_bound: None
+            }
+        );
+        assert_eq!(
+            BackgroundExecution::resolve(true, Some("exec"), &bound(0)),
+            BackgroundExecution::Enabled {
+                handoff_bound: None
+            }
+        );
+    }
+
+    /// `background: true` is refused in a run without background execution,
+    /// and nothing is spawned or registered.
+    #[tokio::test]
+    async fn bash_rejects_explicit_background_without_background_execution() {
+        let home = crate::test_support::temp_zdx_home();
+        let marker = home.path().join("must-not-exist");
+        let ctx = ToolContext::new(home.path().to_path_buf(), None)
+            .with_background_execution(BackgroundExecution::Disabled);
+        let input = json!({
+            "command": format!("touch {}", marker.display()),
+            "background": true,
+        });
+
+        let output = Bash.execute(&input, &ctx).await;
+        let (code, message, _) = output.error_info().expect("must fail");
+        assert_eq!(code, "background_disabled");
+        assert!(message.contains("in the foreground"), "{message}");
+        assert!(!message.contains("seconds"), "no implicit limit: {message}");
+        assert!(!message.contains("background_output"), "{message}");
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!marker.exists(), "the command must not run");
+        assert!(crate::background_activity::list_background().is_empty());
+    }
+
+    /// Without background execution a foreground command outlives a short
+    /// configured handoff bound: it is neither killed nor relocated.
+    #[tokio::test]
+    async fn bash_without_background_execution_outlives_the_bound() {
+        let home = crate::test_support::temp_zdx_home();
+        let ctx = ToolContext::new(home.path().to_path_buf(), None)
+            .with_config(&crate::config::Config {
+                bash_foreground_bound_secs: 1,
+                ..crate::config::Config::default()
+            })
+            .with_background_execution(BackgroundExecution::Disabled);
+
+        let output = Bash
+            .execute(
+                &json!({ "command": "echo started; sleep 2; echo finished" }),
+                &ctx,
+            )
+            .await;
+        let data = output.data().expect("success envelope");
+        assert_eq!(data["timed_out"], false);
+        assert_eq!(data["exit_code"], 0);
+        assert!(data.get("backgrounded").is_none());
+        assert!(data["stdout"].as_str().unwrap().contains("finished"));
+        assert!(crate::background_activity::list_background().is_empty());
     }
 
     #[test]

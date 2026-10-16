@@ -68,6 +68,51 @@ pub fn definition_with_subagents(
     }
 }
 
+/// Adds the background behavior to an `invoke_subagent` definition, for a run
+/// with background execution: the `background` option, and, when the run has
+/// a handoff bound, the automatic handoff of a normal call. Without
+/// background execution the schema has neither.
+pub fn add_background_option(
+    definition: &mut ToolDefinition,
+    handoff_bound: Option<std::time::Duration>,
+) {
+    let normal_call = match handoff_bound {
+        Some(bound) => format!(
+            " Without `background`, the call waits for the subagent and returns its answer if it \
+             finishes within {secs} seconds. A subagent still running after {secs} seconds is not \
+             stopped: it is moved to the background and the call returns backgrounded: true with a \
+             bg_id and child_thread_id instead of the answer. It is the same run and keeps \
+             working, so do NOT invoke it again; follow it with background_output and stop it \
+             with background_kill.",
+            secs = bound.as_secs()
+        ),
+        None => " Without `background`, the call blocks until the subagent finishes and returns \
+                 its answer."
+            .to_string(),
+    };
+    definition.description.push_str(&normal_call);
+    definition.description.push_str(
+        " With `background: true` it returns at once with a bg_id and child_thread_id instead, \
+         so this turn can keep working: follow the subagent with background_output (wait_secs \
+         with wait_for: \"exit\" returns as soon as its result is ready) and stop it with \
+         background_kill. A subagent in the background is stopped when this turn ends, so \
+         collect its result before you finish.",
+    );
+    if let Some(properties) = definition
+        .input_schema
+        .get_mut("properties")
+        .and_then(Value::as_object_mut)
+    {
+        properties.insert(
+            "background".to_string(),
+            json!({
+                "type": "boolean",
+                "description": "Run the subagent without blocking this turn. Returns a bg_id and child_thread_id at once; read progress and the result with background_output and stop it with background_kill. It never outlives this turn: it is stopped when the turn ends."
+            }),
+        );
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct SubagentInput {
     prompt: String,
@@ -77,6 +122,7 @@ struct SubagentInput {
 
 /// Executes the `invoke_subagent` tool and returns a structured envelope.
 pub async fn execute(input: &Value, ctx: &ToolContext) -> ToolOutput {
+    let input_value = input;
     if !ctx.subagents_enabled {
         return ToolOutput::failure(
             "disabled",
@@ -119,6 +165,10 @@ pub async fn execute(input: &Value, ctx: &ToolContext) -> ToolOutput {
 
     let options = build_exec_options(definition, ctx, model, thinking_level, system_prompt);
 
+    if super::wants_background(input_value) {
+        return start_background(definition, ctx, &prompt, options).await;
+    }
+
     // Relay the child's tool activity live to the parent's `invoke_subagent`
     // cell when the engine wired an event sender + tool id for this call.
     let stream = match (ctx.event_sender.clone(), ctx.tool_use_id.clone()) {
@@ -128,6 +178,18 @@ pub async fn execute(input: &Value, ctx: &ToolContext) -> ToolOutput {
         }),
         _ => None,
     };
+
+    if let Some(bound) = automatic_handoff_bound(ctx) {
+        return run_managed(
+            definition,
+            ctx,
+            &prompt,
+            options,
+            super::subagent_job::Launch::After(bound),
+            stream,
+        )
+        .await;
+    }
 
     let result = run_exec_subagent_with_cancel(
         &ctx.root,
@@ -143,6 +205,108 @@ pub async fn execute(input: &Value, ctx: &ToolContext) -> ToolOutput {
             .as_ref()
             .is_some_and(tokio_util::sync::CancellationToken::is_cancelled),
     )
+}
+
+/// Starts `definition` as a background subagent owned by the current turn.
+async fn start_background(
+    definition: &SubagentDefinition,
+    ctx: &ToolContext,
+    prompt: &str,
+    options: ExecSubagentOptions,
+) -> ToolOutput {
+    if !ctx.background_execution.is_enabled() {
+        return ToolOutput::failure(
+            "background_disabled",
+            "background: true is not available: this run has no background execution. Call \
+             invoke_subagent without background; it returns when the subagent finishes.",
+            None,
+        );
+    }
+    // Checked before anything is created, so a call that cannot start leaves
+    // nothing behind.
+    if let Some(refusal) = super::subagent_job::cannot_start(ctx) {
+        return refusal;
+    }
+
+    run_managed(
+        definition,
+        ctx,
+        prompt,
+        options,
+        super::subagent_job::Launch::Immediate,
+        None,
+    )
+    .await
+}
+
+/// When a normal call hands its subagent off to the background: the run's
+/// `Bash` handoff bound, when the run has background execution, a surface
+/// that keeps relocated work alive, a nonzero bound, and an owning turn.
+/// `None` means the call blocks until the child exits, as before.
+fn automatic_handoff_bound(ctx: &ToolContext) -> Option<std::time::Duration> {
+    match ctx.background_execution {
+        super::BackgroundExecution::Enabled {
+            handoff_bound: Some(bound),
+        } if super::subagent_job::cannot_start(ctx).is_none() => Some(bound),
+        _ => None,
+    }
+}
+
+/// Runs `definition` as a managed child owned by the current turn, against a
+/// child thread created up front so a handle can name it.
+async fn run_managed(
+    definition: &SubagentDefinition,
+    ctx: &ToolContext,
+    prompt: &str,
+    mut options: ExecSubagentOptions,
+    launch: super::subagent_job::Launch,
+    live: Option<SubagentStreamSink>,
+) -> ToolOutput {
+    // Create the child's thread up front so the handle can name it before
+    // the child starts; the child then runs against it with `--thread`.
+    let child_thread = match create_child_thread(&ctx.root, &options) {
+        Ok(thread) => thread,
+        Err(err) => {
+            return ToolOutput::failure(
+                "thread_error",
+                "Failed to create the subagent's thread",
+                Some(format!("{err:#}")),
+            );
+        }
+    };
+    options.thread_id = Some(child_thread.id.clone());
+
+    super::subagent_job::run(
+        super::subagent_job::SubagentJob {
+            root: &ctx.root,
+            prompt,
+            options,
+            subagent: &definition.name,
+            child_thread_id: child_thread.id.clone(),
+            child_thread_path: child_thread.path().clone(),
+        },
+        ctx,
+        launch,
+        live,
+    )
+    .await
+}
+
+/// Creates the tagged child thread a background subagent runs against.
+fn create_child_thread(
+    root: &std::path::Path,
+    options: &ExecSubagentOptions,
+) -> anyhow::Result<crate::core::thread_persistence::Thread> {
+    let mut thread = crate::core::thread_persistence::Thread::new_with_root(root)?;
+    thread.set_origin(
+        options.thread_origin_kind.clone(),
+        options.thread_parent_id.clone(),
+        options.thread_subagent_name.clone(),
+    );
+    // Writes the meta line, so the thread exists on disk before the child
+    // opens it by id.
+    thread.set_root_path(root)?;
+    Ok(thread)
 }
 
 fn subagent_tool_output(result: anyhow::Result<String>, cancelled: bool) -> ToolOutput {
@@ -375,6 +539,7 @@ fn build_exec_options(
         thinking_level: Some(thinking_level),
         no_tools: false,
         no_system_prompt: false,
+        no_background_commands: !definition.background_commands,
         tools_override: definition.tools.clone(),
         event_filter: Some(vec![
             "turn_finished".to_string(),
@@ -423,9 +588,9 @@ fn build_subagent_field_description(subagents: &[SubagentSummary]) -> String {
 
 fn build_description(subagents: &[SubagentSummary], allowed: Option<&[String]>) -> String {
     let mut description = if allowed.is_some() {
-        "Delegate a scoped read-only investigation to an isolated child agent run. This agent may only reach the subagents listed in the `subagent` field, which is required. Child runs are self-contained and do not share your full parent reasoning or implicit context, so every important decision, relevant detail, file path, constraint, non-goal, and acceptance criterion must be made explicit in the prompt. Provide a focused prompt with the goal, relevant context, constraints/non-goals, file paths, and expected output. When multiple subtasks are independent, call `invoke_subagent` multiple times in the same response to run them in parallel. Trust but verify: if a child reports claims you plan to rely on, inspect the key evidence before reporting success. The optional `model` spec is a user-controlled override for that invocation only; never change a named subagent's default autonomously. Returns response text only.".to_string()
+        "Delegate a scoped read-only investigation to an isolated child agent run. This agent may only reach the subagents listed in the `subagent` field, which is required. Child runs are self-contained and do not share your full parent reasoning or implicit context, so every important decision, relevant detail, file path, constraint, non-goal, and acceptance criterion must be made explicit in the prompt. Provide a focused prompt with the goal, relevant context, constraints/non-goals, file paths, and expected output. When multiple subtasks are independent, call `invoke_subagent` multiple times in the same response to run them in parallel. Trust but verify: if a child reports claims you plan to rely on, inspect the key evidence before reporting success. The optional `model` spec is a user-controlled override for that invocation only; never change a named subagent's default autonomously. Returns the subagent's final answer as text, not its transcript.".to_string()
     } else {
-        "Delegate a scoped read-only investigation to an isolated child agent run. Every subagent is read-only: they can research, read, and analyze, but they never edit files or change state, so all implementation stays in this run. `subagent` is required — use `explorer` for multi-round local exploration, repo understanding, or thread-history discovery, and `oracle` for deep diagnosis, debugging dead ends, architecture, or tradeoff analysis. Exact one-hop reads or exact string/symbol lookups are direct work and should not be delegated. When multiple investigations are independent, call `invoke_subagent` multiple times in the same response to run them in parallel; `explorer` is especially appropriate for fan-out across separate search areas. Child runs are self-contained and do not share your full parent reasoning or implicit context, so every important decision, relevant detail, file path, constraint, non-goal, and acceptance criterion must be made explicit in the prompt. Provide a focused prompt with the goal, relevant context, constraints/non-goals, file paths, and expected output. Trust but verify: if a child reports claims you plan to rely on, inspect the key evidence before relying on it. The optional `model` spec is a user-controlled override for that invocation only; never change a named subagent's default autonomously. Returns response text only. Skill names are invalid unless they are also listed as supported subagents.".to_string()
+        "Delegate a scoped read-only investigation to an isolated child agent run. Every subagent is read-only: they can research, read, and analyze, but they never edit files or change state, so all implementation stays in this run. `subagent` is required — use `explorer` for multi-round local exploration, repo understanding, or thread-history discovery, and `oracle` for deep diagnosis, debugging dead ends, architecture, or tradeoff analysis. Exact one-hop reads or exact string/symbol lookups are direct work and should not be delegated. When multiple investigations are independent, call `invoke_subagent` multiple times in the same response to run them in parallel; `explorer` is especially appropriate for fan-out across separate search areas. Child runs are self-contained and do not share your full parent reasoning or implicit context, so every important decision, relevant detail, file path, constraint, non-goal, and acceptance criterion must be made explicit in the prompt. Provide a focused prompt with the goal, relevant context, constraints/non-goals, file paths, and expected output. Trust but verify: if a child reports claims you plan to rely on, inspect the key evidence before relying on it. The optional `model` spec is a user-controlled override for that invocation only; never change a named subagent's default autonomously. Returns the subagent's final answer as text, not its transcript. Skill names are invalid unless they are also listed as supported subagents.".to_string()
     };
 
     if !subagents.is_empty() {
@@ -534,6 +699,7 @@ mod tests {
             tools: Some(vec!["read".to_string(), "read_thread".to_string()]),
             skills: None,
             auto_loaded_skills: None,
+            background_commands: false,
             prompt_body: "body".to_string(),
         };
 
@@ -557,6 +723,7 @@ mod tests {
             tools: Some(vec!["read".to_string(), "glob".to_string()]),
             skills: None,
             auto_loaded_skills: None,
+            background_commands: false,
             prompt_body: "body".to_string(),
         };
 
@@ -636,6 +803,7 @@ mod tests {
             tools: Some(vec!["read".to_string()]),
             skills: None,
             auto_loaded_skills: None,
+            background_commands: false,
             prompt_body: "body".to_string(),
         };
 
@@ -681,6 +849,7 @@ mod tests {
             tools: Some(vec!["read".to_string()]),
             skills: None,
             auto_loaded_skills: None,
+            background_commands: false,
             prompt_body: "body".to_string(),
         }
     }
@@ -790,6 +959,7 @@ mod tests {
             tools: Some(vec!["read".to_string()]),
             skills: None,
             auto_loaded_skills: None,
+            background_commands: false,
             prompt_body: "body".to_string(),
         };
 
@@ -805,6 +975,176 @@ mod tests {
             options.thinking_level,
             Some(crate::config::ThinkingLevel::High)
         );
+    }
+
+    /// The child runs without background execution unless the definition
+    /// opts in, whatever the parent run allows.
+    #[test]
+    fn test_build_exec_options_carries_background_policy() {
+        let ctx = ToolContext::new(std::path::PathBuf::from("."), None);
+        let build = |definition: &subagents::SubagentDefinition| {
+            build_exec_options(
+                definition,
+                &ctx,
+                "openai:gpt-5.2".to_string(),
+                crate::config::ThinkingLevel::Low,
+                "system".to_string(),
+            )
+        };
+
+        let default = explorer_definition(None);
+        assert!(build(&default).no_background_commands);
+
+        let opted_in = subagents::SubagentDefinition {
+            background_commands: true,
+            ..explorer_definition(None)
+        };
+        assert!(!build(&opted_in).no_background_commands);
+    }
+
+    fn thread_files() -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(crate::config::paths::threads_dir())
+            .map(|entries| entries.flatten().map(|entry| entry.path()).collect())
+            .unwrap_or_default()
+    }
+
+    fn background_ctx(root: &std::path::Path) -> ToolContext {
+        ToolContext::new(root.to_path_buf(), None).with_background_execution(
+            crate::tools::BackgroundExecution::Enabled {
+                handoff_bound: None,
+            },
+        )
+    }
+
+    async fn start_in(ctx: &ToolContext) -> ToolOutput {
+        let definition = explorer_definition(None);
+        let options = build_exec_options(
+            &definition,
+            ctx,
+            "openai:gpt-5.2".to_string(),
+            crate::config::ThinkingLevel::Low,
+            "system".to_string(),
+        );
+        start_background(&definition, ctx, "task", options).await
+    }
+
+    /// A background call that cannot have an owner is refused before its
+    /// child thread is created, so it leaves nothing behind.
+    #[tokio::test]
+    async fn background_without_an_owner_creates_no_thread() {
+        let home = crate::test_support::temp_zdx_home();
+        let ctx = background_ctx(home.path());
+
+        let output = start_in(&ctx).await;
+        let (code, _, _) = output.error_info().expect("refused");
+        assert_eq!(
+            code,
+            if cfg!(unix) {
+                "no_owner"
+            } else {
+                "unsupported"
+            }
+        );
+        assert!(thread_files().is_empty(), "{:?}", thread_files());
+    }
+
+    /// A launch that fails after the child thread was created removes that
+    /// thread, because the child never wrote to it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_background_launch_removes_its_empty_thread() {
+        let home = crate::test_support::temp_zdx_home();
+        // The background registry directory cannot be created: the launch
+        // fails with an I/O error after the thread exists.
+        std::fs::create_dir_all(home.path().join("run")).unwrap();
+        std::fs::write(home.path().join("run").join("background"), "not a dir").unwrap();
+        let (_guard, tasks) = crate::tools::subagent_job::TurnTasksGuard::new();
+        let mut ctx = background_ctx(home.path());
+        ctx.turn_tasks = Some(tasks);
+
+        let output = start_in(&ctx).await;
+        let (code, _, _) = output.error_info().expect("launch fails");
+        assert_eq!(code, "io_error");
+        assert!(thread_files().is_empty(), "{:?}", thread_files());
+    }
+
+    /// A normal call hands off only with background execution, a handoff
+    /// bound, and an owning turn; otherwise it blocks as before.
+    #[test]
+    fn automatic_handoff_needs_policy_bound_and_owner() {
+        let bound = std::time::Duration::from_secs(5);
+        let (_guard, tasks) = crate::tools::subagent_job::TurnTasksGuard::new();
+        let with = |execution, owner: bool| {
+            let mut ctx = ToolContext::new(std::path::PathBuf::from("."), None)
+                .with_background_execution(execution);
+            if owner {
+                ctx.turn_tasks = Some(std::sync::Arc::clone(&tasks));
+            }
+            automatic_handoff_bound(&ctx)
+        };
+        let enabled = |handoff_bound| crate::tools::BackgroundExecution::Enabled { handoff_bound };
+
+        let expected = if cfg!(unix) { Some(bound) } else { None };
+        assert_eq!(with(enabled(Some(bound)), true), expected);
+        assert_eq!(with(enabled(Some(bound)), false), None, "no owning turn");
+        assert_eq!(with(enabled(None), true), None, "no bound (0, or surface)");
+        assert_eq!(
+            with(crate::tools::BackgroundExecution::Disabled, true),
+            None,
+            "no background execution"
+        );
+    }
+
+    /// The schema states the behavior the run has: the handoff and its bound
+    /// when there is one, a blocking call otherwise; `background` either way.
+    #[test]
+    fn background_option_text_matches_the_handoff_bound() {
+        let mut with_bound = definition();
+        add_background_option(&mut with_bound, Some(std::time::Duration::from_secs(45)));
+        let text = &with_bound.description;
+        assert!(text.contains("finishes within 45 seconds"), "{text}");
+        assert!(text.contains("moved to the background"), "{text}");
+        assert!(text.contains("backgrounded: true"), "{text}");
+        assert!(text.contains("do NOT invoke it again"), "{text}");
+        assert!(text.contains("With `background: true`"), "{text}");
+        assert!(
+            with_bound.input_schema["properties"]
+                .get("background")
+                .is_some()
+        );
+
+        let mut without_bound = definition();
+        add_background_option(&mut without_bound, None);
+        let text = &without_bound.description;
+        assert!(
+            text.contains("blocks until the subagent finishes"),
+            "{text}"
+        );
+        assert!(!text.contains("moved to the background"), "{text}");
+        assert!(text.contains("With `background: true`"), "{text}");
+    }
+
+    /// Cleanup deletes only a thread that holds nothing but its meta line.
+    #[test]
+    fn unused_child_thread_cleanup_keeps_history() {
+        let home = crate::test_support::temp_zdx_home();
+        let options = ExecSubagentOptions {
+            thread_origin_kind: Some("subagent".to_string()),
+            ..ExecSubagentOptions::default()
+        };
+
+        let empty = create_child_thread(home.path(), &options).unwrap();
+        assert!(empty.path().exists());
+        crate::tools::subagent_job::remove_unused_child_thread(empty.path());
+        assert!(!empty.path().exists());
+
+        let mut used = create_child_thread(home.path(), &options).unwrap();
+        used.append(&crate::core::thread_persistence::ThreadEvent::user_message(
+            "real history",
+        ))
+        .unwrap();
+        crate::tools::subagent_job::remove_unused_child_thread(used.path());
+        assert!(used.path().exists(), "a thread with history must be kept");
     }
 
     #[test]

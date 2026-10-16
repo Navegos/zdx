@@ -1,9 +1,11 @@
 //! Background-process registry.
 //!
-//! Mirrors [`crate::agent_activity`] but for long-lived detached processes
-//! started via the bash tool with `background: true`. Unlike agent runs,
-//! background processes intentionally **outlive** the turn and the zdx process
-//! that started them, so markers are NOT removed on `Drop`. Instead they are:
+//! Mirrors [`crate::agent_activity`] but for background jobs: detached
+//! processes started via the bash tool with `background: true` (which
+//! intentionally **outlive** the turn and the zdx process that started them),
+//! foreground commands adopted after their bound, and background subagents
+//! (adopted, and stopped when the turn that started them ends). Markers are
+//! NOT removed on `Drop`. Instead they are:
 //!
 //! - reaped (tombstoned) when the process is gone (liveness + identity check),
 //! - killed explicitly with an **identity guard** that defends against PID
@@ -43,6 +45,19 @@ pub enum BackgroundMode {
     Adopted,
 }
 
+/// What a background job runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BackgroundKind {
+    /// A shell command from the `Bash` tool.
+    #[default]
+    Command,
+    /// A child `zdx exec` subagent started by `invoke_subagent` with
+    /// `background: true`. Always adopted, and stopped when the agent turn that
+    /// started it ends.
+    Subagent,
+}
+
 /// One background-process record, persisted as a marker JSON file.
 ///
 /// `exited_at.is_none()` means the process is considered running; once set it
@@ -64,6 +79,12 @@ pub struct BackgroundProcess {
     /// How the process is owned; decides which termination path applies.
     #[serde(default)]
     pub mode: BackgroundMode,
+    /// What the job runs; decides how `background_output` reports it.
+    #[serde(default)]
+    pub kind: BackgroundKind,
+    /// For a subagent job: the child's thread id, readable with `read_thread`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_thread_id: Option<String>,
     /// RFC 3339 exit timestamp; `None` while running.
     #[serde(default)]
     pub exited_at: Option<String>,
@@ -432,6 +453,8 @@ mod tests {
             cwd: "/tmp/proj".to_string(),
             started_at: now_rfc3339(),
             mode: BackgroundMode::Detached,
+            kind: crate::background_activity::BackgroundKind::Command,
+            child_thread_id: None,
             exited_at: None,
             exit_code: None,
         }

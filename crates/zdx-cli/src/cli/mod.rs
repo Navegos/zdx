@@ -141,6 +141,13 @@ enum Commands {
         #[arg(long = "no-tools", conflicts_with = "tools")]
         no_tools: bool,
 
+        /// Run without background execution: no `background: true`, no
+        /// `background_output` or `background_kill`, nothing moved to the
+        /// background, and a normal `invoke_subagent` call blocks. Bash
+        /// commands run in the foreground until they finish
+        #[arg(long = "no-background-commands")]
+        no_background_commands: bool,
+
         /// Run with a named subagent's prompt, model spec, and tools
         /// (e.g. `explorer`, `oracle`); explicit flags still win
         #[arg(
@@ -1126,6 +1133,7 @@ struct ExecCommandInput {
     model: Option<String>,
     tools: Option<String>,
     no_tools: bool,
+    no_background_commands: bool,
     no_system_prompt: bool,
     no_skills: bool,
     subagent: Option<String>,
@@ -1195,6 +1203,7 @@ async fn run_exec_command(context: &DispatchContext<'_>, input: ExecCommandInput
         stream: input.stream,
         tools_override: input.tools.as_deref(),
         no_tools: input.no_tools,
+        no_background_commands: input.no_background_commands,
         no_system_prompt: input.no_system_prompt,
         no_skills: input.no_skills,
         subagent: input.subagent.as_deref(),
@@ -1252,6 +1261,7 @@ async fn dispatch_command(command: Commands, context: &DispatchContext<'_>) -> R
             model,
             tools,
             no_tools,
+            no_background_commands,
             subagent,
             activity_kind,
             activity_parent_thread_id,
@@ -1268,6 +1278,7 @@ async fn dispatch_command(command: Commands, context: &DispatchContext<'_>) -> R
                     model,
                     tools,
                     no_tools,
+                    no_background_commands,
                     no_system_prompt,
                     no_skills,
                     subagent,

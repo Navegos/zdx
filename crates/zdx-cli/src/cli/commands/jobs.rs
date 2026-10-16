@@ -27,6 +27,9 @@ struct PreparedJobRun {
     settings: JobRunSettings,
     effective_prompt: EffectivePrompt,
     tools_override: Option<String>,
+    /// Background execution for the run: off when the job's subagent does
+    /// not opt in.
+    background_commands: bool,
 }
 
 /// Jobs are one-shot non-interactive runs, so they carry the exec layer and
@@ -628,6 +631,7 @@ async fn run_attempts(
                     no_tools: false,
                     no_system_prompt: false,
                     no_skills: false,
+                    no_background_commands: !prepared.background_commands,
                     subagent: None,
                     activity_kind: Some("job"),
                     activity_parent_thread_id: None,
@@ -755,6 +759,12 @@ fn prepare_job_run(caller: &Caller<'_>, job: &JobDefinition) -> Result<PreparedJ
     let model = resolved.config.model.clone();
     let instruction_layers = job_instruction_layers();
 
+    // A job run with a subagent follows its definition, like any other
+    // subagent run; a job without one keeps background execution.
+    let background_commands = resolved
+        .subagent
+        .as_ref()
+        .is_none_or(|definition| definition.background_commands);
     let (effective_prompt, tools_override) = match resolved.subagent.as_ref() {
         Some(definition) => {
             let (prompt, runtime_context) = subagents::render_prompt_with_layers(
@@ -792,6 +802,7 @@ fn prepare_job_run(caller: &Caller<'_>, job: &JobDefinition) -> Result<PreparedJ
         settings: resolved.settings,
         effective_prompt,
         tools_override,
+        background_commands,
     })
 }
 

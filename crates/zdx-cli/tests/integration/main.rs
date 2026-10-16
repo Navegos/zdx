@@ -6,6 +6,7 @@
 
 mod fixtures;
 
+mod background_subagent;
 mod cli_help;
 mod config_path;
 mod custom_provider_api;

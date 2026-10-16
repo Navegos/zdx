@@ -528,3 +528,99 @@ fn test_set_model_command_edits_only_the_model_line() {
     run(&["paused", "bad \"spec"]).failure();
     assert_eq!(fs::read_to_string(&path).unwrap(), original);
 }
+
+/// Runs one job whose subagent declares `frontmatter_extra`, and returns the
+/// tools the job's model was offered.
+async fn subagent_job_tools(frontmatter_extra: &str) -> Vec<serde_json::Value> {
+    let zdx_home = TempDir::new().unwrap();
+    let root = TempDir::new().unwrap();
+    let subagents = root.path().join(".zdx").join("subagents");
+    fs::create_dir_all(&subagents).unwrap();
+    fs::write(
+        subagents.join("shell-helper.md"),
+        format!("---\ndescription: Shell helper\n{frontmatter_extra}tools:\n  - bash\n---\nYou run commands.\n"),
+    )
+    .unwrap();
+    write_job(
+        zdx_home.path(),
+        "shell",
+        &format!("model: \"{MOCK_MODEL}\"\nsubagent: shell-helper\n"),
+    );
+
+    let mock_server = MockServer::start().await;
+    let captured: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
+    let captured_clone = Arc::clone(&captured);
+    let body = text_sse("done");
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(move |req: &Request| {
+            *captured_clone.lock().unwrap() = req.body_json().ok();
+            sse_response(&body)
+        })
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    crate::fixtures::zdx_cmd()
+        .env("ZDX_HOME", zdx_home.path())
+        .env("ANTHROPIC_API_KEY", "test-api-key")
+        .env("ANTHROPIC_BASE_URL", mock_server.uri())
+        .current_dir(root.path())
+        .args([
+            "--root",
+            root.path().to_str().unwrap(),
+            "--no-thread",
+            "jobs",
+            "run",
+            "shell",
+        ])
+        .assert()
+        .success();
+
+    let request = captured.lock().unwrap().clone().expect("captured request");
+    request["tools"].as_array().cloned().expect("tools array")
+}
+
+fn job_tool_names(tools: &[serde_json::Value]) -> Vec<String> {
+    let mut names: Vec<String> = tools
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap_or_default().to_lowercase())
+        .collect();
+    names.sort();
+    names
+}
+
+fn job_bash_has_background(tools: &[serde_json::Value]) -> bool {
+    tools
+        .iter()
+        .find(|tool| {
+            tool["name"]
+                .as_str()
+                .unwrap_or_default()
+                .eq_ignore_ascii_case("bash")
+        })
+        .expect("bash offered")["input_schema"]["properties"]
+        .get("background")
+        .is_some()
+}
+
+/// A job with a subagent follows the subagent's background policy, like any
+/// other run of that subagent: off unless the definition opts in.
+#[tokio::test]
+async fn test_subagent_job_follows_the_subagent_background_policy() {
+    if !can_bind_localhost() {
+        eprintln!("Skipping: cannot bind localhost TCP port in this environment.");
+        return;
+    }
+
+    let default = subagent_job_tools("").await;
+    assert_eq!(job_tool_names(&default), vec!["bash"]);
+    assert!(!job_bash_has_background(&default));
+
+    let opted_in = subagent_job_tools("background_commands: true\n").await;
+    assert_eq!(
+        job_tool_names(&opted_in),
+        vec!["background_kill", "background_output", "bash"]
+    );
+    assert!(job_bash_has_background(&opted_in));
+}

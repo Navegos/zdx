@@ -28,7 +28,8 @@ use crate::providers::{
 };
 use crate::subagents;
 use crate::tools::{
-    ToolContext, ToolDefinition, ToolRegistry, ToolResult, ToolSet, surface_keeps_background_jobs,
+    BACKGROUND_MANAGEMENT_TOOLS, BACKGROUND_STARTING_TOOLS, BackgroundExecution, ToolContext,
+    ToolDefinition, ToolRegistry, ToolResult, ToolSet,
 };
 
 /// Options for agent execution.
@@ -69,6 +70,10 @@ pub struct ToolConfig {
     /// Restricts which subagents `invoke_subagent` may reach. `None` is
     /// unrestricted. Set from a persistent profile's `allowed_subagents`.
     pub allowed_subagents: Option<Vec<String>>,
+    /// Whether this run may use background execution in `Bash`. On by
+    /// default; off for a subagent unless its definition opts in. The run's
+    /// [`BackgroundExecution`] is resolved from it.
+    pub background_commands: bool,
 }
 
 impl ToolConfig {
@@ -77,6 +82,7 @@ impl ToolConfig {
             registry,
             selection,
             allowed_subagents: None,
+            background_commands: true,
         }
     }
 
@@ -85,15 +91,17 @@ impl ToolConfig {
         self.allowed_subagents = allowed;
         self
     }
+
+    #[must_use]
+    pub fn with_background_commands(mut self, enabled: bool) -> Self {
+        self.background_commands = enabled;
+        self
+    }
 }
 
 impl Default for ToolConfig {
     fn default() -> Self {
-        Self {
-            registry: ToolRegistry::builtins(),
-            selection: ToolSelection::default(),
-            allowed_subagents: None,
-        }
+        Self::new(ToolRegistry::builtins(), ToolSelection::default())
     }
 }
 
@@ -1044,7 +1052,13 @@ fn rebuild_for_lower_thinking(
 ) -> Option<RunTurnSetup> {
     let lower = lowered_thinking_level(setup.thinking_level)?;
     match build_run_turn_setup(config, options, thread_id, messages, Some(lower)) {
-        Ok(rebuilt) => Some(rebuilt),
+        Ok(mut rebuilt) => {
+            rebuilt
+                .tool_ctx
+                .turn_tasks
+                .clone_from(&setup.tool_ctx.turn_tasks);
+            Some(rebuilt)
+        }
         Err(err) => {
             tracing::warn!(error = %err, "Failed to rebuild setup for lower thinking level");
             None
@@ -1208,6 +1222,10 @@ async fn run_turn_inner(
 ) -> RunTurnResult {
     let mut setup = build_run_turn_setup(config, options, thread_id, &messages, None)
         .map_err(|e| (TurnError::from_anyhow(e), messages.clone()))?;
+    // Background work started by this turn's tool calls is stopped when the
+    // guard drops, however the turn ends.
+    let (_turn_tasks_guard, turn_tasks) = crate::tools::subagent_job::TurnTasksGuard::new();
+    setup.tool_ctx.turn_tasks = Some(turn_tasks);
     let span = tracing::Span::current();
     span.record("model", setup.model.as_str());
     span.record("provider", setup.provider.as_str());
@@ -1635,7 +1653,7 @@ fn build_run_turn_setup(
     .with_current_thread_id(thread_id)
     .with_config(config)
     .with_allowed_subagents(options.tool_config.allowed_subagents.clone())
-    .with_background_handoff(surface_keeps_background_jobs(options.surface.as_deref()));
+    .with_background_execution(background_execution(config, options));
     let tool_registry = options.tool_config.registry.clone();
     let tools = resolve_tools(
         config,
@@ -1725,7 +1743,7 @@ fn build_custom_run_turn_setup(
     .with_current_thread_id(thread_id)
     .with_config(config)
     .with_allowed_subagents(options.tool_config.allowed_subagents.clone())
-    .with_background_handoff(surface_keeps_background_jobs(options.surface.as_deref()));
+    .with_background_execution(background_execution(config, options));
     let tool_registry = options.tool_config.registry.clone();
     let provider_config = crate::config::ProviderConfig::default();
     let tools = resolve_tools(config, options, &provider_config, false, &tool_registry);
@@ -1822,7 +1840,75 @@ fn resolve_tools(
         tools.retain(|tool| !tool.name.eq_ignore_ascii_case("Invoke_Subagent"));
     }
 
+    apply_background_execution(
+        &mut tools,
+        background_execution(config, options),
+        tool_registry,
+    );
     tools
+}
+
+/// Resolves the run's background-execution policy from its explicit
+/// permission, its surface, config, and its tool deadline. The single source
+/// for the tool list, the `Bash` and `invoke_subagent` schemas, and runtime
+/// enforcement.
+fn background_execution(config: &Config, options: &AgentOptions) -> BackgroundExecution {
+    BackgroundExecution::resolve(
+        options.tool_config.background_commands,
+        options.surface.as_deref(),
+        config,
+    )
+}
+
+/// Makes the tool list match the run's background-execution policy.
+///
+/// With background execution, a run that has a tool that can start
+/// background work (`bash`, `invoke_subagent`) also gets the tools that read
+/// and stop jobs, so no job it starts is out of its reach, and
+/// `invoke_subagent` advertises `background`. Without it, the management
+/// tools are removed, `Bash` is described as foreground-only with no
+/// implicit limit and no `background` property, and `invoke_subagent` keeps
+/// its blocking schema.
+fn apply_background_execution(
+    tools: &mut Vec<ToolDefinition>,
+    policy: BackgroundExecution,
+    tool_registry: &ToolRegistry,
+) {
+    let named = |name: &str, list: &[&str]| list.iter().any(|tool| name.eq_ignore_ascii_case(tool));
+    match policy {
+        BackgroundExecution::Enabled { handoff_bound } => {
+            let can_start = tools
+                .iter()
+                .any(|tool| named(&tool.name, &BACKGROUND_STARTING_TOOLS));
+            if !can_start {
+                return;
+            }
+            if cfg!(unix) {
+                for tool in tools.iter_mut() {
+                    if tool.name.eq_ignore_ascii_case("invoke_subagent") {
+                        crate::tools::subagent::add_background_option(tool, handoff_bound);
+                    }
+                }
+            }
+            let missing: Vec<&str> = BACKGROUND_MANAGEMENT_TOOLS
+                .into_iter()
+                .filter(|name| {
+                    !tools
+                        .iter()
+                        .any(|tool| tool.name.eq_ignore_ascii_case(name))
+                })
+                .collect();
+            tools.extend(tool_registry.tools_from_names(missing));
+        }
+        BackgroundExecution::Disabled => {
+            tools.retain(|tool| !named(&tool.name, &BACKGROUND_MANAGEMENT_TOOLS));
+            for tool in tools.iter_mut() {
+                if tool.name.eq_ignore_ascii_case("bash") {
+                    *tool = crate::tools::bash::definition_without_background();
+                }
+            }
+        }
+    }
 }
 
 struct RequestSpanStart {
@@ -3202,6 +3288,199 @@ mod tests {
     use tokio::time::{Duration, timeout};
 
     use super::*;
+
+    fn bash_policy_options(
+        root: &std::path::Path,
+        tools: &[&str],
+        background_commands: bool,
+        tool_timeout: Option<Duration>,
+    ) -> AgentOptions {
+        AgentOptions {
+            conversation_id: None,
+            root: root.to_path_buf(),
+            tool_config: ToolConfig::new(
+                ToolRegistry::builtins(),
+                ToolSelection::Explicit(tools.iter().map(ToString::to_string).collect()),
+            )
+            .with_background_commands(background_commands),
+            surface: Some("exec".to_string()),
+            text_verbosity: None,
+            service_tier: None,
+            activity_kind: None,
+            activity_parent_thread_id: None,
+            activity_subagent_name: None,
+            tool_timeout,
+        }
+    }
+
+    fn names(tools: &[ToolDefinition]) -> Vec<String> {
+        let mut names: Vec<String> = tools.iter().map(|t| t.name.to_lowercase()).collect();
+        names.sort();
+        names
+    }
+
+    fn bash_def(tools: &[ToolDefinition]) -> &ToolDefinition {
+        tools
+            .iter()
+            .find(|t| t.name.eq_ignore_ascii_case("bash"))
+            .expect("bash present")
+    }
+
+    /// The tool list, the `Bash` schema, and the tool context all come from
+    /// the same resolved policy: without background execution the management
+    /// tools are gone even when requested, `Bash` has no `background`
+    /// property, and its text claims no implicit limit. The run deadline is
+    /// left to the tool context (`timeout`), not folded into the policy.
+    #[test]
+    fn tools_follow_a_run_without_background_execution() {
+        let home = crate::test_support::temp_zdx_home();
+        let mut config = Config::default();
+        config.subagents.enabled = false;
+        config.providers.anthropic.api_key = Some("test-key".to_string());
+        config.model = "anthropic:claude-sonnet-4-6".to_string();
+
+        let options = bash_policy_options(
+            home.path(),
+            &["bash", "read", "background_output", "background_kill"],
+            false,
+            Some(Duration::from_secs(20)),
+        );
+        let setup = build_run_turn_setup(&config, &options, None, &[], None).unwrap();
+
+        assert_eq!(names(&setup.tools), vec!["bash", "read"]);
+        let enabled: Vec<String> = setup
+            .enabled_tools
+            .iter()
+            .map(|t| t.to_lowercase())
+            .collect();
+        assert!(!enabled.iter().any(|t| t.starts_with("background_")));
+        let bash = bash_def(&setup.tools);
+        assert!(bash.input_schema["properties"].get("background").is_none());
+        assert!(
+            bash.description
+                .contains("No time limit applies unless you set timeout_secs"),
+            "{}",
+            bash.description
+        );
+        assert_eq!(
+            setup.tool_ctx.background_execution,
+            BackgroundExecution::Disabled
+        );
+        assert_eq!(setup.tool_ctx.timeout, Some(Duration::from_secs(20)));
+    }
+
+    /// With background execution, a run that has `bash` always gets the
+    /// tools that read and stop its jobs, so no job it starts is out of its
+    /// reach; a run without `bash` is left as selected.
+    #[test]
+    fn tools_follow_a_run_with_background_execution() {
+        let home = crate::test_support::temp_zdx_home();
+        let mut config = Config::default();
+        config.subagents.enabled = false;
+
+        let with_bash = resolve_active_tools(
+            &config,
+            &bash_policy_options(home.path(), &["bash"], true, None),
+            ProviderKind::Anthropic,
+        );
+        assert_eq!(
+            names(&with_bash),
+            vec!["background_kill", "background_output", "bash"]
+        );
+        assert!(
+            bash_def(&with_bash).input_schema["properties"]
+                .get("background")
+                .is_some()
+        );
+
+        let without_bash = resolve_active_tools(
+            &config,
+            &bash_policy_options(home.path(), &["read"], true, None),
+            ProviderKind::Anthropic,
+        );
+        assert_eq!(names(&without_bash), vec!["read"]);
+    }
+
+    fn invoke_def(tools: &[ToolDefinition]) -> &ToolDefinition {
+        tools
+            .iter()
+            .find(|t| t.name.eq_ignore_ascii_case("invoke_subagent"))
+            .expect("invoke_subagent present")
+    }
+
+    /// `invoke_subagent` follows the same policy as `Bash`: with background
+    /// execution it advertises `background` and brings the management tools
+    /// even without `bash`; without it, it keeps its blocking schema and the
+    /// management tools are absent.
+    #[test]
+    fn invoke_subagent_follows_the_background_policy() {
+        let home = crate::test_support::temp_zdx_home();
+        let mut config = Config::default();
+        config.subagents.enabled = true;
+
+        let enabled = resolve_active_tools(
+            &config,
+            &bash_policy_options(home.path(), &["invoke_subagent", "read"], true, None),
+            ProviderKind::Anthropic,
+        );
+        assert_eq!(
+            names(&enabled),
+            vec![
+                "background_kill",
+                "background_output",
+                "invoke_subagent",
+                "read"
+            ]
+        );
+        let invoke = invoke_def(&enabled);
+        assert_eq!(
+            invoke.input_schema["properties"]["background"]["type"], "boolean",
+            "background option missing"
+        );
+        assert!(invoke.description.contains("background_output"));
+
+        let disabled = resolve_active_tools(
+            &config,
+            &bash_policy_options(
+                home.path(),
+                &["invoke_subagent", "read", "background_output"],
+                false,
+                None,
+            ),
+            ProviderKind::Anthropic,
+        );
+        assert_eq!(names(&disabled), vec!["invoke_subagent", "read"]);
+        let invoke = invoke_def(&disabled);
+        assert!(
+            invoke.input_schema["properties"]
+                .get("background")
+                .is_none()
+        );
+        assert!(!invoke.description.contains("background_output"));
+    }
+
+    /// The turn owns a task set from its first tool call, and keeps the same
+    /// one when the setup is rebuilt for a lower thinking level.
+    #[test]
+    fn rebuilt_setup_keeps_the_turn_task_set() {
+        let home = crate::test_support::temp_zdx_home();
+        let mut config = Config::default();
+        config.subagents.enabled = false;
+        config.providers.anthropic.api_key = Some("test-key".to_string());
+        config.model = "anthropic:claude-sonnet-4-6".to_string();
+        config.thinking_level = ThinkingLevel::High;
+        let options = bash_policy_options(home.path(), &["bash"], true, None);
+
+        let mut setup = build_run_turn_setup(&config, &options, None, &[], None).unwrap();
+        let (_guard, tasks) = crate::tools::subagent_job::TurnTasksGuard::new();
+        setup.tool_ctx.turn_tasks = Some(Arc::clone(&tasks));
+        let rebuilt = rebuild_for_lower_thinking(&setup, &config, &options, None, &[])
+            .expect("a lower thinking level exists");
+        assert!(Arc::ptr_eq(
+            rebuilt.tool_ctx.turn_tasks.as_ref().unwrap(),
+            &tasks
+        ));
+    }
 
     #[tokio::test]
     async fn main_turn_uses_model_thinking_suffix() {

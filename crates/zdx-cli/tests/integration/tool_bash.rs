@@ -595,3 +595,308 @@ fn process_alive(pid: i32) -> bool {
     }
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
+
+/// Runs one `zdx exec --no-background-commands` turn whose single tool call is
+/// `tool_input`, and returns the tool definitions sent on the first request
+/// plus the raw body of the follow-up request that carries the tool result.
+async fn exec_without_background(
+    zdx_home: &TempDir,
+    root: &TempDir,
+    tool_input: serde_json::Value,
+) -> (Vec<serde_json::Value>, String, Duration) {
+    let mock_server = MockServer::start().await;
+    let call_count = Arc::new(AtomicUsize::new(0));
+    let call_count_clone = Arc::clone(&call_count);
+    let first_tools = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let first_tools_clone = Arc::clone(&first_tools);
+    let second_body = Arc::new(std::sync::Mutex::new(String::new()));
+    let second_body_clone = Arc::clone(&second_body);
+
+    let first_response = tool_use_sse("toolu_bash_bounded", "bash", &tool_input.to_string());
+    let second_response = fixtures::text_sse("Done.");
+
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(move |req: &Request| {
+            if call_count_clone.fetch_add(1, Ordering::SeqCst) == 0 {
+                let body: serde_json::Value = req.body_json().unwrap_or_default();
+                *first_tools_clone.lock().unwrap() =
+                    body["tools"].as_array().cloned().unwrap_or_default();
+                sse_response(&first_response)
+            } else {
+                *second_body_clone.lock().unwrap() = String::from_utf8_lossy(&req.body).to_string();
+                sse_response(&second_response)
+            }
+        })
+        .expect(2)
+        .mount(&mock_server)
+        .await;
+
+    let started = std::time::Instant::now();
+    let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_zdx"));
+    cmd.env("ZDX_HOME", zdx_home.path())
+        .env("ANTHROPIC_API_KEY", "test-api-key")
+        .env("ANTHROPIC_BASE_URL", mock_server.uri())
+        .args([
+            "--root",
+            root.path().to_str().unwrap(),
+            "--no-thread",
+            "exec",
+            "--no-background-commands",
+            "-m",
+            MOCK_MODEL,
+            "-p",
+            "Run a command",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    let mut child = cmd.spawn().expect("spawn zdx exec");
+    let status = timeout(Duration::from_mins(1), child.wait())
+        .await
+        .expect("zdx exec without background execution never exited")
+        .expect("wait for zdx");
+    assert!(
+        status.success(),
+        "zdx exec should exit successfully: {status}"
+    );
+
+    let tools = first_tools.lock().unwrap().clone();
+    let body = second_body.lock().unwrap().clone();
+    (tools, body, started.elapsed())
+}
+
+/// Without background execution, the model is never offered background
+/// tools or a `background` property, and a foreground command runs past a
+/// short configured handoff bound to completion: it is neither killed nor
+/// moved to the background, and nothing is registered. This is the default
+/// subagent case.
+#[tokio::test]
+async fn test_exec_without_background_commands_runs_past_the_bound() {
+    if !can_bind_localhost() {
+        eprintln!("Skipping: cannot bind localhost TCP port in this environment.");
+        return;
+    }
+    let root = TempDir::new().unwrap();
+    let zdx_home = temp_zdx_home();
+    std::fs::write(
+        zdx_home.path().join("config.toml"),
+        "bash_foreground_bound_secs = 1\n",
+    )
+    .unwrap();
+
+    let command = "echo early-output; sleep 3; echo late-output";
+    let (tools, body, elapsed) =
+        exec_without_background(&zdx_home, &root, serde_json::json!({ "command": command })).await;
+
+    let names: Vec<String> = tools
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap_or_default().to_lowercase())
+        .collect();
+    assert!(names.contains(&"bash".to_string()), "tools: {names:?}");
+    assert!(
+        !names.iter().any(|name| name.starts_with("background_")),
+        "background tools offered: {names:?}"
+    );
+    let bash = tools
+        .iter()
+        .find(|tool| {
+            tool["name"]
+                .as_str()
+                .unwrap_or_default()
+                .eq_ignore_ascii_case("bash")
+        })
+        .unwrap();
+    assert!(
+        bash["input_schema"]["properties"]
+            .get("background")
+            .is_none()
+    );
+    let description = bash["description"].as_str().unwrap();
+    assert!(
+        description.contains("no background execution"),
+        "{description}"
+    );
+    assert!(
+        description.contains("No time limit applies unless you set timeout_secs"),
+        "{description}"
+    );
+
+    assert!(body.contains(r#"\"timed_out\":false"#), "Got: {body}");
+    assert!(body.contains(r#"\"exit_code\":0"#), "Got: {body}");
+    assert!(body.contains("late-output"), "output lost: {body}");
+    assert!(!body.contains("backgrounded"), "Got: {body}");
+    assert!(
+        elapsed >= Duration::from_secs(3),
+        "the command did not run to completion: {elapsed:?}"
+    );
+    assert_eq!(registered_jobs(&zdx_home), 0, "a job was registered");
+}
+
+/// Background-registry markers under `zdx_home`.
+fn registered_jobs(zdx_home: &TempDir) -> usize {
+    std::fs::read_dir(zdx_home.path().join("run").join("background")).map_or(0, |entries| {
+        entries
+            .flatten()
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+            .count()
+    })
+}
+
+/// A long foreground command in a run without background execution keeps
+/// running past the bound, and interrupting `exec` stops it together with
+/// the processes it started.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_exec_without_background_commands_interrupt_stops_the_tree() {
+    if !can_bind_localhost() {
+        eprintln!("Skipping: cannot bind localhost TCP port in this environment.");
+        return;
+    }
+    let root = TempDir::new().unwrap();
+    let zdx_home = temp_zdx_home();
+    std::fs::write(
+        zdx_home.path().join("config.toml"),
+        "bash_foreground_bound_secs = 1\n",
+    )
+    .unwrap();
+
+    let shell_pidfile = root.path().join("shell.pid");
+    let grandchild_pidfile = root.path().join("grandchild.pid");
+    let command = format!(
+        "sleep 60 & echo $! > {}; echo $$ > {}; wait",
+        grandchild_pidfile.display(),
+        shell_pidfile.display()
+    );
+    let mock_server = MockServer::start().await;
+    let call_count = Arc::new(AtomicUsize::new(0));
+    let call_count_clone = Arc::clone(&call_count);
+    let first_response = tool_use_sse(
+        "toolu_bash_tree",
+        "bash",
+        &serde_json::json!({ "command": command }).to_string(),
+    );
+    let second_response = fixtures::text_sse("Done.");
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(move |_req: &Request| {
+            if call_count_clone.fetch_add(1, Ordering::SeqCst) == 0 {
+                sse_response(&first_response)
+            } else {
+                sse_response(&second_response)
+            }
+        })
+        .mount(&mock_server)
+        .await;
+
+    let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_zdx"));
+    cmd.env("ZDX_HOME", zdx_home.path())
+        .env("ANTHROPIC_API_KEY", "test-api-key")
+        .env("ANTHROPIC_BASE_URL", mock_server.uri())
+        .args([
+            "--root",
+            root.path().to_str().unwrap(),
+            "--no-thread",
+            "exec",
+            "--no-background-commands",
+            "-m",
+            MOCK_MODEL,
+            "-p",
+            "Run a never-ending command",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut child = cmd.spawn().expect("spawn zdx exec");
+    let exec_pid = child.id().expect("exec pid") as i32;
+
+    let shell_pid = read_pid_file(&shell_pidfile).await;
+    let grandchild_pid = read_pid_file(&grandchild_pidfile).await;
+
+    // Well past the 1s bound: still running, in the foreground.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(
+        process_alive(shell_pid),
+        "the command was killed at the bound"
+    );
+    assert!(process_alive(grandchild_pid));
+    assert_eq!(
+        registered_jobs(&zdx_home),
+        0,
+        "the command was moved to the background"
+    );
+    assert_eq!(
+        call_count.load(Ordering::SeqCst),
+        1,
+        "the tool call returned early"
+    );
+
+    unsafe { libc::kill(exec_pid, libc::SIGINT) };
+    timeout(Duration::from_secs(30), child.wait())
+        .await
+        .expect("interrupted exec never exited")
+        .expect("wait for zdx");
+
+    for (pid, what) in [(shell_pid, "command"), (grandchild_pid, "its child")] {
+        timeout(Duration::from_secs(15), async {
+            while process_alive(pid) {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("the interrupted {what} (pid {pid}) survived"));
+    }
+}
+
+/// Waits for a command to write its pid to `path`.
+#[cfg(unix)]
+async fn read_pid_file(path: &std::path::Path) -> i32 {
+    timeout(Duration::from_secs(30), async {
+        loop {
+            if let Ok(raw) = std::fs::read_to_string(path)
+                && let Ok(pid) = raw.trim().parse::<i32>()
+            {
+                break pid;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("command never started")
+}
+
+/// Without background execution, `background: true` is refused before
+/// anything runs, and no job is registered.
+#[tokio::test]
+async fn test_exec_without_background_commands_rejects_background_flag() {
+    if !can_bind_localhost() {
+        eprintln!("Skipping: cannot bind localhost TCP port in this environment.");
+        return;
+    }
+    let root = TempDir::new().unwrap();
+    let zdx_home = temp_zdx_home();
+    let marker = root.path().join("must-not-exist");
+
+    let (_, body, _) = exec_without_background(
+        &zdx_home,
+        &root,
+        serde_json::json!({
+            "command": format!("touch {}", marker.display()),
+            "background": true,
+        }),
+    )
+    .await;
+
+    assert!(body.contains("background_disabled"), "Got: {body}");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert!(!marker.exists(), "the background command ran");
+    let registry = zdx_home.path().join("run").join("background");
+    let registered = std::fs::read_dir(&registry).map_or(0, |entries| {
+        entries
+            .flatten()
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+            .count()
+    });
+    assert_eq!(registered, 0, "a background job was registered");
+}

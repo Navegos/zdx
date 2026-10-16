@@ -13,6 +13,11 @@
 //! dropping the lease would kill work that was relocated precisely because it
 //! was slow. Draining never kills: it waits.
 //!
+//! The engine also adopts background subagents here, so they share the same
+//! lease, kill path, and registry. Their owner stops them with
+//! [`request_terminate`] when the turn that started them ends; [`drain`] then
+//! only waits for that teardown to finish.
+//!
 //! Termination always runs through the lease, which is the authority on target
 //! identity, so there is no PID-reuse hazard to guard against here.
 
@@ -42,10 +47,14 @@ const DRAIN_NOTICE_INTERVAL: Duration = Duration::from_secs(30);
 const READER_DRAIN_GRACE: Duration = Duration::from_millis(500);
 
 /// One adopted job: the token that closes its lease, plus identity for logs.
+/// A cancelled token means the job is being stopped and only awaits reaping.
 struct Job {
     cancel: CancellationToken,
     pid: u32,
     command: String,
+    /// The target has ended on its own (or its teardown finished); only the
+    /// reader drain and exit bookkeeping remain.
+    ended: bool,
 }
 
 static JOBS: LazyLock<Mutex<HashMap<String, Job>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -82,6 +91,7 @@ pub fn adopt(
             cancel: cancel.clone(),
             pid: child.identity.pid,
             command,
+            ended: false,
         },
     );
 
@@ -89,6 +99,9 @@ pub fn adopt(
         // `wait_bounded` with no bound waits indefinitely; cancelling the token
         // closes the lease, which is what asks the supervisor to terminate.
         let outcome = child.wait_bounded(Some(&cancel), None, None).await;
+        if let Some(job) = jobs().get_mut(&bg_id) {
+            job.ended = true;
+        }
 
         // Let the readers finish writing what the command already produced.
         // Bounded, because a descendant that escaped the process group can hold
@@ -171,17 +184,29 @@ pub async fn drain() {
             return;
         }
 
-        if Instant::now() >= next_notice {
+        // Jobs already being stopped only await reaping; the notice is about
+        // the ones this process is genuinely waiting out.
+        let waiting: Vec<_> = {
+            let jobs = jobs();
+            live.iter()
+                .filter(|(bg_id, _, _)| {
+                    jobs.get(bg_id)
+                        .is_some_and(|job| !job.cancel.is_cancelled())
+                })
+                .cloned()
+                .collect()
+        };
+        if !waiting.is_empty() && Instant::now() >= next_notice {
             // warn! so this reaches stderr under the default filter: a human
             // watching a process that has not exited needs to see why.
             tracing::warn!(
-                jobs = live.len(),
-                pids = %live.iter().map(|(_, pid, _)| pid.to_string()).collect::<Vec<_>>().join(", "),
+                jobs = waiting.len(),
+                pids = %waiting.iter().map(|(_, pid, _)| pid.to_string()).collect::<Vec<_>>().join(", "),
                 waited_secs = started.elapsed().as_secs(),
                 "Waiting for background commands to finish before exiting; \
                  they are still running and will not be killed. Interrupt to stop them."
             );
-            for (bg_id, pid, command) in &live {
+            for (bg_id, pid, command) in &waiting {
                 tracing::info!(bg_id, pid, command, "Still running");
             }
             next_notice = Instant::now() + DRAIN_NOTICE_INTERVAL;
@@ -210,6 +235,39 @@ pub async fn terminate_all() {
     for (bg_id, _, _) in live {
         terminate(&bg_id).await;
     }
+}
+
+/// Asks an adopted job to stop by closing its lease, without waiting.
+///
+/// For callers that cannot await, such as a `Drop` guard. The supervisor runs
+/// its usual TERM→KILL teardown, and the job deregisters once it is reaped, so
+/// a later [`drain`] still waits for the teardown to finish. Returns `false`
+/// when `bg_id` is not adopted here.
+pub fn request_terminate(bg_id: &str) -> bool {
+    let Some(cancel) = jobs().get(bg_id).map(|job| job.cancel.clone()) else {
+        return false;
+    };
+    cancel.cancel();
+    true
+}
+
+/// Claims the stop of a still-running adopted job and starts it, atomically.
+///
+/// Returns `true` only when this call is the one that stops the job: it is
+/// adopted here, has not ended, and nobody has asked it to stop yet. Returns
+/// `false` when another stop (an explicit kill, the owner's cleanup) already
+/// won, or the job already ended, so a caller can attribute the stop to
+/// itself only when that is true.
+pub fn claim_terminate(bg_id: &str) -> bool {
+    let jobs = jobs();
+    let Some(job) = jobs.get(bg_id) else {
+        return false;
+    };
+    if job.ended || job.cancel.is_cancelled() {
+        return false;
+    }
+    job.cancel.cancel();
+    true
 }
 
 /// Terminates an adopted job by closing its lease.
@@ -371,6 +429,51 @@ mod tests {
         })
         .await
         .expect("adopted target survived termination");
+    }
+
+    /// Only the first stop is claimed: after an explicit stop, a later claim
+    /// (for example a deadline firing) does not win, and a claim on a job that
+    /// is not adopted here never wins.
+    #[tokio::test]
+    async fn only_the_first_stop_is_claimed() {
+        let temp = TempDir::new().unwrap();
+
+        let stopped_first = format!("bg-{}", uuid::Uuid::new_v4());
+        let pidfile = temp.path().join("first.pid");
+        let mut child = spawn_shell("echo $$ > \"$1\"; sleep 60", &pidfile).await;
+        wait_for_pid(&pidfile).await;
+        let readers = readers_for(&mut child);
+        adopt(
+            stopped_first.clone(),
+            child,
+            "first".to_string(),
+            readers,
+            Box::new(|_| {}),
+        );
+        assert!(request_terminate(&stopped_first));
+        assert!(
+            !claim_terminate(&stopped_first),
+            "a stop that already started must not be claimed again"
+        );
+
+        let claimed = format!("bg-{}", uuid::Uuid::new_v4());
+        let pidfile = temp.path().join("second.pid");
+        let mut child = spawn_shell("echo $$ > \"$1\"; sleep 60", &pidfile).await;
+        wait_for_pid(&pidfile).await;
+        let readers = readers_for(&mut child);
+        adopt(
+            claimed.clone(),
+            child,
+            "second".to_string(),
+            readers,
+            Box::new(|_| {}),
+        );
+        assert!(claim_terminate(&claimed), "the first stop is claimed");
+        assert!(!claim_terminate(&claimed), "and only once");
+
+        assert!(!claim_terminate("bg-not-adopted-here"));
+        terminate(&stopped_first).await;
+        terminate(&claimed).await;
     }
 
     #[tokio::test]

@@ -23,9 +23,9 @@ use crate::core::agent::EventSender;
 use crate::core::events::{AgentEvent, TurnStatus};
 
 #[cfg(unix)]
-type ExecChild = SupervisedChild;
+pub type ExecChild = SupervisedChild;
 #[cfg(not(unix))]
-type ExecChild = tokio::process::Child;
+pub type ExecChild = tokio::process::Child;
 
 /// Options for a child `zdx exec` subagent run.
 #[derive(Debug, Clone, Default)]
@@ -40,6 +40,10 @@ pub struct ExecSubagentOptions {
     pub no_tools: bool,
     /// Disable system prompt/context composition for the child run (`--no-system-prompt`).
     pub no_system_prompt: bool,
+    /// Run the child without background execution in `Bash`
+    /// (`--no-background-commands`). Set for subagents whose definition does
+    /// not opt in; workers and helpers keep the default.
+    pub no_background_commands: bool,
     /// Optional explicit tool allowlist for the child run (`--tools`).
     pub tools_override: Option<Vec<String>>,
     /// Optional event type filters for exec output (`--filter`).
@@ -122,14 +126,63 @@ pub async fn run_exec_subagent_with_cancel(
     cancel: Option<CancellationToken>,
     stream: Option<SubagentStreamSink>,
 ) -> Result<String> {
-    let prompt = prompt.trim();
-    ensure!(!prompt.is_empty(), "Subagent prompt cannot be empty");
     tracing::info!(
-        prompt_bytes = prompt.len(),
+        prompt_bytes = prompt.trim().len(),
         streaming = stream.is_some(),
         timeout = ?options.timeout,
         "Subagent started"
     );
+    // Holds the prompt files until the child has exited.
+    let (child, _prompt_files) = spawn_exec_subagent(root, prompt, options)
+        .await?
+        .into_parts();
+
+    if let Some(sink) = stream {
+        return run_child_streaming(child, cancel, options.timeout, sink).await;
+    }
+
+    run_child_buffered(child, cancel, options.timeout).await
+}
+
+/// A spawned child `zdx exec` subagent, with the temp files it reads.
+///
+/// The prompt files are deleted when this is dropped, so it must live until
+/// the child has exited.
+pub struct SpawnedSubagent {
+    child: ExecChild,
+    prompt_files: PromptFiles,
+}
+
+impl SpawnedSubagent {
+    /// Splits off the child, returning a guard that keeps its prompt files
+    /// alive. Drop the guard only after the child has exited.
+    #[must_use]
+    pub fn into_parts(self) -> (ExecChild, impl Send + 'static) {
+        (self.child, self.prompt_files)
+    }
+}
+
+/// Temp files the child reads at startup.
+struct PromptFiles {
+    _prompt: TempPromptFile,
+    _system_prompt: Option<TempPromptFile>,
+}
+
+/// Spawns a child `zdx exec` subagent with piped stdout/stderr.
+///
+/// On Unix the child runs under the shared lease supervisor, so closing the
+/// lease (cancellation, dropping the handle, or this process dying) stops the
+/// child and its process group.
+///
+/// # Errors
+/// Returns an error if the prompt is empty or the child cannot be spawned.
+pub async fn spawn_exec_subagent(
+    root: &Path,
+    prompt: &str,
+    options: &ExecSubagentOptions,
+) -> Result<SpawnedSubagent> {
+    let prompt = prompt.trim();
+    ensure!(!prompt.is_empty(), "Subagent prompt cannot be empty");
 
     let exe = std::env::current_exe().context("Failed to get executable path")?;
     let prompt_file = write_prompt_file(prompt)?;
@@ -173,11 +226,13 @@ pub async fn run_exec_subagent_with_cancel(
             .map_err(|err| anyhow::anyhow!("Failed to spawn subagent: {err}"))?
     };
 
-    if let Some(sink) = stream {
-        return run_child_streaming(child, cancel, options.timeout, sink).await;
-    }
-
-    run_child_buffered(child, cancel, options.timeout).await
+    Ok(SpawnedSubagent {
+        child,
+        prompt_files: PromptFiles {
+            _prompt: prompt_file,
+            _system_prompt: effective_system_prompt_file,
+        },
+    })
 }
 
 /// How a supervised child run ended, before output processing.
@@ -336,34 +391,41 @@ pub struct SubagentStreamSink {
 }
 
 impl SubagentStreamSink {
-    fn emit(&self, chunk: &Value) {
+    pub(crate) fn emit(&self, chunk: &Value) {
         self.sender.send(AgentEvent::ToolOutputDelta {
             id: self.parent_tool_id.clone(),
             chunk: chunk.to_string(),
         });
     }
+}
 
-    fn emit_start(&self, id: &str, name: &str) {
-        self.emit(&serde_json::json!({ "t": "start", "id": id, "name": name }));
-    }
+/// How a child subagent's turn ended, from its `TurnFinished` event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TurnOutcome {
+    /// The turn finished; carries the final answer.
+    Completed(String),
+    /// The turn was interrupted; carries the partial text so far.
+    Interrupted(String),
+    /// The turn failed; carries the error message.
+    Failed(String),
+}
 
-    fn emit_input(&self, id: &str, arg: &str) {
-        self.emit(&serde_json::json!({ "t": "input", "id": id, "arg": arg }));
-    }
-
-    fn emit_done(&self, id: &str) {
-        self.emit(&serde_json::json!({ "t": "done", "id": id }));
-    }
-
-    fn emit_error(&self, id: &str) {
-        self.emit(&serde_json::json!({ "t": "error", "id": id }));
-    }
+/// One event a child subagent's stdout reports, in the order it arrives.
+#[derive(Debug)]
+pub enum ChildEvent<'a> {
+    /// A tool lifecycle chunk (`{"t":"start"|"input"|"done"|"error", ...}`).
+    Tool(&'a Value),
+    /// The child's turn ended. Reported when the event arrives, which can be
+    /// well before the child process exits (for example while it waits for
+    /// its own background commands).
+    TurnEnded(&'a TurnOutcome),
 }
 
 /// Result of draining a child subagent's stdout event stream.
-struct StreamOutcome {
-    final_text: Option<String>,
-    turn_failed: Option<String>,
+#[derive(Debug, Default)]
+pub struct StreamOutcome {
+    /// How the child's turn ended, if it reported that before exiting.
+    pub turn: Option<TurnOutcome>,
 }
 
 /// Streams a child `zdx exec` process: relays tool activity live via `sink`,
@@ -391,7 +453,12 @@ async fn run_child_streaming(
 
     let stderr_handle = tokio::spawn(read_to_end(stderr));
     let stdout_handle = tokio::spawn(async move {
-        let outcome = read_stdout_events(stdout, &sink).await;
+        let outcome = read_stdout_events(stdout, |event| {
+            if let ChildEvent::Tool(chunk) = event {
+                sink.emit(chunk);
+            }
+        })
+        .await;
         drop(sink);
         outcome
     });
@@ -405,8 +472,8 @@ async fn run_child_streaming(
         .context("Subagent stdout reader task failed")??;
     let stderr_buf = stderr_handle.await.unwrap_or_default();
 
-    if let Some(message) = outcome.turn_failed {
-        tracing::warn!(error = %zdx_types::log_field(&message, 200), "Subagent turn failed");
+    if let Some(TurnOutcome::Failed(message)) = &outcome.turn {
+        tracing::warn!(error = %zdx_types::log_field(message, 200), "Subagent turn failed");
         bail!("Subagent turn failed: {message}");
     }
 
@@ -421,7 +488,12 @@ async fn run_child_streaming(
         bail!("Subagent failed: {stderr}");
     }
 
-    match outcome.final_text {
+    // An interrupted turn still returns its partial text, as before.
+    let final_text = match outcome.turn {
+        Some(TurnOutcome::Completed(text) | TurnOutcome::Interrupted(text)) => Some(text),
+        Some(TurnOutcome::Failed(_)) | None => None,
+    };
+    match final_text {
         Some(text) if !text.trim().is_empty() => {
             tracing::info!(output_bytes = text.len(), "Subagent finished");
             Ok(text)
@@ -433,16 +505,19 @@ async fn run_child_streaming(
     }
 }
 
-/// Reads JSONL agent events from a child's stdout, relaying tool lifecycle
-/// events through `sink` and capturing the terminal turn result.
-async fn read_stdout_events<R: AsyncRead + Unpin>(
+/// Reads JSONL agent events from a child's stdout until EOF, passing each
+/// tool lifecycle chunk and the turn's end to `on_event` as they arrive, and
+/// returning how the turn ended.
+///
+/// # Errors
+/// Returns an error if reading the child's stdout fails.
+pub async fn read_stdout_events<R: AsyncRead + Unpin>(
     reader: R,
-    sink: &SubagentStreamSink,
+    mut on_event: impl FnMut(ChildEvent<'_>),
 ) -> Result<StreamOutcome> {
     let mut lines = BufReader::new(reader).lines();
     let mut seen_ids: HashSet<String> = HashSet::new();
-    let mut final_text = None;
-    let mut turn_failed = None;
+    let mut turn = None;
 
     while let Some(line) = lines
         .next_line()
@@ -460,38 +535,44 @@ async fn read_stdout_events<R: AsyncRead + Unpin>(
             AgentEvent::ToolInputCompleted { id, name, input } => {
                 let name = name.to_ascii_lowercase();
                 if seen_ids.insert(id.clone()) {
-                    sink.emit_start(&id, &name);
+                    on_event(ChildEvent::Tool(
+                        &serde_json::json!({ "t": "start", "id": id, "name": name }),
+                    ));
                 }
                 if let Some(arg) = extract_key_arg(&name, &input) {
-                    sink.emit_input(&id, &arg);
+                    on_event(ChildEvent::Tool(
+                        &serde_json::json!({ "t": "input", "id": id, "arg": arg }),
+                    ));
                 }
             }
             AgentEvent::ToolStarted { id, name } if seen_ids.insert(id.clone()) => {
-                sink.emit_start(&id, &name.to_ascii_lowercase());
+                let name = name.to_ascii_lowercase();
+                on_event(ChildEvent::Tool(
+                    &serde_json::json!({ "t": "start", "id": id, "name": name }),
+                ));
             }
             AgentEvent::ToolCompleted { id, result, .. } => {
-                if result.is_ok() {
-                    sink.emit_done(&id);
-                } else {
-                    sink.emit_error(&id);
-                }
+                let t = if result.is_ok() { "done" } else { "error" };
+                on_event(ChildEvent::Tool(&serde_json::json!({ "t": t, "id": id })));
             }
             AgentEvent::TurnFinished {
                 status,
                 final_text: text,
                 ..
-            } => match status {
-                TurnStatus::Completed | TurnStatus::Interrupted => final_text = Some(text),
-                TurnStatus::Failed { message, .. } => turn_failed = Some(message),
-            },
+            } => {
+                let outcome = match status {
+                    TurnStatus::Completed => TurnOutcome::Completed(text),
+                    TurnStatus::Interrupted => TurnOutcome::Interrupted(text),
+                    TurnStatus::Failed { message, .. } => TurnOutcome::Failed(message),
+                };
+                on_event(ChildEvent::TurnEnded(&outcome));
+                turn = Some(outcome);
+            }
             _ => {}
         }
     }
 
-    Ok(StreamOutcome {
-        final_text,
-        turn_failed,
-    })
+    Ok(StreamOutcome { turn })
 }
 
 /// Extracts the most useful single argument to display for a child tool call.
@@ -504,7 +585,7 @@ fn extract_key_arg(tool_name: &str, input: &Value) -> Option<String> {
     (!preview.is_empty()).then_some(preview)
 }
 
-pub(super) fn tool_input_preview(input: &str) -> String {
+pub(crate) fn tool_input_preview(input: &str) -> String {
     const MAX_CHARS: usize = 200;
     let mut chars = input
         .split_whitespace()
@@ -557,6 +638,10 @@ fn build_exec_args(
 
     if options.no_system_prompt {
         args.push(OsString::from("--no-system-prompt"));
+    }
+
+    if options.no_background_commands {
+        args.push(OsString::from("--no-background-commands"));
     }
 
     if let Some(tools) = options
@@ -749,6 +834,7 @@ mod tests {
                 thinking_level: Some(crate::config::ThinkingLevel::Low),
                 no_tools: false,
                 no_system_prompt: true,
+                no_background_commands: true,
                 tools_override: Some(vec!["read".to_string(), "glob".to_string()]),
                 event_filter: Some(vec!["turn_finished".to_string()]),
                 timeout: None,
@@ -776,6 +862,7 @@ mod tests {
                 "--prompt-file",
                 "/tmp/subagent-prompt.md",
                 "--no-system-prompt",
+                "--no-background-commands",
                 "--tools",
                 "read,glob",
                 "--filter",
@@ -1072,9 +1159,17 @@ mod tests {
         ];
         let bytes = jsonl(&events);
 
-        let outcome = read_stdout_events(bytes.as_bytes(), &sink).await.unwrap();
-        assert_eq!(outcome.final_text.as_deref(), Some("all done"));
-        assert!(outcome.turn_failed.is_none());
+        let outcome = read_stdout_events(bytes.as_bytes(), |event| {
+            if let ChildEvent::Tool(chunk) = event {
+                sink.emit(chunk);
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            outcome.turn,
+            Some(TurnOutcome::Completed("all done".to_string()))
+        );
 
         drop(sink);
         let mut kinds = Vec::new();
@@ -1108,8 +1203,13 @@ mod tests {
         }];
         let bytes = jsonl(&events);
 
-        let outcome = read_stdout_events(bytes.as_bytes(), &sink).await.unwrap();
-        assert_eq!(outcome.turn_failed.as_deref(), Some("boom"));
-        assert!(outcome.final_text.is_none());
+        let outcome = read_stdout_events(bytes.as_bytes(), |event| {
+            if let ChildEvent::Tool(chunk) = event {
+                sink.emit(chunk);
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(outcome.turn, Some(TurnOutcome::Failed("boom".to_string())));
     }
 }

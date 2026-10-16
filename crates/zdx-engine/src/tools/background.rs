@@ -9,6 +9,8 @@
 //!   move the command to the background if it outruns its foreground bound.
 //! - [`BackgroundOutput`] and [`BackgroundKill`] are agent tools that read a
 //!   background process's output / stop it, scoped to the caller's thread.
+//!   Background subagents are jobs too; their start, ownership, and output
+//!   view live in [`super::subagent_job`].
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -17,7 +19,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::{Tool, ToolContext, ToolDefinition, ToolFuture};
-use crate::background_activity::{self, BackgroundMode, BackgroundProcess, KillOutcome};
+use crate::background_activity::{
+    self, BackgroundKind, BackgroundMode, BackgroundProcess, KillOutcome,
+};
 use crate::core::events::ToolOutput;
 
 /// Max bytes returned per stream by `background_output`.
@@ -121,6 +125,8 @@ pub async fn run_background(input: &Value, ctx: &ToolContext) -> ToolOutput {
         cwd: cwd.to_string_lossy().into_owned(),
         started_at: chrono::Utc::now().to_rfc3339(),
         mode: BackgroundMode::Detached,
+        kind: crate::background_activity::BackgroundKind::Command,
+        child_thread_id: None,
         exited_at: None,
         exit_code: None,
     };
@@ -213,7 +219,9 @@ async fn kill_failed_spawn(mut spawn: zdx_tools::bash::BackgroundSpawn, pid: u32
 
 /// Builds the auto-background handoff for a foreground bash command.
 ///
-/// Returns `None` when the command must keep waiting in the foreground:
+/// Returns `None` when the command must not be relocated, which the run's
+/// [`super::BackgroundExecution`] decides:
+/// - the run has no background execution (it is killed at its limit instead);
 /// - the run is on a surface that can neither outlive the job nor drain it
 ///   (unknown or absent surfaces) — see
 ///   [`crate::tools::surface_keeps_background_jobs`];
@@ -228,10 +236,12 @@ async fn kill_failed_spawn(mut spawn: zdx_tools::bash::BackgroundSpawn, pid: u32
 /// trace in the registry.
 #[cfg(unix)]
 pub fn prepare_handoff(command: &str, ctx: &ToolContext) -> Option<zdx_tools::bash::Handoff> {
-    if !ctx.background_handoff {
+    let super::BackgroundExecution::Enabled {
+        handoff_bound: Some(bound),
+    } = ctx.background_execution
+    else {
         return None;
-    }
-    let bound = ctx.config.as_ref()?.bash_foreground_bound()?;
+    };
     background_activity::ensure_dirs().ok()?;
 
     let bg_id = format!("bg-{}", uuid::Uuid::new_v4());
@@ -264,6 +274,8 @@ pub fn prepare_handoff(command: &str, ctx: &ToolContext) -> Option<zdx_tools::ba
                 cwd,
                 started_at,
                 mode: BackgroundMode::Adopted,
+                kind: crate::background_activity::BackgroundKind::Command,
+                child_thread_id: None,
                 exited_at: None,
                 exit_code: None,
             };
@@ -337,6 +349,9 @@ enum Waited {
     Output,
     /// The job exited.
     Exit,
+    /// A subagent job's turn ended, so its result is available, while its
+    /// process may still be running.
+    Result,
     /// `wait_secs` elapsed with the job still running and quiet.
     Timeout,
 }
@@ -346,6 +361,7 @@ impl Waited {
         match self {
             Self::Output => "output",
             Self::Exit => "exit",
+            Self::Result => "result",
             Self::Timeout => "timeout",
         }
     }
@@ -394,14 +410,26 @@ async fn wait_for_change(
     let baseline = log_len();
 
     let deadline = tokio::time::Instant::now() + budget;
+    let is_subagent = rec.kind == BackgroundKind::Subagent;
     let poll = async {
+        // A subagent's result can arrive long before its process exits, so an
+        // exit wait on one also ends when its turn ends. Checked only when its
+        // log has grown, since the turn's end is a log record.
+        let mut checked_len = None;
         loop {
             // Re-read the marker: an exit recorded by the owning waiter is the
             // authoritative "this job is done" signal for both job kinds.
             if background_activity::get(&rec.bg_id).is_none_or(|current| !current.is_running()) {
                 return Waited::Exit;
             }
-            if mode == WaitFor::Output && log_len() != baseline {
+            let len = log_len();
+            if is_subagent && checked_len != Some(len) {
+                checked_len = Some(len);
+                if super::subagent_job::turn_ended(&rec.bg_id) {
+                    return Waited::Result;
+                }
+            }
+            if mode == WaitFor::Output && len != baseline {
                 return Waited::Output;
             }
             tokio::time::sleep(WAIT_POLL_INTERVAL).await;
@@ -435,11 +463,15 @@ impl Tool for BackgroundOutput {
                 "Read the recent output (stdout + stderr tail) and status of a background \
                 process started with the Bash tool's background: true, or of a foreground \
                 command that was moved to the background after exceeding its foreground \
-                bound. Status \"running\" with no new output does NOT mean the process is done \
-                or ready — check the status field. To follow a job, prefer waiting on it with \
+                bound. For a subagent started with invoke_subagent background: true, or \
+                moved to the background after its handoff bound, it returns progress instead (current_tool, tool_calls, seconds_since_activity), \
+                then turn and its result or error once the subagent's turn ends; status stays \
+                \"running\" until its process exits. Status \"running\" with no new output does \
+                NOT mean the process is done or ready — check the status field. To follow a job, prefer waiting on it with \
                 wait_secs over re-reading it in a loop or sleeping between reads. For a long job \
                 whose progress you do not need, wait it out with wait_for: \"exit\" and a longer \
-                wait_secs. Polling the same bg_id repeatedly is expected and allowed; each read \
+                wait_secs; on a background subagent that wait ends as soon as its result is \
+                ready, even if its process is still running. Polling the same bg_id repeatedly is expected and allowed; each read \
                 returns a new read_seq."
                     .to_string(),
             input_schema: json!({
@@ -449,12 +481,12 @@ impl Tool for BackgroundOutput {
                     "wait_secs": {
                         "type": "integer",
                         "minimum": 0,
-                        "description": "Optional. Block until the job exits, writes new output (default wait_for: \"output\" only), or this many seconds pass, whichever comes first, then return as usual plus waited_for (\"output\", \"exit\", or \"timeout\"). Clamped to the foreground bound (120s by default), or to 1800s with wait_for: \"exit\"; a longer value silently waits only that long. Waiting never affects the job: it keeps running whatever the wait returns. Omit it to read what is available right now."
+                        "description": "Optional. Block until the job exits, writes new output (default wait_for: \"output\" only), or this many seconds pass, whichever comes first, then return as usual plus waited_for (\"output\", \"exit\", or \"timeout\"; \"result\" when a background subagent's turn ended, so its result is ready while its process may still be running). Clamped to the foreground bound (120s by default), or to 1800s with wait_for: \"exit\"; a longer value silently waits only that long. Waiting never affects the job: it keeps running whatever the wait returns. Omit it to read what is available right now."
                     },
                     "wait_for": {
                         "type": "string",
                         "enum": ["output", "exit"],
-                        "description": "Optional, used with wait_secs. \"output\" (default): return on new output or exit. \"exit\": ignore new output and return only when the job exits or wait_secs runs out."
+                        "description": "Optional, used with wait_secs. \"output\" (default): return on new output or exit. \"exit\": ignore new output; for a command, return only when it exits or wait_secs runs out; for a background subagent, return as soon as its result is ready (waited_for: \"result\", while its process may still be running) or it exits, or wait_secs runs out."
                     }
                 },
                 "required": ["bg_id"],
@@ -493,6 +525,14 @@ impl Tool for BackgroundOutput {
             // Re-read after waiting so status, exit code and uptime describe the
             // job as of the moment this call returns, not when it started.
             let rec = background_activity::get(&rec.bg_id).unwrap_or(rec);
+            if rec.kind == BackgroundKind::Subagent {
+                let mut data = super::subagent_job::output_view(&rec, OUTPUT_TAIL_BYTES);
+                data["read_seq"] = json!(READ_SEQ.fetch_add(1, Ordering::Relaxed) + 1);
+                if let Some(waited) = waited {
+                    data["waited_for"] = json!(waited.as_str());
+                }
+                return ToolOutput::success(data);
+            }
             let status = if rec.is_running() {
                 "running"
             } else {
@@ -568,8 +608,10 @@ impl Tool for BackgroundKill {
         ToolDefinition {
             name: "background_kill".to_string(),
             description:
-                "Stop a background process started with the Bash tool's background: true, or a \
-                foreground command that was moved to the background, by its bg_id."
+                "Stop a background process started with the Bash tool's background: true, a \
+                foreground command that was moved to the background, or a subagent started \
+                with invoke_subagent background: true or moved to the background (with the \
+                commands it is running), by its bg_id."
                     .to_string(),
             input_schema: json!({
                 "type": "object",
@@ -592,11 +634,16 @@ impl Tool for BackgroundKill {
             };
             let bg_id = rec.bg_id.as_str();
 
+            let what = if rec.kind == BackgroundKind::Subagent {
+                "subagent"
+            } else {
+                "background process"
+            };
             let (status, message) = match background_activity::kill_background(bg_id).await {
-                KillOutcome::Killed => ("killed", format!("Stopped background process {bg_id}.")),
+                KillOutcome::Killed => ("killed", format!("Stopped {what} {bg_id}.")),
                 KillOutcome::AlreadyExited => (
                     "already_exited",
-                    format!("Background process {bg_id} had already exited."),
+                    format!("The {what} {bg_id} had already exited."),
                 ),
                 KillOutcome::NotFound => {
                     return ToolOutput::failure(
@@ -626,6 +673,41 @@ mod tests {
     use serde_json::json;
 
     use super::BackgroundInput;
+
+    /// The `background_output` schema states both exit-wait behaviors the
+    /// implementation has: a command waits for exit, a background subagent
+    /// for its result, which can come while its process still runs.
+    #[test]
+    fn exit_wait_text_matches_both_job_kinds() {
+        use crate::tools::Tool as _;
+
+        let definition = super::BackgroundOutput.definition();
+        let properties = &definition.input_schema["properties"];
+        let wait_for = properties["wait_for"]["description"].as_str().unwrap();
+        assert!(
+            wait_for.contains("for a command, return only when it exits"),
+            "{wait_for}"
+        );
+        assert!(
+            wait_for.contains("for a background subagent, return as soon as its result is ready"),
+            "{wait_for}"
+        );
+        assert!(wait_for.contains("waited_for: \"result\""), "{wait_for}");
+        assert!(
+            wait_for.contains("process may still be running"),
+            "{wait_for}"
+        );
+
+        let wait_secs = properties["wait_secs"]["description"].as_str().unwrap();
+        assert!(wait_secs.contains("\"result\""), "{wait_secs}");
+        assert!(
+            definition
+                .description
+                .contains("ends as soon as its result is ready"),
+            "{}",
+            definition.description
+        );
+    }
 
     fn timeout_of(value: &serde_json::Value) -> Option<u64> {
         serde_json::from_value::<BackgroundInput>(
@@ -706,9 +788,13 @@ mod handoff_registry_tests {
             ..Config::default()
         };
         let mut ctx = ToolContext::new(root.clone(), None);
-        ctx.background_handoff = true;
         ctx.current_thread_id = Some("thread-handoff".to_string());
         ctx.config = Some(config);
+        ctx.background_execution = crate::tools::BackgroundExecution::resolve(
+            true,
+            Some("exec"),
+            ctx.config.as_ref().unwrap(),
+        );
 
         let command = "echo warming; sleep 60";
         let handoff = prepare_handoff(command, &ctx).expect("bound is configured");
@@ -771,7 +857,8 @@ mod handoff_registry_tests {
         for surface in [Some("unknown-surface"), None] {
             let mut ctx = ToolContext::new(home.path().to_path_buf(), None);
             ctx.config = Some(config.clone());
-            ctx.background_handoff = crate::tools::surface_keeps_background_jobs(surface);
+            ctx.background_execution =
+                crate::tools::BackgroundExecution::resolve(true, surface, &config);
 
             assert!(
                 prepare_handoff("sleep 1", &ctx).is_none(),
@@ -803,8 +890,12 @@ mod handoff_registry_tests {
             ..Config::default()
         };
         let mut ctx = ToolContext::new(home.path().to_path_buf(), None);
-        ctx.background_handoff = true;
         ctx.config = Some(config);
+        ctx.background_execution = crate::tools::BackgroundExecution::resolve(
+            true,
+            Some("exec"),
+            ctx.config.as_ref().unwrap(),
+        );
 
         assert!(prepare_handoff("sleep 1", &ctx).is_none());
     }
@@ -822,8 +913,12 @@ mod handoff_registry_tests {
             ..Config::default()
         };
         let mut ctx = ToolContext::new(root, None);
-        ctx.background_handoff = true;
         ctx.config = Some(config);
+        ctx.background_execution = crate::tools::BackgroundExecution::resolve(
+            true,
+            Some("exec"),
+            ctx.config.as_ref().unwrap(),
+        );
 
         let result =
             run_background(&json!({ "command": "sleep 60", "background": true }), &ctx).await;
@@ -1217,7 +1312,11 @@ mod wait_tests {
             bash_foreground_bound_secs: 1,
             ..Config::default()
         });
-        ctx.background_handoff = true;
+        ctx.background_execution = crate::tools::BackgroundExecution::resolve(
+            true,
+            Some("exec"),
+            ctx.config.as_ref().unwrap(),
+        );
 
         // Outruns the 1s bound, then writes again and exits.
         let command = "echo early; sleep 2; echo later; exit 4";
@@ -1269,7 +1368,11 @@ mod wait_tests {
             bash_foreground_bound_secs: 1,
             ..Config::default()
         });
-        ctx.background_handoff = true;
+        ctx.background_execution = crate::tools::BackgroundExecution::resolve(
+            true,
+            Some("exec"),
+            ctx.config.as_ref().unwrap(),
+        );
 
         let command = "echo early; sleep 1.5; echo mid; sleep 1.5; echo late; exit 5";
         let handoff = prepare_handoff(command, &ctx).expect("bound is configured");

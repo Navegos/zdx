@@ -117,11 +117,10 @@ fn orchestrator_tool_config(
     for tool in zdx_engine::tools::orchestrator::OrchestratorTool::bound(worker_manager) {
         tool_registry.register_boxed(Arc::new(tool));
     }
-    ToolConfig {
-        registry: tool_registry,
-        selection: zdx_engine::core::agent::ToolSelection::default(),
-        allowed_subagents: None,
-    }
+    ToolConfig::new(
+        tool_registry,
+        zdx_engine::core::agent::ToolSelection::default(),
+    )
 }
 
 /// Builds the shared bot context with all per-process maps initialized.

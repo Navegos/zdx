@@ -29,6 +29,9 @@ pub struct ExecRunOptions<'a> {
     pub stream: bool,
     pub tools_override: Option<&'a str>,
     pub no_tools: bool,
+    /// Forces the run off background execution. A `subagent` definition
+    /// that does not opt in turns it off as well.
+    pub no_background_commands: bool,
     pub no_system_prompt: bool,
     pub no_skills: bool,
     pub subagent: Option<&'a str>,
@@ -94,6 +97,10 @@ pub async fn run(options: ExecRunOptions<'_>) -> Result<()> {
 
     let tool_registry = ToolRegistry::builtins();
     let available_tool_names = tool_registry.tool_names();
+    let background_commands = !options.no_background_commands
+        && subagent
+            .as_ref()
+            .is_none_or(|definition| definition.background_commands);
 
     let exec_opts = modes::exec::ExecOptions {
         root: root_path,
@@ -106,7 +113,8 @@ pub async fn run(options: ExecRunOptions<'_>) -> Result<()> {
             } else {
                 ToolSelection::default()
             },
-        ),
+        )
+        .with_background_commands(background_commands),
         event_filter: options
             .event_filter_override
             .map(parse_event_filter)

@@ -68,6 +68,11 @@ pub struct SubagentDefinition {
     pub allowed_subagents: Option<Vec<String>>,
     pub skills: Option<Vec<String>>,
     pub auto_loaded_skills: Option<Vec<String>>,
+    /// Whether runs of this subagent may use background execution in `Bash`
+    /// (`background: true`, the auto-background handoff, and the
+    /// `background_output`/`background_kill` tools). Off unless the
+    /// definition sets `background_commands: true`.
+    pub background_commands: bool,
     /// Standalone prompt body used as the child subagent system prompt.
     pub prompt_body: String,
 }
@@ -89,6 +94,7 @@ struct SubagentFrontmatter {
     allowed_subagents: Option<Vec<String>>,
     skills: Option<Vec<String>>,
     auto_loaded_skills: Option<Vec<String>>,
+    background_commands: Option<bool>,
 }
 
 /// Discovers built-in, global, and project subagents.
@@ -632,6 +638,7 @@ fn parse_subagent_content(
         allowed_subagents,
         skills,
         auto_loaded_skills,
+        background_commands: frontmatter.background_commands.unwrap_or(false),
         prompt_body,
     })
 }
@@ -921,6 +928,41 @@ mod tests {
         .unwrap();
         let err = parse_subagent_file(&file, SubagentSource::User).unwrap_err();
         assert!(format!("{err:#}").contains("reserved profile"));
+    }
+
+    /// Background execution is off for every subagent unless its definition
+    /// opts in, built-ins included.
+    #[test]
+    fn background_commands_default_off_and_opt_in() {
+        let dir = tempdir().unwrap();
+        let parse = |name: &str, frontmatter: &str| {
+            let file = dir.path().join(format!("{name}.md"));
+            fs::write(&file, format!("---\n{frontmatter}---\nPrompt")).unwrap();
+            parse_subagent_file(&file, SubagentSource::User)
+        };
+
+        let default = parse("plain", "description: Plain\ntools:\n  - bash\n").unwrap();
+        assert!(!default.background_commands);
+
+        let opted_in = parse(
+            "builder",
+            "description: Builder\nbackground_commands: true\n",
+        )
+        .unwrap();
+        assert!(opted_in.background_commands);
+
+        let opted_out = parse("quiet", "description: Quiet\nbackground_commands: false\n").unwrap();
+        assert!(!opted_out.background_commands);
+
+        assert!(parse("typo", "description: Typo\nbackground_commands: maybe\n").is_err());
+
+        for definition in built_in_definitions().unwrap() {
+            assert!(
+                !definition.background_commands,
+                "built-in '{}' must not opt in",
+                definition.name
+            );
+        }
     }
 
     #[test]
@@ -1311,6 +1353,7 @@ mod tests {
             tools: None,
             skills: None,
             auto_loaded_skills: None,
+            background_commands: false,
             prompt_body: "{% if project_context %}{{ project_context }}{% endif %}\n{{ cwd }}"
                 .to_string(),
         };
@@ -1364,6 +1407,7 @@ mod tests {
             tools: Some(vec!["read".to_string()]),
             skills: None,
             auto_loaded_skills: None,
+            background_commands: false,
             prompt_body: "body".to_string(),
         };
         let rendered_worker = render_prompt(
@@ -1465,6 +1509,7 @@ mod tests {
             tools: Some(vec!["read".to_string()]),
             skills: Some(vec!["deepwiki-cli".to_string(), "memory".to_string()]),
             auto_loaded_skills: Some(vec!["deepwiki-cli".to_string()]),
+            background_commands: false,
             prompt_body: "{% if available_skills %}## Available Skills\n{% for skill in available_skills %}- {{ skill.name }} => {{ skill.path }}\n{% endfor %}{% endif %}\n{% if auto_loaded_skill_contents %}## Auto-loaded Skills\n{% for skill in auto_loaded_skill_contents %}Path: {{ skill.path }}\n{{ skill.content }}\n{% endfor %}{% endif %}".to_string(),
         };
 

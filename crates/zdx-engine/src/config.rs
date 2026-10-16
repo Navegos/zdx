@@ -955,6 +955,14 @@ pub struct Config {
     /// A per-call `timeout_secs` overrides the duration for that one command
     /// but cannot make it lethal. Only a job's `timeout_secs`
     /// frontmatter kills, and it suppresses the handoff entirely.
+    ///
+    /// It is never a kill limit: in a run without background execution (a
+    /// subagent that has not opted in) it does not apply at all, and a
+    /// command runs in the foreground until it finishes.
+    ///
+    /// With background execution, it also bounds the wait of a normal
+    /// `invoke_subagent` call: a subagent still running after it is handed
+    /// off to the background, never stopped. 0 disables that handoff too.
     pub bash_foreground_bound_secs: u32,
 
     /// Seconds a provider request may go without content progress before it

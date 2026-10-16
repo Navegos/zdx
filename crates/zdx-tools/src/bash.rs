@@ -44,12 +44,17 @@ fn write_temp_file(bytes: &[u8], stream_name: &str) -> Option<String> {
     Some(path.to_string_lossy().into_owned())
 }
 
-/// Returns the tool definition for the bash tool.
+/// What the `Bash` tool is for, shared by both execution modes' descriptions.
+const PURPOSE: &str = "Run shell and CLI workflows whose capability no dedicated tool provides: builds, tests, version control, package managers, other CLIs, and work on those commands' own output. Reading, discovering, and searching files is covered by the dedicated tools, which return structured, ignore-aware, paginated results; scoping or limiting such a result is part of that same capability.";
+
+/// Returns the tool definition for the bash tool in a run with background
+/// execution: `background: true` and the auto-background handoff.
 pub fn definition() -> ToolDefinition {
     ToolDefinition {
         name: "Bash".to_string(),
-        description: "Run shell and CLI workflows whose capability no dedicated tool provides: builds, tests, version control, package managers, other CLIs, and work on those commands' own output. Reading, discovering, and searching files is covered by the dedicated tools, which return structured, ignore-aware, paginated results; scoping or limiting such a result is part of that same capability. A long-running foreground command is not killed for being slow: one still running after the foreground bound is moved to the background and the result comes back with backgrounded: true and a bg_id to poll with background_output instead of an exit code. Only a deadline configured for the run by an operator can terminate it. Long-lived commands use background mode, and truncated output can be inspected with Read."
-            .to_string(),
+        description: format!(
+            "{PURPOSE} A long-running foreground command is not killed for being slow: one still running after the foreground bound is moved to the background and the result comes back with backgrounded: true and a bg_id to poll with background_output instead of an exit code. Only a deadline configured for the run by an operator can terminate it. Long-lived commands use background mode, and truncated output can be inspected with Read."
+        ),
         input_schema: json!({
             "type": "object",
             "properties": {
@@ -73,18 +78,49 @@ pub fn definition() -> ToolDefinition {
     }
 }
 
+/// Returns the tool definition for the bash tool in a run without background
+/// execution, where every command runs in the foreground until it finishes.
+///
+/// The schema has no `background` property and the text names no background
+/// tool, because neither exists for this run. There is no implicit time
+/// limit: a command is stopped only at a `timeout_secs` the caller sets, or at
+/// a deadline an operator configured for the run.
+pub fn definition_without_background() -> ToolDefinition {
+    ToolDefinition {
+        name: "Bash".to_string(),
+        description: format!(
+            "{PURPOSE} This run has no background execution: every command runs in the foreground, and this turn waits until it finishes. No time limit applies unless you set timeout_secs (or an operator configured a deadline for the run), so do not start servers, watchers, or other processes that never exit, and set timeout_secs on a command that might hang. A command stopped at its limit is stopped together with its process group, and the result carries timed_out: true with the output captured so far. Truncated output can be inspected with Read."
+        ),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "description": "The shell command to execute"
+                },
+                "timeout_secs": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Optional time limit in seconds for this command. A command still running after it is stopped together with its process group and returns its partial output with timed_out: true. Omit it or pass 0 for no limit. A deadline an operator configured for the run still applies when it is earlier."
+                }
+            },
+            "required": ["command"],
+            "additionalProperties": false
+        }),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct BashInput {
     command: String,
-    /// Foreground wait budget. It only ever tunes a handoff bound, so on a
-    /// platform with no handoff it is inert — still accepted and validated, so
-    /// the argument stays a contract rather than becoming an unknown field, and
-    /// still never destructive.
+    /// With background execution, a foreground wait budget: it only ever
+    /// tunes a handoff bound, so where there is no handoff it is inert and
+    /// still never destructive. Without background execution there is
+    /// nothing to relocate into, so it is the caller's own kill limit.
     #[serde(
         default,
         deserialize_with = "crate::u64_or_string::deserialize_optional"
     )]
-    #[cfg_attr(not(unix), allow(dead_code))]
     timeout_secs: Option<u64>,
 }
 
@@ -104,6 +140,65 @@ fn apply_wait_bound(handoff: Option<Handoff>, requested_secs: Option<u64>) -> Op
         handoff.bound = Duration::from_secs(secs);
     }
     Some(handoff)
+}
+
+/// A point at which a running foreground command is killed with its process
+/// group, and which limit set it, so the result can name the right one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Deadline {
+    after: Duration,
+    source: DeadlineSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeadlineSource {
+    /// The run's operator-configured deadline (a job's `timeout_secs`).
+    Run,
+    /// The caller's `timeout_secs`, in a run without background execution.
+    Requested,
+}
+
+/// Resolves the kill deadline for a run without background execution: the
+/// earlier of the run's deadline and the caller's `timeout_secs`, or none.
+/// There is no implicit limit.
+fn foreground_deadline(run: Option<Duration>, requested_secs: Option<u64>) -> Option<Deadline> {
+    let requested = requested_secs
+        .filter(|secs| *secs > 0)
+        .map(Duration::from_secs);
+    match (run, requested) {
+        (Some(run), Some(requested)) if requested < run => Some(Deadline {
+            after: requested,
+            source: DeadlineSource::Requested,
+        }),
+        (Some(run), _) => Some(Deadline::run(run)),
+        (None, Some(requested)) => Some(Deadline {
+            after: requested,
+            source: DeadlineSource::Requested,
+        }),
+        (None, None) => None,
+    }
+}
+
+impl Deadline {
+    fn run(after: Duration) -> Self {
+        Self {
+            after,
+            source: DeadlineSource::Run,
+        }
+    }
+
+    /// The message appended to stderr when this deadline kills the command.
+    fn message(self) -> String {
+        let secs = self.after.as_secs();
+        match self.source {
+            DeadlineSource::Run => format!(
+                "Command was killed after {secs} seconds by the deadline configured for this run (a job's timeout_secs). The Bash timeout_secs argument cannot raise or remove it. Report that this run's operator-imposed limit stopped the command and what it needs instead, so the limit can be adjusted with the operator's approval."
+            ),
+            DeadlineSource::Requested => format!(
+                "Command was stopped after {secs} seconds, together with its process group, by the timeout_secs you set. The output above is partial. Do not re-run the same command unchanged: narrow it, or give it a larger timeout_secs (or none) if it needs more time."
+            ),
+        }
+    }
 }
 
 /// Output from a bash command execution.
@@ -330,6 +425,55 @@ pub async fn execute(
     output_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
     #[cfg(unix)] handoff: Option<Handoff>,
 ) -> ToolOutput {
+    execute_with(
+        input,
+        ctx,
+        timeout,
+        output_tx,
+        Mode::Background {
+            #[cfg(unix)]
+            handoff,
+        },
+    )
+    .await
+}
+
+/// Executes the bash tool in a run without background execution.
+///
+/// The command runs in the foreground until it finishes: it is never moved to
+/// the background and has no implicit time limit. It is killed with its
+/// process group only at the caller's `timeout_secs` or the run's `timeout`,
+/// whichever is earlier, and the result then carries `timed_out: true` with
+/// the output captured so far.
+pub async fn execute_without_background(
+    input: &Value,
+    ctx: &ToolContext,
+    timeout: Option<Duration>,
+    output_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+) -> ToolOutput {
+    execute_with(input, ctx, timeout, output_tx, Mode::Foreground).await
+}
+
+/// How a foreground command may end other than by exiting on its own.
+enum Mode {
+    /// Background execution is available: an optional handoff relocates the
+    /// command when it outruns its bound.
+    Background {
+        #[cfg(unix)]
+        handoff: Option<Handoff>,
+    },
+    /// No background execution: the command stays in the foreground until it
+    /// finishes or reaches the caller's `timeout_secs` or the run deadline.
+    Foreground,
+}
+
+async fn execute_with(
+    input: &Value,
+    ctx: &ToolContext,
+    timeout: Option<Duration>,
+    output_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    mode: Mode,
+) -> ToolOutput {
     let input: BashInput = match serde_json::from_value(input.clone()) {
         Ok(i) => i,
         Err(e) => {
@@ -345,26 +489,32 @@ pub async fn execute(
         return ToolOutput::failure("invalid_input", "command cannot be empty", None);
     }
 
-    // Only the run's configured deadline kills. The caller's `timeout_secs`
-    // bounds the foreground wait instead, so a slow command is relocated with
-    // its work intact rather than destroyed.
-    #[cfg(unix)]
-    let handoff = if timeout.is_some() {
-        None
-    } else {
-        apply_wait_bound(handoff, input.timeout_secs)
+    let plan = match mode {
+        // Only the run's configured deadline kills. The caller's
+        // `timeout_secs` bounds the foreground wait instead, so a slow command
+        // is relocated with its work intact rather than destroyed.
+        Mode::Background {
+            #[cfg(unix)]
+            handoff,
+        } => WaitPlan {
+            deadline: timeout.map(Deadline::run),
+            #[cfg(unix)]
+            handoff: if timeout.is_some() {
+                None
+            } else {
+                apply_wait_bound(handoff, input.timeout_secs)
+            },
+            background_available: true,
+        },
+        Mode::Foreground => WaitPlan {
+            deadline: foreground_deadline(timeout, input.timeout_secs),
+            #[cfg(unix)]
+            handoff: None,
+            background_available: false,
+        },
     };
 
-    match run_command(
-        &input.command,
-        ctx,
-        timeout,
-        output_tx,
-        #[cfg(unix)]
-        handoff,
-    )
-    .await
-    {
+    match run_command(&input.command, ctx, output_tx, plan).await {
         Ok(outcome) => outcome.into_tool_output(),
         Err(e) => e,
     }
@@ -388,16 +538,13 @@ pub async fn run(
         return ToolOutput::failure("invalid_input", "command cannot be empty", None);
     }
 
-    match run_command(
-        command,
-        ctx,
-        timeout,
-        output_tx,
+    let plan = WaitPlan {
+        deadline: timeout.map(Deadline::run),
         #[cfg(unix)]
-        None,
-    )
-    .await
-    {
+        handoff: None,
+        background_available: true,
+    };
+    match run_command(command, ctx, output_tx, plan).await {
         Ok(outcome) => outcome.into_tool_output(),
         Err(e) => e,
     }
@@ -592,15 +739,33 @@ async fn finish_reader(mut task: tokio::task::JoinHandle<()>, sink: StreamSink) 
         .unwrap_or_default()
 }
 
+/// How `run_command` waits for one command.
+struct WaitPlan {
+    /// When the command is killed with its process group, if ever.
+    deadline: Option<Deadline>,
+    /// Relocates the command to the background when it outruns its bound.
+    #[cfg(unix)]
+    handoff: Option<Handoff>,
+    /// Whether this run offers background execution, which decides what the
+    /// result may advise.
+    background_available: bool,
+}
+
 /// Runs a shell command in the context's root directory.
 #[allow(clippy::too_many_lines)]
 async fn run_command(
     command: &str,
     ctx: &ToolContext,
-    timeout: Option<Duration>,
     output_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
-    #[cfg(unix)] handoff: Option<Handoff>,
+    plan: WaitPlan,
 ) -> Result<CommandOutcome, ToolOutput> {
+    let WaitPlan {
+        deadline,
+        #[cfg(unix)]
+        handoff,
+        background_available,
+    } = plan;
+    let timeout = deadline.map(|deadline| deadline.after);
     let started = std::time::Instant::now();
 
     #[cfg(unix)]
@@ -761,10 +926,7 @@ async fn run_command(
     }
 
     if timed_out {
-        let timeout_msg = format!(
-            "Command was killed after {} seconds by the deadline configured for this run (a job's timeout_secs). The Bash timeout_secs argument cannot raise or remove it. Report that this run's operator-imposed limit stopped the command and what it needs instead, so the limit can be adjusted with the operator's approval.",
-            timeout.map_or(0, |d| d.as_secs())
-        );
+        let timeout_msg = deadline.map(Deadline::message).unwrap_or_default();
         if let Some(ref tx) = output_tx {
             let _ = tx.send(timeout_msg.clone());
         }
@@ -788,7 +950,11 @@ async fn run_command(
     }
 
     let stderr = if left_leftovers {
-        let note = "note: this command left background descendants running; they were stopped. Use background: true to run a long-lived process (e.g. a dev server).";
+        let note = if background_available {
+            "note: this command left background descendants running; they were stopped. Use background: true to run a long-lived process (e.g. a dev server)."
+        } else {
+            "note: this command left background descendants running; they were stopped. This run has no background execution, so long-lived processes are not available."
+        };
         if stderr_text.is_empty() {
             note.to_string()
         } else {
@@ -1144,6 +1310,159 @@ mod tests {
         assert!(result.is_ok());
         let data = result.data().expect("should have data");
         assert_eq!(data["timed_out"], true);
+    }
+
+    /// Without background execution there is no implicit limit: only the
+    /// caller's `timeout_secs` and the run's deadline kill, whichever is
+    /// earlier, and `0` means none.
+    #[test]
+    fn foreground_deadline_has_no_implicit_limit() {
+        let at = |run: Option<u64>, requested: Option<u64>| {
+            foreground_deadline(run.map(Duration::from_secs), requested)
+        };
+
+        assert_eq!(at(None, None), None);
+        assert_eq!(at(None, Some(0)), None);
+        assert_eq!(
+            at(None, Some(600)),
+            Some(Deadline {
+                after: Duration::from_mins(10),
+                source: DeadlineSource::Requested
+            }),
+            "a requested limit is not capped"
+        );
+        assert_eq!(
+            at(Some(10), Some(30)),
+            Some(Deadline {
+                after: Duration::from_secs(10),
+                source: DeadlineSource::Run
+            })
+        );
+        assert_eq!(
+            at(Some(500), Some(30)),
+            Some(Deadline {
+                after: Duration::from_secs(30),
+                source: DeadlineSource::Requested
+            })
+        );
+        assert_eq!(
+            at(Some(10), None),
+            Some(Deadline::run(Duration::from_secs(10)))
+        );
+    }
+
+    /// The no-background schema has no `background` property, names no tool
+    /// the run does not have, and claims no implicit limit; the background
+    /// schema keeps both.
+    #[test]
+    fn definitions_match_the_execution_mode() {
+        let without = definition_without_background();
+        let text = format!("{} {}", without.description, without.input_schema);
+        assert!(
+            without.input_schema["properties"]
+                .get("background")
+                .is_none()
+        );
+        assert!(
+            without.input_schema["properties"]
+                .get("timeout_secs")
+                .is_some()
+        );
+        for absent in [
+            "background_output",
+            "background_kill",
+            "bg_id",
+            "background: true",
+            "must finish within",
+        ] {
+            assert!(!text.contains(absent), "mentions {absent}: {text}");
+        }
+        assert!(
+            text.contains("No time limit applies unless you set timeout_secs"),
+            "{text}"
+        );
+        assert!(text.contains("no background execution"), "{text}");
+
+        let with = definition();
+        assert!(with.input_schema["properties"].get("background").is_some());
+        assert!(with.description.contains("background_output"));
+        assert!(with.description.starts_with(PURPOSE));
+        assert!(without.description.starts_with(PURPOSE));
+    }
+
+    /// Without background execution a command runs in the foreground until
+    /// it finishes, however long that is: it is neither killed nor moved.
+    #[tokio::test]
+    async fn without_background_runs_until_the_command_finishes() {
+        let temp = TempDir::new().unwrap();
+        let ctx = ToolContext::new(temp.path().to_path_buf(), None);
+        let input = json!({"command": "sleep 2; echo finished"});
+
+        let result = execute_without_background(&input, &ctx, None, None).await;
+        let data = result.data().unwrap();
+        assert_eq!(data["timed_out"], false);
+        assert_eq!(data["exit_code"], 0);
+        assert!(data.get("backgrounded").is_none());
+        assert!(data["stdout"].as_str().unwrap().contains("finished"));
+    }
+
+    /// A caller's `timeout_secs` stops the command and its process group,
+    /// keeps the partial output, and is named as the cause.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn without_background_timeout_secs_kills_the_group() {
+        let temp = TempDir::new().unwrap();
+        let pidfile = temp.path().join("group.pid");
+        let ctx = ToolContext::new(temp.path().to_path_buf(), None);
+        let input = json!({
+            "command": format!(
+                "echo partial-before; sleep 60 & echo $! > {}; sleep 60",
+                pidfile.display()
+            ),
+            "timeout_secs": 1,
+        });
+
+        let started = std::time::Instant::now();
+        let result = execute_without_background(&input, &ctx, None, None).await;
+        assert!(started.elapsed() < Duration::from_secs(10));
+
+        let data = result.data().expect("should have data");
+        assert_eq!(data["timed_out"], true);
+        assert!(data.get("backgrounded").is_none());
+        assert!(data["stdout"].as_str().unwrap().contains("partial-before"));
+        let stderr = data["stderr"].as_str().unwrap();
+        assert!(stderr.contains("timeout_secs you set"), "{stderr}");
+        assert!(stderr.contains("Do not re-run"), "{stderr}");
+        assert!(!stderr.contains("background: true"), "{stderr}");
+
+        let group_child: i32 = std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let gone = tokio::time::timeout(Duration::from_secs(5), async {
+            while unsafe { libc::kill(group_child, 0) } == 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(gone.is_ok(), "process-group child {group_child} survived");
+    }
+
+    /// The run's deadline (a job's `timeout_secs`) still kills, and is named
+    /// as the operator's limit.
+    #[tokio::test]
+    async fn without_background_run_deadline_still_kills() {
+        let temp = TempDir::new().unwrap();
+        let ctx = ToolContext::new(temp.path().to_path_buf(), None);
+        let input = json!({"command": "sleep 30", "timeout_secs": 600});
+
+        let result =
+            execute_without_background(&input, &ctx, Some(Duration::from_secs(1)), None).await;
+        let data = result.data().unwrap();
+        assert_eq!(data["timed_out"], true);
+        let stderr = data["stderr"].as_str().unwrap();
+        assert!(stderr.contains("operator-imposed limit"), "{stderr}");
     }
 
     #[tokio::test]

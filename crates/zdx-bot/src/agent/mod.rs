@@ -453,6 +453,7 @@ pub(crate) fn spawn_agent_turn(
             registry: tool_config.registry.clone(),
             selection: ToolSelection::Explicit(tools),
             allowed_subagents,
+            background_commands: tool_config.background_commands,
         },
         None => tool_config.clone(),
     };
