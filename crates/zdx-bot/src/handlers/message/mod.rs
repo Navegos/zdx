@@ -74,7 +74,11 @@ pub(crate) async fn handle_message(
         return Ok(());
     };
 
-    let reply_ctx = build_reply_context(&incoming, synthetic_topic_routed_from_general);
+    let reply_ctx = build_reply_context(
+        &incoming,
+        synthetic_topic_routed_from_general,
+        synthetic_prompt,
+    );
 
     // Worker mirror topics are checked before ANY local interpretation:
     // slash commands, staging, and setup flows would otherwise act on (or
@@ -282,10 +286,24 @@ async fn route_worker_topic_message(
     Ok(true)
 }
 
+/// Where a reply goes. `synthetic_prompt` marks a bot-generated prompt
+/// (`Message::synthetic`, e.g. a `[worker update]`): its message id is an
+/// internal counter, not a Telegram message, so the reply quotes nothing.
+/// `synthetic_topic_routed_from_general` is different: a real user message
+/// from General, answered in its new topic with a cross-topic quote.
 fn build_reply_context(
     incoming: &crate::types::IncomingMessage,
     synthetic_topic_routed_from_general: bool,
+    synthetic_prompt: bool,
 ) -> ReplyContext {
+    let topic_id = incoming.message_thread_id;
+    if synthetic_prompt {
+        return ReplyContext {
+            reply_to_message_id: None,
+            topic_id,
+            cross_topic_reply_parameters: None,
+        };
+    }
     let reply_to_message_id = if synthetic_topic_routed_from_general
         || incoming.message_thread_id == Some(incoming.message_id)
     {
@@ -293,7 +311,6 @@ fn build_reply_context(
     } else {
         Some(incoming.message_id)
     };
-    let topic_id = incoming.message_thread_id;
     let cross_topic_reply_parameters = if synthetic_topic_routed_from_general && topic_id.is_some()
     {
         Some(ReplyParameters {
@@ -437,6 +454,184 @@ pub(crate) fn mini_app_base_url(context: &BotContext, chat_id: i64) -> Option<St
         .as_ref()
         .filter(|server| server.enabled)
         .and_then(|server| server.mini_app_url.clone())
+}
+
+#[cfg(test)]
+mod reply_target_tests {
+    use zdx_engine::core::delivery::DeliveryStatus;
+    use zdx_engine::core::thread_persistence::{Thread, ThreadEvent, load_thread_events};
+
+    use super::build_reply_context;
+    use super::response::send_final_response;
+    use crate::bot::context::BotContext;
+    use crate::telegram::TelegramClient;
+    use crate::telegram::fake::{FakeTelegram, TOKEN};
+
+    const CHAT: i64 = -1_001_234;
+
+    fn incoming(message_id: i64, topic: Option<i64>) -> crate::types::IncomingMessage {
+        crate::types::IncomingMessage {
+            chat_id: CHAT,
+            message_id,
+            user_id: 1,
+            text: Some("go".to_string()),
+            images: Vec::new(),
+            audios: Vec::new(),
+            documents: Vec::new(),
+            videos: Vec::new(),
+            notices: Vec::new(),
+            message_thread_id: topic,
+            is_forum: true,
+        }
+    }
+
+    struct TempFile(std::path::PathBuf);
+
+    impl Drop for TempFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    /// Sends a final reply with text, one document, and follow-ups through
+    /// the real reply path to a fake Bot API. Returns the requests seen and
+    /// the last delivery record's statuses and message ids.
+    async fn send_document_reply(
+        reply_ctx: &super::ReplyContext,
+        incoming: &crate::types::IncomingMessage,
+    ) -> (
+        Vec<crate::telegram::fake::Seen>,
+        Vec<(DeliveryStatus, Option<i64>)>,
+    ) {
+        let fake = FakeTelegram::start().await;
+        let context = BotContext::for_test(
+            TelegramClient::with_base_url(TOKEN.to_string(), fake.base_url.clone()),
+            zdx_engine::config::Config::default(),
+            std::env::temp_dir(),
+        );
+        let file =
+            TempFile(std::env::temp_dir().join(format!("zdx-reply-{}.html", uuid::Uuid::new_v4())));
+        std::fs::write(&file.0, "<p>synthetic</p>").expect("write file");
+        let thread_id = format!("telegram-reply-target-{}", uuid::Uuid::new_v4());
+        let mut thread = Thread::with_id(thread_id.clone()).expect("thread");
+        thread
+            .append(&ThreadEvent::user_message("go"))
+            .expect("append");
+        let final_text = format!(
+            "**Done**\n\n<followups><followup>Next step</followup></followups>\n<media>{}</media>",
+            file.0.display()
+        );
+        send_final_response(
+            &context,
+            incoming,
+            reply_ctx,
+            None,
+            &final_text,
+            &thread_id,
+            &[],
+            &mut thread,
+        )
+        .await
+        .expect("send final response");
+        let events = load_thread_events(&thread_id).expect("events");
+        let Some(ThreadEvent::Delivery { record, .. }) = events.last() else {
+            panic!("delivery outcome recorded last");
+        };
+        let items = record
+            .items
+            .iter()
+            .map(|item| (item.status, item.message_id))
+            .collect();
+        (fake.seen(), items)
+    }
+
+    /// The production failure: a `[worker update]` carries an internal id
+    /// near `i64::MAX`. Its reply must quote nothing, so the rich document
+    /// message is accepted in the right topic with no fallback.
+    #[tokio::test]
+    async fn a_synthetic_update_reply_quotes_nothing_and_stays_rich() {
+        let _home = zdx_engine::test_support::temp_zdx_home();
+        let update = incoming(i64::MAX - 3, Some(7));
+        let reply_ctx = build_reply_context(&update, false, true);
+        assert_eq!(reply_ctx.reply_to_message_id, None);
+        assert!(reply_ctx.cross_topic_reply_parameters.is_none());
+        assert_eq!(reply_ctx.topic_id, Some(7));
+
+        let (seen, items) = send_document_reply(&reply_ctx, &update).await;
+        let methods: Vec<&str> = seen.iter().map(|s| s.method.as_str()).collect();
+        assert_eq!(methods, ["sendRichMessage"], "no fallback");
+        let body = &seen[0].body;
+        assert!(!body.contains("reply_parameters"));
+        assert!(!body.contains("reply_to_message_id"));
+        assert!(!body.contains(&(i64::MAX - 3).to_string()));
+        assert!(body.contains("name=\"message_thread_id\"\r\n\r\n7"));
+        assert!(body.contains("fu:0"), "footer keyboard on the rich message");
+        assert_eq!(items.len(), 2);
+        assert!(
+            items
+                .iter()
+                .all(|(status, _)| *status == DeliveryStatus::Sent)
+        );
+        assert!(items[0].1.is_some() && items[0].1 == items[1].1);
+    }
+
+    /// The fake refuses what Telegram refused, so the test above would catch
+    /// a regression: the old context quoted the internal id and fell back.
+    #[tokio::test]
+    async fn the_old_synthetic_reply_target_is_refused_and_falls_back() {
+        let _home = zdx_engine::test_support::temp_zdx_home();
+        let update = incoming(i64::MAX - 3, Some(7));
+        let old = build_reply_context(&update, false, false);
+        assert_eq!(old.reply_to_message_id, Some(i64::MAX - 3));
+
+        let (seen, _) = send_document_reply(&old, &update).await;
+        let methods: Vec<&str> = seen.iter().map(|s| s.method.as_str()).collect();
+        assert_eq!(methods, ["sendRichMessage", "sendDocument"]);
+    }
+
+    #[tokio::test]
+    async fn a_real_user_reply_keeps_its_target_on_the_rich_message() {
+        let _home = zdx_engine::test_support::temp_zdx_home();
+        let message = incoming(42, Some(7));
+        let reply_ctx = build_reply_context(&message, false, false);
+        assert_eq!(reply_ctx.reply_to_message_id, Some(42));
+
+        let (seen, items) = send_document_reply(&reply_ctx, &message).await;
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].method, "sendRichMessage");
+        assert!(
+            seen[0]
+                .body
+                .contains("{\"message_id\":42,\"allow_sending_without_reply\":true}")
+        );
+        assert!(
+            items
+                .iter()
+                .all(|(status, _)| *status == DeliveryStatus::Sent)
+        );
+    }
+
+    #[test]
+    fn general_routing_and_topic_starters_keep_their_targets() {
+        // A real General message moved into a new topic: quoted across topics.
+        let routed = build_reply_context(&incoming(50, Some(9)), true, false);
+        assert_eq!(routed.reply_to_message_id, None);
+        let cross = routed
+            .cross_topic_reply_parameters
+            .expect("cross-topic quote");
+        assert_eq!((cross.message_id, cross.chat_id), (50, Some(CHAT)));
+        assert_eq!(routed.topic_id, Some(9));
+
+        // The topic's own opening message is not quoted.
+        let starter = build_reply_context(&incoming(9, Some(9)), false, false);
+        assert_eq!(starter.reply_to_message_id, None);
+        assert!(starter.cross_topic_reply_parameters.is_none());
+
+        // A synthetic prompt never quotes, even if marked as routed.
+        let synthetic = build_reply_context(&incoming(i64::MAX, Some(9)), true, true);
+        assert_eq!(synthetic.reply_to_message_id, None);
+        assert!(synthetic.cross_topic_reply_parameters.is_none());
+    }
 }
 
 #[cfg(test)]

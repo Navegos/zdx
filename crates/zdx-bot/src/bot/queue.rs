@@ -411,6 +411,8 @@ async fn enqueue_message(queues: &ChatQueueMap, context: &Arc<BotContext>, messa
         let chat_id = message.chat.id;
         let topic_id = message.effective_thread_id();
         let user_message_id = message.id;
+        // A synthetic prompt's id is an internal counter: quote nothing.
+        let reply_to = message.synthetic.is_none().then_some(user_message_id);
         let cancel_data = format!("cancel_q:{chat_id}:{user_message_id}");
         let cancel_markup = InlineKeyboardMarkup {
             inline_keyboard: vec![vec![InlineKeyboardButton::callback(
@@ -421,13 +423,7 @@ async fn enqueue_message(queues: &ChatQueueMap, context: &Arc<BotContext>, messa
 
         match context
             .client()
-            .send_message_with_markup(
-                chat_id,
-                "⏳ Queued",
-                Some(user_message_id),
-                topic_id,
-                &cancel_markup,
-            )
+            .send_message_with_markup(chat_id, "⏳ Queued", reply_to, topic_id, &cancel_markup)
             .await
         {
             Ok(status_msg) => {

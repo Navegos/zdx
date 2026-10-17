@@ -114,7 +114,17 @@ fn answer(state: &Mutex<State>, method: &str, body: &[u8]) -> Response {
         .scripts
         .get_mut(method)
         .and_then(VecDeque::pop_front)
-        .unwrap_or(Reply::Ok);
+        .unwrap_or_else(|| {
+            if quotes_an_internal_message_id(method, body) {
+                Reply::Error(
+                    400,
+                    "Bad Request: field \"message_id\" must be a valid Number",
+                    None,
+                )
+            } else {
+                Reply::Ok
+            }
+        });
     match reply {
         Reply::Ok if !(method.starts_with("send") || method == "forwardMessage") => {
             axum::Json(json!({ "ok": true, "result": true })).into_response()
@@ -149,4 +159,27 @@ fn answer(state: &Mutex<State>, method: &str, body: &[u8]) -> Response {
         }))
         .into_response(),
     }
+}
+
+/// Mirrors the production refusal seen for synthetic prompts: a rich message
+/// whose `reply_parameters` quote an internal countdown id (near `i64::MAX`,
+/// beyond what Telegram accepts as a number). Only that form field is read,
+/// never uploaded file bytes.
+fn quotes_an_internal_message_id(method: &str, body: &[u8]) -> bool {
+    const MAX_SAFE_ID: u64 = (1 << 53) - 1;
+    const FIELD: &str = "name=\"reply_parameters\"\r\n\r\n";
+    if method != "sendRichMessage" {
+        return false;
+    }
+    let body = String::from_utf8_lossy(body);
+    let Some(start) = body.find(FIELD).map(|at| at + FIELD.len()) else {
+        return false;
+    };
+    let end = body[start..]
+        .find("\r\n")
+        .map_or(body.len(), |at| start + at);
+    serde_json::from_str::<Value>(&body[start..end])
+        .ok()
+        .and_then(|value| value.get("message_id").and_then(Value::as_u64))
+        .is_some_and(|id| id > MAX_SAFE_ID)
 }
