@@ -286,6 +286,19 @@ pub fn format_transcript(events: &[ThreadEvent]) -> String {
     output.trim_end().to_string()
 }
 
+/// Formats the conversation of a thread for handoff generation: user and
+/// assistant messages only, in [`format_transcript`]'s layout. Reasoning, tool
+/// calls, tool results, and notices are left out; the source thread keeps them,
+/// and the handoff seed points at it.
+pub fn format_handoff_transcript(events: &[ThreadEvent]) -> String {
+    let messages: Vec<ThreadEvent> = events
+        .iter()
+        .filter(|event| matches!(event, ThreadEvent::Message { .. }))
+        .cloned()
+        .collect();
+    format_transcript(&messages)
+}
+
 /// Builds a display label for a usage event's model/provider attribution.
 /// Returns `provider:model`, or just the model or provider when only one is
 /// known, or `None` when neither is present.
@@ -363,5 +376,41 @@ mod budget_tests {
         let text = "aaaé";
         // 5 bytes total; a cut at 2 bytes would land inside the 2-byte 'é'.
         assert_eq!(tail_str(text, 2), "é");
+    }
+}
+
+#[cfg(test)]
+mod handoff_tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn handoff_transcript_keeps_only_the_conversation() {
+        let events = vec![
+            ThreadEvent::meta_with_root(None),
+            ThreadEvent::user_message("Fix the build"),
+            ThreadEvent::reasoning(Some("private chain of thought".to_string()), None),
+            ThreadEvent::tool_use("call-1", "read", json!({ "path": "src/main.rs" })),
+            ThreadEvent::tool_result("call-1", json!({ "content": "FILE-BODY" }), true),
+            ThreadEvent::user_message("[worker update] Worker thread `w` finished a turn."),
+            ThreadEvent::assistant_message("Fixed."),
+        ];
+
+        let handoff = format_handoff_transcript(&events);
+        assert!(handoff.starts_with("### You\nFix the build"));
+        assert!(handoff.contains("[worker update] Worker thread `w` finished a turn."));
+        assert!(handoff.ends_with("### Assistant\nFixed."));
+        for left_out in [
+            "private chain of thought",
+            "### Tool",
+            "FILE-BODY",
+            "### Thread",
+        ] {
+            assert!(!handoff.contains(left_out), "{left_out} should be left out");
+        }
+
+        let full = format_transcript(&events);
+        assert!(full.contains("private chain of thought") && full.contains("FILE-BODY"));
     }
 }

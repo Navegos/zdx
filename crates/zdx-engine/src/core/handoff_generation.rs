@@ -188,7 +188,7 @@ pub async fn generate_handoff(
     let events = tp::load_thread_events(thread_id)
         .with_context(|| format!("load thread '{thread_id}' for handoff"))?;
     ensure!(!events.is_empty(), "Thread '{thread_id}' is empty");
-    let thread_content = tp::format_transcript(&events);
+    let thread_content = tp::format_handoff_transcript(&events);
 
     let generation_prompt =
         build_handoff_prompt(&thread_content, next_message, &build_zdx_context(root));
