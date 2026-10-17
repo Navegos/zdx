@@ -660,9 +660,10 @@ Contracts:
 - Any `<media>` directives are stripped from the user-visible reply text.
 - Routing by file type:
   - Image-like extensions (`.png`, `.jpg`, `.jpeg`, `.webp`) are sent via Telegram `sendPhoto`.
-  - Other files (including `.pdf`) are sent via Telegram `sendDocument`.
+  - Other files (including `.pdf`) are sent via Telegram `sendDocument`, except documents that go out inside a rich message with the reply text (below).
 - When multiple valid media paths are present, the bot attempts to send each one in order, after the reply text.
-- A reply with text and exactly one valid file whose full rendered caption (reply text plus appended links) fits Telegram's 1024-character caption limit is sent as one message: the file with the text as its HTML caption and the follow-up buttons attached. If Telegram refuses that file for a reason other than flood control, the text is still sent on its own. Otherwise text and files are separate messages.
+- A reply with text and one or more valid documents (any file that is not a photo, voice note, or audio file) is sent as one rich message (`sendRichMessage`): the formatted text first, then each document in order, then the follow-up keyboard. All files are uploaded in the same request. It is used only when the reply fits the rich-message limits (Bot API: 32768 characters of text, 500 blocks, 50 media attachments; checked conservatively). Reply HTML is passed through as rich HTML with line breaks as `<br>`. If Telegram refuses the rich message, or it cannot be built (for example a file over 50 MB), the reply falls back to the separate-message path below; a flood refusal that the retry policy cannot absorb, or an unknown outcome, does not fall back, so nothing is sent twice. Photos, voice notes, audio, and replies mixing them with documents keep the existing path.
+- Otherwise, a reply with text and exactly one valid file whose full rendered caption (reply text plus appended links) fits Telegram's 1024-character caption limit is sent as one message: the file with the text as its HTML caption and the follow-up buttons attached. If Telegram refuses that file for a reason other than flood control, the text is still sent on its own. Otherwise text and files are separate messages.
 - Bot only uses local absolute file paths for this flow (no URL fetch in this slice).
 - Preflight upload size checks:
   - photos > 10 MB are rejected before upload

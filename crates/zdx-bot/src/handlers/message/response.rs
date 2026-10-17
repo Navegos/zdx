@@ -7,12 +7,15 @@ use zdx_engine::core::thread_persistence::{self, Thread, ThreadEvent};
 use zdx_engine::telegram::flood::{self, FailureClass};
 
 use super::ReplyContext;
-use super::media::{is_valid_media_path, parse_final_response, send_media_file};
+use super::media::{
+    is_audio_path, is_image_path, is_valid_media_path, is_voice_note_path, parse_final_response,
+    send_media_file,
+};
 use crate::bot::context::BotContext;
-use crate::telegram::markdown::visible_utf16_len;
+use crate::telegram::markdown::{rich_shape, telegram_html_to_rich_html, visible_utf16_len};
 use crate::telegram::{
     InlineKeyboardMarkup, MediaSend, Message, ReplyParameters, TelegramClient, TextSend,
-    is_invalid_reply_error,
+    is_invalid_reply_error, rich_document_id,
 };
 
 /// Telegram's caption limit, in characters after entity parsing.
@@ -243,6 +246,11 @@ impl ReplyTarget {
 /// `record` (items: optional text first, then one per file, in order).
 /// Returns the id of the message that carries `keyboard`, if it was sent.
 ///
+/// Text with one or more documents (no photos, voice notes, or audio) that
+/// fits the rich-message limits goes out as one rich message: the text, then
+/// the documents, then the keyboard. If Telegram refuses that message, or it
+/// cannot be built (a file too large to upload), the reply falls back to the
+/// paths below; a flood refusal or an unknown outcome does not fall back.
 /// A single file whose complete caption fits Telegram's limit is sent with
 /// the text as its caption (one message instead of two). Otherwise text goes
 /// first and files follow. After a flood refusal that the retry policy could
@@ -261,6 +269,13 @@ pub(super) async fn deliver_reply(
         if !is_valid_media_path(path) {
             record.items[file_offset + idx].mark_failed("file not found or not a regular file");
         }
+    }
+
+    if let Some(text) = text
+        && rich_document_layout(text, files, record)
+        && let Some(done) = send_rich_reply(client, target, text, files, keyboard, record).await
+    {
+        return done;
     }
 
     if let Some(text) = text
@@ -330,6 +345,104 @@ pub(super) async fn deliver_reply(
         }
     }
     keyboard_message
+}
+
+/// Sends text and documents as one rich message. Returns `None` when the
+/// reply should fall back to separate messages (the rich message was refused
+/// or could not be built, so nothing was delivered); otherwise the id of the
+/// message carrying the keyboard, if any, with every item recorded.
+async fn send_rich_reply(
+    client: &TelegramClient,
+    target: &ReplyTarget,
+    text: &str,
+    files: &[PathBuf],
+    keyboard: Option<&InlineKeyboardMarkup>,
+    record: &mut DeliveryRecord,
+) -> Option<Option<i64>> {
+    let paths: Vec<&std::path::Path> = files.iter().map(PathBuf::as_path).collect();
+    let html = rich_reply_html(text, files.len());
+    let options = target.media_options(None, keyboard);
+    let err = match client
+        .send_rich_documents(target.chat_id, &html, &paths, &options)
+        .await
+    {
+        Ok(message) => {
+            for item in &mut record.items {
+                item.mark_sent(Some(message.id));
+            }
+            return Some(Some(message.id));
+        }
+        Err(err) => err,
+    };
+    let error = format!("{err:#}");
+    match flood::classify(&err) {
+        FailureClass::Unknown => {
+            for item in &mut record.items {
+                item.mark_unknown(&error);
+            }
+            Some(None)
+        }
+        FailureClass::FloodWait(_) => {
+            for item in &mut record.items {
+                item.mark_failed(&error);
+            }
+            Some(None)
+        }
+        FailureClass::Rejected | FailureClass::NotSent => {
+            tracing::warn!(
+                chat_id = target.chat_id,
+                err = %error,
+                "Rich document reply not sent; using separate messages"
+            );
+            None
+        }
+    }
+}
+
+/// Rich-message limits (Bot API "Rich Message Limits"): 32768 characters of
+/// text, 500 blocks, 16 levels of nesting, 50 media attachments.
+const RICH_MAX_TEXT_CHARS: usize = 32_768;
+const RICH_MAX_NESTING: usize = 16;
+const RICH_MAX_BLOCKS: usize = 500;
+const RICH_MAX_MEDIA: usize = 50;
+
+/// Whether this reply goes out as one rich message: there is text, every file
+/// is a valid document (not a photo, voice note, or audio file, which keep
+/// their own send methods), and the reply fits the limits. The checks are
+/// conservative: the text is measured in UTF-16 units (never fewer than
+/// characters) and every line break is counted as a possible block.
+fn rich_document_layout(text: &str, files: &[PathBuf], record: &DeliveryRecord) -> bool {
+    !files.is_empty()
+        && record.items[1..]
+            .iter()
+            .all(|item| item.status == DeliveryStatus::Pending)
+        && files
+            .iter()
+            .all(|path| !is_image_path(path) && !is_voice_note_path(path) && !is_audio_path(path))
+        && rich_layout_fits(text, files.len())
+}
+
+fn rich_layout_fits(text: &str, documents: usize) -> bool {
+    let shape = rich_shape(text);
+    documents <= RICH_MAX_MEDIA
+        && shape.blocks + documents <= RICH_MAX_BLOCKS
+        // Strictly below: one level for the message's own block.
+        && shape.depth < RICH_MAX_NESTING
+        && visible_utf16_len(text) <= RICH_MAX_TEXT_CHARS
+}
+
+/// Rich HTML body: the reply text, then one `<tg-document>` per file, in
+/// order, referencing the uploads by id.
+fn rich_reply_html(text: &str, documents: usize) -> String {
+    let mut html = telegram_html_to_rich_html(text);
+    for index in 0..documents {
+        let _ = write!(
+            html,
+            "<tg-document src=\"tg://document?id={}\"></tg-document>",
+            rich_document_id(index)
+        );
+    }
+    html
 }
 
 /// Records a send result on `item`. Returns the message id on success, or the
@@ -635,14 +748,202 @@ mod tests {
         assert_eq!(record.items[0].status, DeliveryStatus::Sent);
     }
 
+    fn rich_json(body: &str) -> serde_json::Value {
+        let start = body
+            .find("name=\"rich_message\"")
+            .expect("rich_message field");
+        let json_start = body[start..].find("\r\n\r\n").expect("field body") + start + 4;
+        let json_end = body[json_start..].find("\r\n--").expect("field end") + json_start;
+        serde_json::from_str(&body[json_start..json_end]).expect("rich_message json")
+    }
+
+    fn rich_html(body: &str) -> String {
+        rich_json(body)["html"].as_str().expect("html").to_string()
+    }
+
+    #[tokio::test]
+    async fn text_and_one_document_go_out_as_one_rich_message() {
+        let fake = FakeTelegram::start().await;
+        let file = TempFile::new("html");
+        let text = "<b>Ready</b> &lt;tag&gt; &amp; <a href=\"https://example.com/a?b=1&amp;c=2\">link</a>\nsecond line";
+        let (id, record) = deliver(&fake, Some(text), std::slice::from_ref(&file.0)).await;
+
+        assert_eq!(fake.methods(), ["sendRichMessage"]);
+        let body = &fake.seen()[0].body;
+        assert!(body.contains("fu:0"), "keyboard rides on the rich message");
+        assert!(
+            body.contains("name=\"file0\""),
+            "document uploaded in the same request"
+        );
+        assert!(body.contains("{\"message_id\":42,\"allow_sending_without_reply\":true}"));
+        assert!(body.contains("synthetic file"));
+        let media = &rich_json(body)["media"];
+        assert_eq!(media[0]["id"], "file0");
+        assert_eq!(media[0]["media"]["type"], "document");
+        assert_eq!(media[0]["media"]["media"], "attach://file0");
+        assert_eq!(
+            rich_html(body),
+            "<b>Ready</b> &lt;tag&gt; &amp; <a href=\"https://example.com/a?b=1&amp;c=2\">link</a><br>second line<tg-document src=\"tg://document?id=file0\"></tg-document>"
+        );
+        assert_eq!(
+            statuses(&record),
+            [DeliveryStatus::Sent, DeliveryStatus::Sent]
+        );
+        assert_eq!(id, record.items[0].message_id);
+        assert_eq!(record.items[0].message_id, record.items[1].message_id);
+    }
+
+    #[tokio::test]
+    async fn two_documents_follow_the_text_in_order_in_one_message() {
+        let fake = FakeTelegram::start().await;
+        let first = TempFile::new("html");
+        let second = TempFile::new("csv");
+        let files = [first.0.clone(), second.0.clone()];
+        let (id, record) = deliver(&fake, Some("**done**"), &files).await;
+
+        assert_eq!(fake.methods(), ["sendRichMessage"]);
+        let body = &fake.seen()[0].body;
+        let html = rich_html(body);
+        let one = html.find("id=file0").expect("first document");
+        let two = html.find("id=file1").expect("second document");
+        assert!(one < two);
+        assert!(body.find("name=\"file0\"") < body.find("name=\"file1\""));
+        assert_eq!(statuses(&record), [DeliveryStatus::Sent; 3]);
+        assert!(record.items.iter().all(|item| item.message_id == id));
+    }
+
+    #[tokio::test]
+    async fn a_refused_rich_message_falls_back_to_separate_messages() {
+        let fake = FakeTelegram::start().await;
+        fake.script(
+            "sendRichMessage",
+            &[Reply::Error(
+                400,
+                "Bad Request: can't parse rich message",
+                None,
+            )],
+        );
+        let file = TempFile::new("html");
+        let (id, record) = deliver(&fake, Some("done"), std::slice::from_ref(&file.0)).await;
+
+        assert_eq!(fake.methods(), ["sendRichMessage", "sendDocument"]);
+        assert_eq!(
+            statuses(&record),
+            [DeliveryStatus::Sent, DeliveryStatus::Sent]
+        );
+        assert_eq!(id, record.items[0].message_id);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_rich_outcome_is_not_resent() {
+        let fake = FakeTelegram::start().await;
+        fake.script("sendRichMessage", &[Reply::Garbage]);
+        let file = TempFile::new("html");
+        let (id, record) = deliver(&fake, Some("done"), std::slice::from_ref(&file.0)).await;
+
+        assert_eq!(id, None);
+        assert_eq!(fake.methods(), ["sendRichMessage"]);
+        assert_eq!(
+            statuses(&record),
+            [DeliveryStatus::Unknown, DeliveryStatus::Unknown]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rich_flood_refusal_is_retried_with_the_files_or_fails_without_fallback() {
+        let fake = FakeTelegram::start().await;
+        fake.script(
+            "sendRichMessage",
+            &[Reply::Error(
+                429,
+                "Too Many Requests: retry after 1",
+                Some(1),
+            )],
+        );
+        let file = TempFile::new("html");
+        let (_, record) = deliver(&fake, Some("done"), std::slice::from_ref(&file.0)).await;
+        assert_eq!(fake.methods(), ["sendRichMessage", "sendRichMessage"]);
+        let retry = &fake.seen()[1].body;
+        assert!(retry.contains("name=\"file0\"") && retry.contains("synthetic file"));
+        assert_eq!(
+            statuses(&record),
+            [DeliveryStatus::Sent, DeliveryStatus::Sent]
+        );
+
+        let fake = FakeTelegram::start().await;
+        fake.script(
+            "sendRichMessage",
+            &[Reply::Error(
+                429,
+                "Too Many Requests: retry after 500",
+                Some(500),
+            )],
+        );
+        let (_, record) = deliver(&fake, Some("done"), std::slice::from_ref(&file.0)).await;
+        assert_eq!(fake.methods(), ["sendRichMessage"]);
+        assert_eq!(
+            statuses(&record),
+            [DeliveryStatus::Failed, DeliveryStatus::Failed]
+        );
+    }
+
+    #[tokio::test]
+    async fn photos_and_mixed_media_keep_their_own_methods() {
+        let fake = FakeTelegram::start().await;
+        let photo = TempFile::new("png");
+        let doc = TempFile::new("html");
+        let files = [photo.0.clone(), doc.0.clone()];
+        let (_, record) = deliver(&fake, Some("done"), &files).await;
+        assert_eq!(fake.methods(), ["sendMessage", "sendPhoto", "sendDocument"]);
+        assert_eq!(statuses(&record), [DeliveryStatus::Sent; 3]);
+    }
+
+    #[test]
+    fn rich_layout_respects_the_documented_limits() {
+        assert!(super::rich_layout_fits("short", 1));
+        assert!(super::rich_layout_fits("short", 50));
+        assert!(!super::rich_layout_fits("short", 51));
+        assert!(!super::rich_layout_fits(&"x".repeat(32_769), 1));
+        assert!(super::rich_layout_fits(&"x".repeat(32_768), 1));
+        assert!(!super::rich_layout_fits(&"line\n".repeat(499), 1));
+        // Adjacent blocks with no line breaks between them still count.
+        assert!(!super::rich_layout_fits(&"<pre>x</pre>".repeat(250), 1));
+        let deep = format!("{}x{}", "<b>".repeat(16), "</b>".repeat(16));
+        assert!(!super::rich_layout_fits(&deep, 1));
+        let ok = format!("{}x{}", "<b>".repeat(15), "</b>".repeat(15));
+        assert!(super::rich_layout_fits(&ok, 1));
+    }
+
+    #[tokio::test]
+    async fn an_oversized_document_is_not_sent_rich_and_the_text_still_goes_out() {
+        let fake = FakeTelegram::start().await;
+        let big = TempFile::new("html");
+        std::fs::File::options()
+            .write(true)
+            .open(&big.0)
+            .and_then(|file| file.set_len(50 * 1024 * 1024 + 1))
+            .expect("grow file");
+        let (_, record) = deliver(&fake, Some("done"), std::slice::from_ref(&big.0)).await;
+
+        assert_eq!(
+            fake.methods(),
+            ["sendMessage"],
+            "no rich or document request"
+        );
+        assert_eq!(
+            statuses(&record),
+            [DeliveryStatus::Sent, DeliveryStatus::Failed]
+        );
+    }
+
     #[tokio::test]
     async fn short_text_and_one_file_go_out_as_one_captioned_message() {
         let fake = FakeTelegram::start().await;
-        let file = TempFile::new("html");
+        let file = TempFile::new("png");
         let (id, record) =
             deliver(&fake, Some("<b>Ready</b>"), std::slice::from_ref(&file.0)).await;
 
-        assert_eq!(fake.methods(), ["sendDocument"]);
+        assert_eq!(fake.methods(), ["sendPhoto"]);
         let body = &fake.seen()[0].body;
         assert!(body.contains("<b>Ready</b>"));
         assert!(body.contains("fu:0"), "buttons ride on the captioned file");
@@ -657,11 +958,11 @@ mod tests {
     #[tokio::test]
     async fn long_text_goes_first_with_the_buttons_then_the_file() {
         let fake = FakeTelegram::start().await;
-        let file = TempFile::new("html");
+        let file = TempFile::new("png");
         let text = "x".repeat(1100);
         let (id, record) = deliver(&fake, Some(&text), std::slice::from_ref(&file.0)).await;
 
-        assert_eq!(fake.methods(), ["sendMessage", "sendDocument"]);
+        assert_eq!(fake.methods(), ["sendMessage", "sendPhoto"]);
         let seen = fake.seen();
         assert!(seen[0].body.contains("fu:0"));
         assert!(!seen[1].body.contains("fu:0"));
@@ -683,8 +984,8 @@ mod tests {
                 Some(500),
             )],
         );
-        let a = TempFile::new("html");
-        let b = TempFile::new("csv");
+        let a = TempFile::new("png");
+        let b = TempFile::new("jpg");
         let (id, record) = deliver(&fake, Some("done"), &[a.0.clone(), b.0.clone()]).await;
 
         assert_eq!(id, None);
@@ -709,13 +1010,13 @@ mod tests {
     async fn a_refused_captioned_file_still_delivers_the_text() {
         let fake = FakeTelegram::start().await;
         fake.script(
-            "sendDocument",
+            "sendPhoto",
             &[Reply::Error(400, "Bad Request: wrong file type", None)],
         );
-        let file = TempFile::new("html");
+        let file = TempFile::new("png");
         let (id, record) = deliver(&fake, Some("done"), std::slice::from_ref(&file.0)).await;
 
-        assert_eq!(fake.methods(), ["sendDocument", "sendMessage"]);
+        assert_eq!(fake.methods(), ["sendPhoto", "sendMessage"]);
         assert_eq!(
             statuses(&record),
             [DeliveryStatus::Sent, DeliveryStatus::Failed]
@@ -726,12 +1027,12 @@ mod tests {
     #[tokio::test]
     async fn an_ambiguous_captioned_send_is_unknown_and_not_resent() {
         let fake = FakeTelegram::start().await;
-        fake.script("sendDocument", &[Reply::Garbage]);
-        let file = TempFile::new("html");
+        fake.script("sendPhoto", &[Reply::Garbage]);
+        let file = TempFile::new("png");
         let (id, record) = deliver(&fake, Some("done"), std::slice::from_ref(&file.0)).await;
 
         assert_eq!(id, None);
-        assert_eq!(fake.methods(), ["sendDocument"]);
+        assert_eq!(fake.methods(), ["sendPhoto"]);
         assert_eq!(
             statuses(&record),
             [DeliveryStatus::Unknown, DeliveryStatus::Unknown]

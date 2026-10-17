@@ -225,6 +225,57 @@ mod tests {
         assert_eq!(chosen.inline_keyboard.len(), 1);
     }
 
+    /// The buttons sit on the reply itself (often a rich message with files),
+    /// so a tap or Dismiss must change only the keyboard, never the content.
+    #[tokio::test]
+    async fn taps_and_dismiss_edit_only_the_keyboard() {
+        use crate::telegram::fake::{FakeTelegram, TOKEN};
+
+        let _home = zdx_engine::test_support::temp_zdx_home();
+        let fake = FakeTelegram::start().await;
+        let client = TelegramClient::with_base_url(TOKEN.to_string(), fake.base_url.clone());
+        let context = Arc::new(BotContext::for_test(
+            client.clone(),
+            zdx_engine::config::Config::default(),
+            std::env::temp_dir(),
+        ));
+        let queues = crate::bot::queue::new_chat_queues();
+        let callback = |data: &str| -> CallbackQuery {
+            serde_json::from_value(json!({
+                "id": "cb1",
+                "from": { "id": 7, "is_bot": false },
+                "data": data,
+                "message": {
+                    "message_id": 900,
+                    "chat": { "id": -1001, "type": "supergroup", "is_forum": true },
+                    "message_thread_id": 7,
+                },
+            }))
+            .expect("callback")
+        };
+
+        register(&context, -1001, 900, vec!["Next step".to_string()]);
+        handle_callback(&context, &queues, &client, &callback("fu:x"), "x").await;
+        register(&context, -1001, 900, vec!["Next step".to_string()]);
+        handle_callback(&context, &queues, &client, &callback("fu:0"), "0").await;
+
+        let methods = fake.methods();
+        assert_eq!(
+            methods
+                .iter()
+                .filter(|m| m.as_str() == "editMessageReplyMarkup")
+                .count(),
+            2,
+            "{methods:?}"
+        );
+        assert!(
+            !methods
+                .iter()
+                .any(|m| m == "editMessageText" || m == "deleteMessage"),
+            "{methods:?}"
+        );
+    }
+
     #[test]
     fn strips_markdown_markers_from_button_labels() {
         assert_eq!(

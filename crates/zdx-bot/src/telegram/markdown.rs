@@ -107,6 +107,132 @@ fn visible_char_count(input: &str) -> usize {
     count
 }
 
+/// Converts reply HTML (the Telegram HTML subset this module produces) into
+/// the `html` body of a rich message. Rich HTML treats a plain newline as a
+/// space, so line breaks in text become `<br>`, except inside `<pre>` (kept
+/// verbatim) and next to block elements (`<pre>`, `<blockquote>`), which
+/// already end a line. A legacy spoiler `<span>` (the only span this subset
+/// keeps) becomes `<tg-spoiler>`, the only spoiler form rich HTML lists. All
+/// other tags and entities pass through unchanged: rich HTML supports every
+/// tag this subset uses.
+pub(crate) fn telegram_html_to_rich_html(input: &str) -> String {
+    let input = map_html(input, |piece, out| match piece {
+        HtmlPiece::Tag(tag, _) if tag.name == "span" => {
+            out.push_str(if tag.closing {
+                "</tg-spoiler>"
+            } else {
+                "<tg-spoiler>"
+            });
+        }
+        HtmlPiece::Tag(_, raw) | HtmlPiece::Text(raw) => out.push_str(raw),
+    });
+    let mut out = String::with_capacity(input.len() + 32);
+    let mut rest = input.as_str();
+    let mut after_block = false;
+    loop {
+        let next = [("<pre", "</pre>"), ("<blockquote", "</blockquote>")]
+            .into_iter()
+            .filter_map(|(open, close)| rest.find(open).map(|at| (at, close, open == "<pre")))
+            .min_by_key(|(at, _, _)| *at);
+        let Some((start, close, verbatim)) = next else {
+            push_rich_breaks(&mut out, rest, after_block, false);
+            return out;
+        };
+        push_rich_breaks(&mut out, &rest[..start], after_block, true);
+        let block = &rest[start..];
+        let end = block.find(close).map_or(block.len(), |at| at + close.len());
+        if verbatim {
+            out.push_str(&block[..end]);
+        } else {
+            // Inside a quotation a line break stays a line break.
+            out.push_str(&text_breaks(block[..end].trim_end_matches('\n')));
+        }
+        rest = &block[end..];
+        after_block = true;
+    }
+}
+
+/// Conservative structure of reply HTML sent as a rich message: an upper
+/// estimate of its blocks (every line break, plus each `<pre>`/`<blockquote>`
+/// and the text around it) and its deepest tag nesting.
+pub(crate) struct RichShape {
+    pub(crate) blocks: usize,
+    pub(crate) depth: usize,
+}
+
+pub(crate) fn rich_shape(input: &str) -> RichShape {
+    let mut blocks = 1;
+    let mut depth = 0usize;
+    let mut max_depth = 0;
+    let _ = map_html(input, |piece, _| match piece {
+        HtmlPiece::Tag(tag, _) if tag.closing => depth = depth.saturating_sub(1),
+        HtmlPiece::Tag(tag, _) => {
+            depth += 1;
+            max_depth = max_depth.max(depth);
+            if matches!(tag.name, "pre" | "blockquote") {
+                blocks += 2;
+            }
+        }
+        HtmlPiece::Text(text) => blocks += text.matches('\n').count(),
+    });
+    RichShape {
+        blocks,
+        depth: max_depth,
+    }
+}
+
+enum HtmlPiece<'a> {
+    Tag(HtmlTag<'a>, &'a str),
+    Text(&'a str),
+}
+
+/// Walks `input` as recognised tags and text runs, building a new string.
+fn map_html(input: &str, mut f: impl FnMut(HtmlPiece<'_>, &mut String)) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut cursor = 0;
+    let mut text_start = 0;
+    while cursor < input.len() {
+        let rest = &input[cursor..];
+        if let Some(tag) = parse_telegram_tag(rest) {
+            if text_start < cursor {
+                f(HtmlPiece::Text(&input[text_start..cursor]), &mut out);
+            }
+            let len = tag.len;
+            f(HtmlPiece::Tag(tag, &rest[..len]), &mut out);
+            cursor += len;
+            text_start = cursor;
+        } else {
+            cursor += rest.chars().next().map_or(1, char::len_utf8);
+        }
+    }
+    if text_start < input.len() {
+        f(HtmlPiece::Text(&input[text_start..]), &mut out);
+    }
+    out
+}
+
+/// Replaces line breaks in text (never inside a tag) with `<br>`.
+fn text_breaks(input: &str) -> String {
+    map_html(input, |piece, out| match piece {
+        HtmlPiece::Text(text) => out.push_str(&text.replace('\n', "<br>")),
+        HtmlPiece::Tag(_, raw) => out.push_str(raw),
+    })
+}
+
+fn push_rich_breaks(out: &mut String, text: &str, after_block: bool, before_block: bool) {
+    let text = if after_block {
+        text.trim_start_matches('\n')
+    } else {
+        text
+    };
+    let text = if before_block {
+        text.trim_end_matches('\n')
+    } else {
+        text
+    };
+    out.push_str(&text_breaks(text));
+}
+
 /// Upper bound on Telegram's "characters after entities parsing" for HTML:
 /// tags are dropped and text is counted in UTF-16 code units. Entities count
 /// as 2 so a numeric entity outside the BMP is never undercounted.
@@ -651,6 +777,39 @@ fn escape_attr(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rich_html_keeps_formatting_and_turns_lines_into_breaks() {
+        use super::telegram_html_to_rich_html as rich;
+        assert_eq!(rich("<b>a</b>\nb &amp; c"), "<b>a</b><br>b &amp; c");
+        assert_eq!(
+            rich("intro\n<pre><code>x\n  y</code></pre>\nafter"),
+            "intro<pre><code>x\n  y</code></pre>after"
+        );
+        assert_eq!(
+            rich("<blockquote>one\ntwo</blockquote>\n\nafter"),
+            "<blockquote>one<br>two</blockquote>after"
+        );
+        assert_eq!(
+            rich("a <span class=\"tg-spoiler\">secret</span>"),
+            "a <tg-spoiler>secret</tg-spoiler>"
+        );
+        assert_eq!(rich("a\n\nb"), "a<br><br>b");
+        // A legacy spoiler with extra spacing still pairs up.
+        assert_eq!(
+            rich("<span class=\"tg-spoiler\" >secret</span>"),
+            "<tg-spoiler>secret</tg-spoiler>"
+        );
+    }
+
+    #[test]
+    fn rich_shape_counts_blocks_and_nesting_conservatively() {
+        let shape = super::rich_shape(&"<pre>x</pre>".repeat(3));
+        assert_eq!(shape.blocks, 7);
+        assert_eq!(shape.depth, 1);
+        let shape = super::rich_shape("<b><i><u>x</u></i></b>\nline");
+        assert_eq!((shape.blocks, shape.depth), (2, 3));
+    }
+
     use super::{to_telegram_html, truncate_telegram_html};
 
     #[test]
