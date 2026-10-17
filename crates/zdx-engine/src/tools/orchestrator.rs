@@ -173,13 +173,17 @@ fn definition_for(op: Op) -> ToolDefinition {
         },
         Op::Status => ToolDefinition {
             name: "Get_Thread_Status".to_string(),
-            description: "Report a worker thread's status (queued/running/completed/failed/cancelled), queue depth, the waiting prompts (`queue`: `prompt_id` + a bounded excerpt, in run order; the running prompt is not listed), and latest final text. Managed workers also report `current_tool`, `current_tool_input` (a one-line command/path/pattern preview, at most 200 characters), `seconds_since_last_activity`, and `turn_elapsed_seconds`. The name and input belong to the same tool-use id; with concurrent tools, they describe the most recently started unfinished call. Inspect the preview before judging a long wait: a build can be quiet, and activity age alone does not prove a hang. Input is null until available or when the tool has no primary argument. For a thread this process does not manage, live tool information is unavailable; it reports `seconds_since_last_write` from the file mtime. Both paths include `context`: the latest recorded request's input tokens INCLUDING cache reads/writes, its recorded model/provider, context_limit, percent_used, and recorded_at. This estimates context occupancy, not cumulative spend; output tokens are excluded, and it is not an exact count of the next resumed request. Context is null when no input-bearing usage is found in the last 256 KiB or the file cannot be read. Unknown model/provider/limit leaves tokens visible but limit and percentage null. Use percent_used to decide whether to move work to a fresh thread. Omit thread_id to list every worker owned by this orchestrator in the current process.".to_string(),
+            description: "Report a worker thread's status (queued/running/completed/failed/cancelled), queue depth, and the waiting prompts (`queue`: `prompt_id` + a bounded excerpt, in run order; the running prompt is not listed). The worker's last answer is left out by default because its `[worker update]` already delivered it; pass `include_last_answer: true` to get it as `latest_final_text` (bounded, held in memory by this process, so null after a restart or for an unmanaged thread). Use Read_Thread for anything older. Managed workers also report `current_tool`, `current_tool_input` (a one-line command/path/pattern preview, at most 200 characters), `seconds_since_last_activity`, and `turn_elapsed_seconds`. The name and input belong to the same tool-use id; with concurrent tools, they describe the most recently started unfinished call. Inspect the preview before judging a long wait: a build can be quiet, and activity age alone does not prove a hang. Input is null until available or when the tool has no primary argument. For a thread this process does not manage, live tool information is unavailable; it reports `seconds_since_last_write` from the file mtime. Both paths include `context`: the latest recorded request's input tokens INCLUDING cache reads/writes, its recorded model/provider, context_limit, percent_used, and recorded_at. This estimates context occupancy, not cumulative spend; output tokens are excluded, and it is not an exact count of the next resumed request. Context is null when no input-bearing usage is found in the last 256 KiB or the file cannot be read. Unknown model/provider/limit leaves tokens visible but limit and percentage null. Use percent_used to decide whether to move work to a fresh thread. Omit thread_id to list every worker owned by this orchestrator in the current process.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "thread_id": {
                         "type": "string",
                         "description": "Optional worker thread id; omit to list all owned workers"
+                    },
+                    "include_last_answer": {
+                        "type": "boolean",
+                        "description": "Include the worker's last answer as `latest_final_text`. Defaults to false."
                     }
                 },
                 "required": [],
@@ -285,10 +289,6 @@ fn snapshot_json(snapshot: &WorkerSnapshot) -> Value {
             }))
             .collect::<Vec<_>>(),
         "idle": snapshot.is_idle(),
-        "latest_final_text": snapshot
-            .latest_final_text
-            .as_deref()
-            .map(|text| truncate_chars(text, MAX_FINAL_TEXT_CHARS)),
         "last_error": snapshot.last_error,
         "mirror_url": snapshot.mirror_url,
         "current_tool": snapshot.current_tool,
@@ -563,11 +563,34 @@ fn get_thread_status(
     input: &Value,
     config: Option<&crate::config::Config>,
 ) -> ToolOutput {
+    let include_last_answer = input
+        .get("include_last_answer")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let status_json = |snapshot: &WorkerSnapshot| {
+        let mut worker = snapshot_json(snapshot);
+        if include_last_answer {
+            worker["latest_final_text"] = json!(
+                snapshot
+                    .latest_final_text
+                    .as_deref()
+                    .map(|text| truncate_chars(text, MAX_FINAL_TEXT_CHARS))
+            );
+        }
+        worker["context"] = thread_context_json(&snapshot.thread_id, config);
+        worker
+    };
+
     if let Some(thread_id) = optional_str(input, "thread_id") {
-        let mut worker = match manager.snapshot(thread_id) {
-            Some(snapshot) => snapshot_json(&snapshot),
+        let worker = match manager.snapshot(thread_id) {
+            Some(snapshot) => status_json(&snapshot),
             None if thread_file_path(thread_id).is_file() => {
-                unmanaged_thread_json(thread_id)
+                let mut worker = unmanaged_thread_json(thread_id);
+                if include_last_answer {
+                    worker["latest_final_text"] = Value::Null;
+                }
+                worker["context"] = thread_context_json(thread_id, config);
+                worker
             }
             None => return ToolOutput::failure(
                 "not_managed",
@@ -577,18 +600,13 @@ fn get_thread_status(
                 ),
             ),
         };
-        worker["context"] = thread_context_json(thread_id, config);
         return ToolOutput::success(json!({ "worker": worker }));
     }
 
     let workers: Vec<Value> = manager
         .list_for_owner(owner)
         .iter()
-        .map(|snapshot| {
-            let mut worker = snapshot_json(snapshot);
-            worker["context"] = thread_context_json(&snapshot.thread_id, config);
-            worker
-        })
+        .map(status_json)
         .collect();
     ToolOutput::success(json!({ "count": workers.len(), "workers": workers }))
 }
@@ -936,6 +954,61 @@ mod tests {
         let (code, _, _) = again.error_info().unwrap();
         assert_eq!(code, "remove_thread_prompt_failed");
         release_tx.send(true).unwrap();
+    }
+
+    #[tokio::test]
+    async fn last_answer_is_returned_only_when_requested() {
+        let home = crate::test_support::temp_zdx_home();
+        let (manager, _events) =
+            WorkerManager::with_runner(Arc::new(|_| Box::pin(async { Ok("the answer".into()) })));
+        let id = manager
+            .create_worker("owner", home.path(), "go", None, None, None)
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !manager.snapshot(&id).is_some_and(|s| s.is_idle()) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("worker finishes");
+
+        let status = |input: Value| get_thread_status(&manager, "owner", &input, None);
+        let default = status(json!({"thread_id": id}));
+        let worker = &default.data().unwrap()["worker"];
+        assert_eq!(worker["status"], "completed");
+        assert!(worker.get("latest_final_text").is_none());
+
+        let explicit = status(json!({"thread_id": id, "include_last_answer": true}));
+        assert_eq!(
+            explicit.data().unwrap()["worker"]["latest_final_text"],
+            "the answer"
+        );
+        let listing = status(json!({"include_last_answer": true}));
+        assert_eq!(
+            listing.data().unwrap()["workers"][0]["latest_final_text"],
+            "the answer"
+        );
+
+        let sent = send_thread_message(
+            &manager,
+            "owner",
+            &json!({"thread_id": id, "message": "again"}),
+        );
+        assert!(
+            sent.data().unwrap()["worker"]
+                .get("latest_final_text")
+                .is_none(),
+            "mutation results never repeat the previous answer"
+        );
+
+        let (other_manager, _other_events) = WorkerManager::new();
+        let unmanaged = get_thread_status(
+            &other_manager,
+            "owner",
+            &json!({"thread_id": id, "include_last_answer": true}),
+            None,
+        );
+        assert!(unmanaged.data().unwrap()["worker"]["latest_final_text"].is_null());
     }
 
     #[tokio::test]
