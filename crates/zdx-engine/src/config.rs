@@ -2393,6 +2393,9 @@ fn default_google_antigravity_provider() -> ProviderConfig {
     ProviderConfig {
         enabled: Some(true),
         models: vec![
+            "gemini-4-argon-high".to_string(),
+            "gemini-4-argon-medium".to_string(),
+            "gemini-4-argon-low".to_string(),
             "gemini-3.8-flash-high".to_string(),
             "gemini-3.8-flash-medium".to_string(),
             "gemini-3.8-flash-low".to_string(),
@@ -5030,6 +5033,14 @@ file = "prompts/template.md"
         let providers = ProvidersConfig::default();
 
         assert_eq!(providers.gemini.models.first().unwrap(), "gemini-4-argon");
+        assert_eq!(
+            providers.google_antigravity.models[..3],
+            [
+                "gemini-4-argon-high",
+                "gemini-4-argon-medium",
+                "gemini-4-argon-low"
+            ]
+        );
 
         assert_eq!(
             providers.meta.models,

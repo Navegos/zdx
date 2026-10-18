@@ -168,9 +168,12 @@ fn build_headers(access_token: &str) -> anyhow::Result<HeaderMap> {
     );
     headers.insert(
         "User-Agent",
-        // The backend gates the served model catalog on this client version:
-        // versions below 2.5.4 404 on gemini-3.7-flash-*.
-        HeaderValue::from_static("antigravity/2.5.4 darwin/arm64"),
+        // The backend gates the served model catalog on this client identity.
+        // Gemini 4 Argon is served only to the Antigravity CLI client
+        // (`antigravity/cli/<2.x>`); the desktop form (`antigravity/<v> darwin/arm64`)
+        // 404s on it at every version. Desktop versions below 2.5.4 also 404 on
+        // gemini-3.7-flash-*. Verified 2026-10-18.
+        HeaderValue::from_static(USER_AGENT),
     );
     headers.insert(
         "X-Goog-Api-Client",
@@ -187,11 +190,31 @@ fn build_headers(access_token: &str) -> anyhow::Result<HeaderMap> {
     Ok(headers)
 }
 
+/// User-Agent sent with every Antigravity request (see `build_headers`).
+const USER_AGENT: &str = "antigravity/cli/2.24.0";
+
+/// Thinking level baked into a Gemini 4 fixed-tier id (`gemini-4-argon-high`).
+///
+/// The backend honors the request's `thinkingLevel` over the tier suffix, and
+/// fixed-tier ids are registered non-reasoning (so the engine passes `Off`).
+/// Sending the suffix keeps each tier's effort what its name says.
+fn gemini_4_tier_level(model: &str) -> Option<&'static str> {
+    if !model.starts_with("gemini-4") {
+        return None;
+    }
+    ["low", "medium", "high"]
+        .into_iter()
+        .find(|tier| model.ends_with(&format!("-{tier}")))
+}
+
 fn antigravity_thinking_config(
     level: ThinkingLevel,
     model: &str,
     max_tokens: Option<u32>,
 ) -> GeminiThinkingConfig {
+    if let Some(tier) = gemini_4_tier_level(model) {
+        return GeminiThinkingConfig::Level(tier.to_string());
+    }
     let budget = if model.starts_with("claude-") {
         match level {
             ThinkingLevel::Off => 0,
@@ -234,6 +257,36 @@ pub fn build(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gemini_4_argon_tiers_send_their_own_level_whatever_the_zdx_level() {
+        for (model, tier) in [
+            ("gemini-4-argon-low", "low"),
+            ("gemini-4-argon-medium", "medium"),
+            ("gemini-4-argon-high", "high"),
+        ] {
+            for level in [ThinkingLevel::Off, ThinkingLevel::Low, ThinkingLevel::Max] {
+                assert!(
+                    matches!(
+                        antigravity_thinking_config(level, model, Some(65_536)),
+                        GeminiThinkingConfig::Level(ref l) if l == tier
+                    ),
+                    "{model} at {level:?}"
+                );
+            }
+        }
+        // An untiered Gemini 4 id keeps the ZDX level (never `minimal`).
+        assert!(matches!(
+            antigravity_thinking_config(ThinkingLevel::Off, "gemini-4-argon", Some(65_536)),
+            GeminiThinkingConfig::Level(ref l) if l == "low"
+        ));
+    }
+
+    #[test]
+    fn requests_identify_as_the_antigravity_cli_client() {
+        let headers = build_headers("token").unwrap();
+        assert_eq!(headers["User-Agent"], "antigravity/cli/2.24.0");
+    }
 
     #[test]
     fn gemini_3_7_fixed_tiers_clamp_minimal_up_to_low() {

@@ -580,6 +580,57 @@ input_images = true
 output_limit = 65536
 
 [[model]]
+id = "google-antigravity:gemini-4-argon-high"
+provider = "google-antigravity"
+display_name = "Gemini 4 Argon High"
+context_limit = 1048576
+
+[model.pricing]
+input = 0.0
+output = 0.0
+cache_read = 0.0
+cache_write = 0.0
+
+[model.capabilities]
+reasoning = false
+input_images = true
+output_limit = 65536
+
+[[model]]
+id = "google-antigravity:gemini-4-argon-medium"
+provider = "google-antigravity"
+display_name = "Gemini 4 Argon Medium"
+context_limit = 1048576
+
+[model.pricing]
+input = 0.0
+output = 0.0
+cache_read = 0.0
+cache_write = 0.0
+
+[model.capabilities]
+reasoning = false
+input_images = true
+output_limit = 65536
+
+[[model]]
+id = "google-antigravity:gemini-4-argon-low"
+provider = "google-antigravity"
+display_name = "Gemini 4 Argon Low"
+context_limit = 1048576
+
+[model.pricing]
+input = 0.0
+output = 0.0
+cache_read = 0.0
+cache_write = 0.0
+
+[model.capabilities]
+reasoning = false
+input_images = true
+output_limit = 65536
+
+[[model]]
 id = "google-antigravity:gemini-3.8-flash-high"
 provider = "google-antigravity"
 display_name = "Gemini 3.8 Flash High"

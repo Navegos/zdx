@@ -118,6 +118,31 @@ reasoning = false
 id = "google-antigravity:gemini-3.1-pro-low"
 reasoning = false
 
+# Gemini 4 Argon tiers on Antigravity. Unlike 3.8 Flash, the request's
+# thinkingLevel is sent from the tier suffix (the backend honors the request
+# level over the tier), so the id fixes the effort. Limits and image support
+# from the live fetchAvailableModels catalog (CLI client). Verified: 2026-10-18.
+[[override]]
+id = "google-antigravity:gemini-4-argon-high"
+reasoning = false
+input_images = true
+context_limit = 1048576
+output_limit = 65536
+
+[[override]]
+id = "google-antigravity:gemini-4-argon-medium"
+reasoning = false
+input_images = true
+context_limit = 1048576
+output_limit = 65536
+
+[[override]]
+id = "google-antigravity:gemini-4-argon-low"
+reasoning = false
+input_images = true
+context_limit = 1048576
+output_limit = 65536
+
 # Gemini 4 Argon (`gemini-4-argon`, Gemini API GA 2026-10-13): pinned to the current
 # introductory rate, valid through 2026-11-30. Cached input is 95% off input.
 # EXPIRES: from 2026-12-01 the standard rate is $4 input / $20 output ($0.20 cached);
