@@ -1,12 +1,14 @@
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use tokio_util::sync::CancellationToken;
 use zdx_engine::config::{Config, paths};
+use zdx_engine::telegram::flood::{TelegramApiError, TelegramTransportError};
 
 use crate::telegram::{Audio, Document, Message, PhotoSize, TelegramClient, Video, Voice};
 use crate::transcribe;
@@ -28,6 +30,14 @@ const MAX_AUDIO_BYTES: u64 = 25 * 1024 * 1024; // 25MB
 const MAX_DOCUMENT_BYTES: u64 = 25 * 1024 * 1024; // 25MB
 const MAX_VIDEO_BYTES: u64 = zdx_engine::media::MAX_INLINE_BYTES as u64;
 const SUPPORTED_IMAGE_MIMES: &[&str] = &["image/jpeg", "image/png", "image/gif", "image/webp"];
+/// Tries per Telegram file (`getFile` plus the file fetch). A slow link to
+/// Telegram drops single requests now and then; a fresh try usually works.
+const DOWNLOAD_ATTEMPTS: u32 = 3;
+/// Wait before retry `n` is `n` times this.
+#[cfg(not(test))]
+const DOWNLOAD_RETRY_DELAY: Duration = Duration::from_secs(2);
+#[cfg(test)]
+const DOWNLOAD_RETRY_DELAY: Duration = Duration::from_millis(10);
 
 pub(crate) struct AllowlistConfig<'a> {
     pub user_ids: &'a HashSet<i64>,
@@ -61,6 +71,24 @@ impl std::fmt::Display for AttachmentNotice {
 }
 
 impl std::error::Error for AttachmentNotice {}
+
+/// A Telegram attachment whose download still failed on a network or server
+/// error after every try. The message is not answered without it: the
+/// handler keeps the message and offers to load it again, because Telegram
+/// still has the file.
+#[derive(Debug)]
+pub(crate) struct DownloadUnavailable {
+    /// What the user sent, e.g. `voice message`.
+    pub label: String,
+}
+
+impl std::fmt::Display for DownloadUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} could not be downloaded from Telegram", self.label)
+    }
+}
+
+impl std::error::Error for DownloadUnavailable {}
 
 struct FileRef<'a> {
     id: &'a str,
@@ -97,12 +125,13 @@ struct AudioSource<'a> {
 
 ///
 /// # Errors
-/// Returns an error if the operation fails.
+/// [`DownloadUnavailable`] when a Telegram attachment could not be downloaded
+/// after every try; any other error if the operation fails.
 pub(crate) async fn parse_incoming_message(
     client: &TelegramClient,
     allowlist: AllowlistConfig<'_>,
     config: &Config,
-    message: Message,
+    message: &Message,
     cancel_token: Option<&CancellationToken>,
 ) -> Result<Option<IncomingMessage>> {
     let target = MessageTarget {
@@ -111,12 +140,12 @@ pub(crate) async fn parse_incoming_message(
         thread: message.effective_thread_id(),
     };
 
-    let Some(user_id) = validate_access(client, allowlist, &message, &target).await? else {
+    let Some(user_id) = validate_access(client, allowlist, message, &target).await? else {
         return Ok(None);
     };
 
-    let mut text = extract_text(&message);
-    let attachments = collect_attachments(client, config, &message, &target, cancel_token).await?;
+    let mut text = extract_text(message);
+    let attachments = collect_attachments(client, config, message, &target, cancel_token).await?;
     let AttachmentCollection {
         images,
         audios,
@@ -382,6 +411,12 @@ async fn push_attachment<T>(
         Err(err) if transcribe::is_operation_cancelled(&err) => return Err(err),
         Err(err) => {
             tracing::error!(err = %format!("{err:#}"), label, "Failed to load attachment");
+            if is_transient_download_error(&err) {
+                return Err(DownloadUnavailable {
+                    label: label.to_string(),
+                }
+                .into());
+            }
             // The raw error is not passed on: a download error carries the
             // file URL, which embeds the bot token.
             notices.push(match err.downcast_ref::<AttachmentNotice>() {
@@ -470,7 +505,7 @@ async fn load_image(
         .into());
     }
 
-    let (file_path, bytes) = download_file_bytes(client, source.id).await?;
+    let (file_path, bytes) = download_file_bytes(client, source.id, None).await?;
     let file_name = source
         .name
         .and_then(file_name_from_path)
@@ -540,7 +575,7 @@ async fn load_generic_document(
         return Ok(None);
     }
 
-    let (file_path, bytes) = download_file_bytes(client, &document.file_id).await?;
+    let (file_path, bytes) = download_file_bytes(client, &document.file_id, None).await?;
     if bytes.len() as u64 > MAX_DOCUMENT_BYTES {
         tracing::debug!(chat_id, "Downloaded document exceeds max size");
         return Ok(None);
@@ -585,7 +620,7 @@ async fn load_video(
         return too_large(size);
     }
 
-    let (file_path, bytes) = download_file_bytes(client, video.id).await?;
+    let (file_path, bytes) = download_file_bytes(client, video.id, None).await?;
     if bytes.len() as u64 > MAX_VIDEO_BYTES {
         return too_large(bytes.len() as u64);
     }
@@ -692,7 +727,7 @@ async fn load_audio_by_id(
         return Ok(None);
     }
 
-    let (file_path, bytes) = download_file_bytes(client, source.file_id).await?;
+    let (file_path, bytes) = download_file_bytes(client, source.file_id, cancel_token).await?;
     if bytes.len() as u64 > MAX_AUDIO_BYTES {
         tracing::debug!(chat_id, "Downloaded audio exceeds max size");
         return Ok(None);
@@ -728,13 +763,52 @@ async fn load_audio_by_id(
     }))
 }
 
-async fn download_file_bytes(client: &TelegramClient, file_id: &str) -> Result<(String, Vec<u8>)> {
+/// Downloads a Telegram file, trying again on a network or server error.
+async fn download_file_bytes(
+    client: &TelegramClient,
+    file_id: &str,
+    cancel_token: Option<&CancellationToken>,
+) -> Result<(String, Vec<u8>)> {
+    let mut attempt = 1;
+    loop {
+        match download_file_once(client, file_id).await {
+            Ok(file) => return Ok(file),
+            Err(err) if attempt < DOWNLOAD_ATTEMPTS && is_transient_download_error(&err) => {
+                tracing::warn!(attempt, err = %format!("{err:#}"), "Telegram download failed; trying again");
+                let delay = DOWNLOAD_RETRY_DELAY * attempt;
+                match cancel_token {
+                    Some(token) => tokio::select! {
+                        () = token.cancelled() => return Err(transcribe::OperationCancelled.into()),
+                        () = tokio::time::sleep(delay) => {}
+                    },
+                    None => tokio::time::sleep(delay).await,
+                }
+                attempt += 1;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+async fn download_file_once(client: &TelegramClient, file_id: &str) -> Result<(String, Vec<u8>)> {
     let file = client.get_file(file_id).await?;
     let file_path = file
         .file_path
         .ok_or_else(|| anyhow!("Telegram file missing file_path"))?;
     let bytes = client.download_file(&file_path).await?;
     Ok((file_path, bytes))
+}
+
+/// A failure another try can fix: no readable answer from Telegram, or a
+/// server error. A refusal such as "file is too big" is not one.
+fn is_transient_download_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause.is::<TelegramTransportError>()
+            || cause
+                .downcast_ref::<TelegramApiError>()
+                .and_then(|api| api.code)
+                .is_some_and(|code| code >= 500)
+    })
 }
 
 fn file_name_from_path(path: &str) -> Option<String> {
@@ -771,6 +845,8 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use axum::extract::Path as AxumPath;
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
     use axum::routing::{get, post};
     use axum::{Json, Router};
     use base64::Engine as _;
@@ -778,8 +854,9 @@ mod tests {
     use zdx_engine::config::Config;
 
     use super::{
-        AllowlistConfig, BASE64, INLINE_IMAGE_BYTES, INLINE_IMAGE_EDGE, MAX_VIDEO_BYTES,
-        TELEGRAM_DOWNLOAD_LIMIT_BYTES, extract_text, parse_incoming_message,
+        AllowlistConfig, BASE64, DOWNLOAD_ATTEMPTS, DownloadUnavailable, INLINE_IMAGE_BYTES,
+        INLINE_IMAGE_EDGE, MAX_VIDEO_BYTES, TELEGRAM_DOWNLOAD_LIMIT_BYTES, extract_text,
+        parse_incoming_message,
     };
     use crate::agent::build_user_text;
     use crate::telegram::{Message, TelegramClient};
@@ -855,8 +932,9 @@ mod tests {
 
     /// Fake Bot API. `files` maps a file id to its `file_path` and bytes; any
     /// other id is served as `videos/<id>.mp4` with fixed bytes, except
-    /// `broken`, which `getFile` rejects. Returns the base URL and the
-    /// `getFile` count.
+    /// `broken`, which `getFile` rejects; `flaky`, whose first file fetch
+    /// answers 502; and `down`, whose file fetch always answers 502. Returns
+    /// the base URL and the `getFile` count.
     async fn fake_telegram_with(
         files: HashMap<&'static str, (&'static str, Vec<u8>)>,
     ) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
@@ -869,6 +947,7 @@ mod tests {
         );
         let get_file_calls = Arc::new(AtomicUsize::new(0));
         let calls = Arc::clone(&get_file_calls);
+        let flaky_fetches = Arc::new(AtomicUsize::new(0));
         let app = Router::new()
             .route(
                 &format!("/bot{TOKEN}/getFile"),
@@ -900,11 +979,18 @@ mod tests {
                 &format!("/file/bot{TOKEN}/{{*path}}"),
                 get(move |AxumPath(path): AxumPath<String>| {
                     let by_path = Arc::clone(&by_path);
+                    let flaky_fetches = Arc::clone(&flaky_fetches);
                     async move {
+                        let first_flaky = path.contains("flaky")
+                            && flaky_fetches.fetch_add(1, Ordering::SeqCst) == 0;
+                        if first_flaky || path.contains("down") {
+                            return StatusCode::BAD_GATEWAY.into_response();
+                        }
                         by_path
                             .get(&path)
                             .cloned()
                             .unwrap_or_else(|| VIDEO_BYTES.to_vec())
+                            .into_response()
                     }
                 }),
             );
@@ -920,7 +1006,10 @@ mod tests {
         (format!("http://{addr}"), get_file_calls, server)
     }
 
-    async fn ingest(base_url: String, message: Message) -> Option<IncomingMessage> {
+    async fn try_ingest(
+        base_url: String,
+        message: Message,
+    ) -> anyhow::Result<Option<IncomingMessage>> {
         let client = TelegramClient::with_base_url(TOKEN.to_string(), base_url);
         let user_ids = HashSet::from([7]);
         let chat_ids = HashSet::from([42]);
@@ -931,11 +1020,14 @@ mod tests {
                 chat_ids: &chat_ids,
             },
             &Config::default(),
-            message,
+            &message,
             None,
         )
         .await
-        .expect("ingest message")
+    }
+
+    async fn ingest(base_url: String, message: Message) -> Option<IncomingMessage> {
+        try_ingest(base_url, message).await.expect("ingest message")
     }
 
     fn saved_video_path(incoming: &IncomingMessage) -> PathBuf {
@@ -1228,6 +1320,46 @@ mod tests {
             ]
         );
         assert!(!build_user_text(&incoming).contains(TOKEN));
+        server.abort();
+    }
+
+    /// One dropped download is tried again, so the voice message still
+    /// reaches the turn.
+    #[tokio::test]
+    async fn a_failed_download_is_tried_again() {
+        let _home = zdx_engine::test_support::temp_zdx_home();
+        let (base_url, get_file_calls, server) = fake_telegram().await;
+        let message = with(30, &json!({ "voice": { "file_id": "flaky" } }));
+
+        let incoming = ingest(base_url, message).await.expect("turn runs");
+        assert_eq!(get_file_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(incoming.audios.len(), 1);
+        assert!(incoming.notices.is_empty(), "{:?}", incoming.notices);
+        server.abort();
+    }
+
+    /// A download that keeps failing does not reach the agent as a notice:
+    /// the message is held so the user can load it again.
+    #[tokio::test]
+    async fn a_download_that_keeps_failing_holds_the_message() {
+        let _home = zdx_engine::test_support::temp_zdx_home();
+        let (base_url, get_file_calls, server) = fake_telegram().await;
+        let message = with(
+            31,
+            &json!({ "caption": "listen to this", "voice": { "file_id": "down" } }),
+        );
+
+        let Err(err) = try_ingest(base_url, message).await else {
+            panic!("message ran a turn");
+        };
+        let unavailable = err
+            .downcast_ref::<DownloadUnavailable>()
+            .expect("download unavailable");
+        assert_eq!(unavailable.label, "voice message");
+        assert_eq!(
+            get_file_calls.load(Ordering::SeqCst),
+            DOWNLOAD_ATTEMPTS as usize
+        );
         server.abort();
     }
 }

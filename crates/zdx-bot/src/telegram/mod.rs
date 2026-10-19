@@ -487,11 +487,15 @@ impl TelegramClient {
             .await
             .map_err(|err| TelegramTransportError::from_reqwest("downloadFile", err))?;
 
-        if !response.status().is_success() {
-            bail!(
-                "Telegram file download failed with status {}",
-                response.status()
-            );
+        let status = response.status();
+        if !status.is_success() {
+            return Err(TelegramApiError {
+                method: "downloadFile".to_string(),
+                code: Some(status.as_u16()),
+                description: format!("file download failed with status {status}"),
+                retry_after: None,
+            }
+            .into());
         }
 
         let bytes = response

@@ -402,7 +402,7 @@ async fn handle_callback_query(
     } else if let Some(rest) = data.strip_prefix("fu:") {
         followups::handle_callback(context, chat_queues, client, &callback, rest).await;
     } else if let Some(rest) = data.strip_prefix("retry:") {
-        retry::handle_callback(context, client, &callback, rest).await;
+        retry::handle_callback(context, chat_queues, client, &callback, rest).await;
     } else if let Some(rest) = data.strip_prefix("wk:") {
         orchestrator::handle_callback(context.as_ref(), client, &callback, rest).await;
     } else if let Some(rest) = data.strip_prefix("stg:") {

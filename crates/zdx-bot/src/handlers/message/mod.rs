@@ -61,17 +61,26 @@ pub(crate) async fn handle_message(
         user_ids: ctx.allowlist_user_ids(),
         chat_ids: ctx.allowlist_chat_ids(),
     };
-    let Some(incoming) = parse_message_with_status(
+    let parsed = parse_message_with_status(
         ctx,
         allowlist,
         &bot_config,
-        message,
+        &message,
         provisional_status.as_ref(),
     )
-    .await?
-    else {
-        cleanup_provisional_status(ctx, None, provisional_status).await;
-        return Ok(());
+    .await;
+    let incoming = match parsed {
+        Ok(Some(incoming)) => incoming,
+        Ok(None) => {
+            cleanup_provisional_status(ctx, None, provisional_status).await;
+            return Ok(());
+        }
+        Err(err) => {
+            let unavailable = err.downcast::<ingest::DownloadUnavailable>()?;
+            cleanup_provisional_status(ctx, Some(message.chat.id), provisional_status).await;
+            crate::retry::offer_download_retry(ctx, message, &unavailable.label).await;
+            return Ok(());
+        }
     };
 
     let reply_ctx = build_reply_context(
@@ -191,7 +200,7 @@ async fn parse_message_with_status(
     context: &BotContext,
     allowlist: AllowlistConfig<'_>,
     bot_config: &zdx_engine::config::Config,
-    message: Message,
+    message: &Message,
     provisional_status: Option<&TurnStatus>,
 ) -> Result<Option<crate::types::IncomingMessage>> {
     match ingest::parse_incoming_message(
