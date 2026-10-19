@@ -555,10 +555,10 @@ mod reply_target_tests {
     }
 
     /// The production failure: a `[worker update]` carries an internal id
-    /// near `i64::MAX`. Its reply must quote nothing, so the rich document
-    /// message is accepted in the right topic with no fallback.
+    /// near `i64::MAX`. Its reply must quote nothing, so the text and the
+    /// document are accepted in the right topic.
     #[tokio::test]
-    async fn a_synthetic_update_reply_quotes_nothing_and_stays_rich() {
+    async fn a_synthetic_update_reply_quotes_nothing() {
         let _home = zdx_engine::test_support::temp_zdx_home();
         let update = incoming(i64::MAX - 3, Some(7));
         let reply_ctx = build_reply_context(&update, false, true);
@@ -568,56 +568,147 @@ mod reply_target_tests {
 
         let (seen, items) = send_document_reply(&reply_ctx, &update).await;
         let methods: Vec<&str> = seen.iter().map(|s| s.method.as_str()).collect();
-        assert_eq!(methods, ["sendRichMessage"], "no fallback");
-        let body = &seen[0].body;
-        assert!(!body.contains("reply_parameters"));
-        assert!(!body.contains("reply_to_message_id"));
-        assert!(!body.contains(&(i64::MAX - 3).to_string()));
-        assert!(body.contains("name=\"message_thread_id\"\r\n\r\n7"));
-        assert!(body.contains("fu:0"), "footer keyboard on the rich message");
+        assert_eq!(methods, ["sendMessage", "sendDocument"]);
+        for request in &seen {
+            assert!(!request.body.contains("reply_parameters"));
+            assert!(!request.body.contains("reply_to_message_id"));
+            assert!(!request.body.contains(&(i64::MAX - 3).to_string()));
+        }
+        assert!(seen[0].body.contains("\"message_thread_id\":7"));
+        assert!(seen[1].body.contains("name=\"message_thread_id\"\r\n\r\n7"));
+        assert!(seen[0].body.contains("fu:0"), "follow-ups on the text");
         assert_eq!(items.len(), 2);
         assert!(
             items
                 .iter()
                 .all(|(status, _)| *status == DeliveryStatus::Sent)
         );
-        assert!(items[0].1.is_some() && items[0].1 == items[1].1);
     }
 
     /// The fake refuses what Telegram refused, so the test above would catch
-    /// a regression: the old context quoted the internal id and fell back.
+    /// a regression: the old context quoted the internal id.
     #[tokio::test]
-    async fn the_old_synthetic_reply_target_is_refused_and_falls_back() {
+    async fn the_old_synthetic_reply_target_is_refused() {
         let _home = zdx_engine::test_support::temp_zdx_home();
         let update = incoming(i64::MAX - 3, Some(7));
         let old = build_reply_context(&update, false, false);
         assert_eq!(old.reply_to_message_id, Some(i64::MAX - 3));
 
-        let (seen, _) = send_document_reply(&old, &update).await;
+        let (seen, items) = send_document_reply(&old, &update).await;
         let methods: Vec<&str> = seen.iter().map(|s| s.method.as_str()).collect();
-        assert_eq!(methods, ["sendRichMessage", "sendDocument"]);
+        // Both refused, then the partial-delivery summary.
+        assert_eq!(methods, ["sendMessage", "sendDocument", "sendMessage"]);
+        assert!(
+            items
+                .iter()
+                .all(|(status, _)| *status == DeliveryStatus::Failed)
+        );
     }
 
     #[tokio::test]
-    async fn a_real_user_reply_keeps_its_target_on_the_rich_message() {
+    async fn a_real_user_reply_keeps_its_target() {
         let _home = zdx_engine::test_support::temp_zdx_home();
         let message = incoming(42, Some(7));
         let reply_ctx = build_reply_context(&message, false, false);
         assert_eq!(reply_ctx.reply_to_message_id, Some(42));
 
         let (seen, items) = send_document_reply(&reply_ctx, &message).await;
-        assert_eq!(seen.len(), 1);
-        assert_eq!(seen[0].method, "sendRichMessage");
+        assert_eq!(seen.len(), 2);
+        assert!(seen[0].body.contains("\"reply_to_message_id\":42"));
         assert!(
-            seen[0]
+            seen[1]
                 .body
-                .contains("{\"message_id\":42,\"allow_sending_without_reply\":true}")
+                .contains("name=\"reply_to_message_id\"\r\n\r\n42")
         );
         assert!(
             items
                 .iter()
                 .all(|(status, _)| *status == DeliveryStatus::Sent)
         );
+    }
+
+    /// End to end through the real reply path: a resumed topic (aliased to
+    /// its source thread) replies with its own file and a worker's file of the
+    /// same name. Each document gets a link naming the *topic*, so feedback
+    /// returns there, and the file's key, which the topic's artifact list (read
+    /// through the alias, as the Mini App does) resolves to that exact file.
+    #[tokio::test]
+    async fn artifact_links_name_the_topic_and_resolve_to_the_exact_file() {
+        use zdx_engine::core::artifacts::{artifact_dir_for_thread, list_thread_artifacts};
+
+        let _home = zdx_engine::test_support::temp_zdx_home();
+        let fake = FakeTelegram::start().await;
+        let mut config = zdx_engine::config::Config::default();
+        config.telegram.server = Some(zdx_engine::config::TelegramServerConfig {
+            enabled: true,
+            port: 4141,
+            mini_app_url: Some("https://t.me/zdx_test_bot/app".to_string()),
+        });
+        let context = BotContext::for_test(
+            TelegramClient::with_base_url(TOKEN.to_string(), fake.base_url.clone()),
+            config,
+            std::env::temp_dir(),
+        );
+
+        let source = format!("resumed-source-{}", uuid::Uuid::new_v4());
+        let worker = format!("worker-{}", uuid::Uuid::new_v4());
+        let topic_thread = super::thread_id_for_chat(CHAT, Some(7));
+        Thread::with_id(topic_thread.clone())
+            .expect("topic thread")
+            .set_alias(Some(source.clone()))
+            .expect("alias");
+        let own = artifact_dir_for_thread(Some(&source)).join("report.html");
+        let theirs = artifact_dir_for_thread(Some(&worker)).join("report.html");
+        for (path, body) in [(&own, "own"), (&theirs, "worker")] {
+            std::fs::create_dir_all(path.parent().expect("dir")).expect("dir");
+            std::fs::write(path, body).expect("write");
+        }
+        let final_text = format!(
+            "Both reports.\n<media>{}</media>\n<media>{}</media>",
+            own.display(),
+            theirs.display()
+        );
+        let mut thread = Thread::with_id(source.clone()).expect("thread");
+        thread
+            .append(&ThreadEvent::assistant_message(final_text.clone()))
+            .expect("append");
+        let update = incoming(i64::MAX - 9, Some(7));
+        let reply_ctx = build_reply_context(&update, false, true);
+        send_final_response(
+            &context,
+            &update,
+            &reply_ctx,
+            None,
+            &final_text,
+            &source,
+            &[],
+            &mut thread,
+        )
+        .await
+        .expect("send final response");
+
+        let seen = fake.seen();
+        let methods: Vec<&str> = seen.iter().map(|s| s.method.as_str()).collect();
+        assert_eq!(methods, ["sendMessage", "sendDocument", "sendDocument"]);
+        let listed = list_thread_artifacts(&super::resolve_effective_thread_id(&topic_thread))
+            .expect("artifacts");
+        for (request, (expected, body)) in
+            seen[1..].iter().zip([(&own, "own"), (&theirs, "worker")])
+        {
+            assert!(request.body.contains(body));
+            let marker = "startapp=a_";
+            let at = request.body.find(marker).expect("open artifact link") + marker.len();
+            let rest = &request.body[at..];
+            let end = rest.find('"').expect("url end");
+            let (key, thread) = rest[..end].split_once('_').expect("key and thread");
+            assert_eq!(thread, topic_thread, "the receiving topic, not the source");
+            let row = listed.iter().find(|row| row.key == key).expect("listed");
+            assert_eq!(row.path, expected.to_string_lossy());
+            assert!(!rest[..end].contains('/'), "no path in the link");
+        }
+        // The link's thread maps back to the receiving topic, which is where
+        // Mini App feedback for it is routed.
+        assert_eq!(super::parse_topic_thread_id(&topic_thread), Some((CHAT, 7)));
     }
 
     #[test]

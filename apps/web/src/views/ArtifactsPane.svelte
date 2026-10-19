@@ -1,6 +1,8 @@
 <script lang="ts">
   import { untrack } from "svelte";
   import { api, formatBytes, ApiError } from "$lib/api";
+  import { findLinkedArtifact } from "$lib/artifactLink";
+  import { router } from "$lib/router.svelte";
   import type { ArtifactItem } from "$lib/types";
   import ArtifactPreview from "../components/ArtifactPreview.svelte";
   import Icon from "../components/Icon.svelte";
@@ -16,6 +18,8 @@
   let error = $state("");
   let loading = $state(true);
   let preview = $state<ArtifactItem | null>(null);
+  /** Why a file's `Open artifact` link could not open it, if it could not. */
+  let linkNotice = $state("");
   /** Thread the current `items` belong to; also the in-flight staleness key. */
   let loadedFor = $state<string | null>(null);
 
@@ -32,11 +36,27 @@
       const response = await api.artifacts(target);
       if (loadedFor !== target) return;
       items = response.artifacts;
+      openLinked(target, response.artifacts);
     } catch (e) {
       if (loadedFor === target) error = e instanceof ApiError ? e.message : String(e);
     } finally {
       if (loadedFor === target) loading = false;
     }
+  }
+
+  // An `Open artifact` link names one file by its projection key; open it
+  // with the same preview (and feedback destination) as a tap on its row.
+  function openLinked(target: string, list: ArtifactItem[]) {
+    const key = router.takeLinkedArtifact(target);
+    if (!key) return;
+    const item = findLinkedArtifact(list, key);
+    if (item?.exists) {
+      preview = item;
+      return;
+    }
+    linkNotice = item
+      ? `${item.name} is no longer available.`
+      : "The linked file is not in this thread's artifact list. It may no longer be part of this thread, or be older than the newest 500 files the list shows.";
   }
 
   async function download(item: ArtifactItem) {
@@ -60,14 +80,25 @@
     const target = threadId;
     untrack(() => {
       items = [];
+      linkNotice = "";
       void target;
       void load();
     });
+    // A response that lands after this pane is gone (or moved to another
+    // thread) is dropped, so it cannot take a link meant for the next pane.
+    return () => {
+      loadedFor = null;
+    };
   });
 </script>
 
 <div class="scroll-area h-full px-3 py-2">
   <div class="mx-auto flex max-w-3xl flex-col gap-2 pb-6">
+    {#if linkNotice}
+      <p class="rounded-md border border-border px-3 py-2 text-xs text-muted-foreground" data-link-notice>
+        {linkNotice}
+      </p>
+    {/if}
     {#if loading}
       <p class="py-8 text-center text-xs text-muted-foreground">Loading artifacts…</p>
     {:else if error}

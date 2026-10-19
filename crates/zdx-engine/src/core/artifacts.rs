@@ -14,11 +14,13 @@
 //! media-tag parsing themselves.
 
 use std::collections::{BTreeMap, HashMap};
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 use crate::config::paths;
 use crate::core::thread_persistence::{ThreadEvent, load_thread_events};
@@ -87,6 +89,9 @@ pub struct ArtifactAttachment {
 /// One row of the thread Artifacts tab.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Artifact {
+    /// Opaque, stable id of this file within the thread (see
+    /// [`artifact_key`]). Deep links name a file by it, never by its path.
+    pub key: String,
     pub name: String,
     /// Absolute path, passed back to the download endpoint as `?path=`.
     pub path: String,
@@ -210,7 +215,10 @@ pub fn extract_media_paths(text: &str) -> Vec<String> {
     out
 }
 
-fn clean_media_path(raw: &str) -> Option<String> {
+/// The absolute path one `<media>` value names, or `None` when it is not an
+/// absolute path. The bot's send path uses this same rule, so the file it
+/// sends is the file this projection lists.
+pub fn clean_media_path(raw: &str) -> Option<String> {
     let candidate = raw
         .trim()
         .trim_matches('`')
@@ -224,6 +232,41 @@ fn clean_media_path(raw: &str) -> Option<String> {
         Some(candidate.to_string())
     } else {
         None
+    }
+}
+
+/// Length of an [`artifact_key`], in lowercase hex characters (64 bits).
+pub const ARTIFACT_KEY_LEN: usize = 16;
+
+/// Opaque id of the file at `path`: a SHA-256 prefix of its lexically
+/// normalized absolute path, the same string the projection dedupes on. It
+/// identifies a file, so two files with the same name in different places get
+/// different keys. It does not embed the raw path. It is an opaque lookup
+/// identifier, not an authorization: a surface looks it up in one thread's
+/// [`list_thread_artifacts`], read with that surface's own access checks. A
+/// file outside that list (for example past its [`MAX_ARTIFACT_FILES`] cap)
+/// is not found, never matched to another row.
+pub fn artifact_key(path: &Path) -> String {
+    let normalized = normalize_absolute(path);
+    let digest = Sha256::digest(normalized.to_string_lossy().as_bytes());
+    let mut key = String::with_capacity(ARTIFACT_KEY_LEN);
+    for byte in &digest[..ARTIFACT_KEY_LEN / 2] {
+        let _ = write!(key, "{byte:02x}");
+    }
+    key
+}
+
+/// Whether the projection's (lexical) path for `path` is the file the
+/// filesystem opens at `path`. They differ only when a `..` steps back out of
+/// a symlinked directory; then a key would name another file than the one
+/// sent, so senders skip the link. `false` when either side does not resolve.
+pub fn lexical_path_is_physical(path: &Path) -> bool {
+    match (
+        fs::canonicalize(path),
+        fs::canonicalize(normalize_absolute(path)),
+    ) {
+        (Ok(physical), Ok(lexical)) => physical == lexical,
+        _ => false,
     }
 }
 
@@ -388,6 +431,7 @@ fn list_with(
         by_key.insert(
             key.clone(),
             Artifact {
+                key: artifact_key(key_path),
                 name,
                 path: key,
                 rel: entry.rel,
@@ -421,6 +465,7 @@ fn list_with(
         by_key.insert(
             key.clone(),
             Artifact {
+                key: artifact_key(&path),
                 name: attachment.name,
                 path: key.clone(),
                 rel,
@@ -582,6 +627,86 @@ mod tests {
         let unlinked_row = artifacts.iter().find(|a| a.name == "notes.txt").unwrap();
         assert_eq!(unlinked_row.source, ArtifactSource::Generated);
         assert!(unlinked_row.message_sequences.is_empty());
+    }
+
+    /// A deep link names a file by key: same-named files in different places
+    /// (here a worker's file sent by its parent) get different keys, the key a
+    /// sender derives from the raw `<media>` path matches the listed row, and
+    /// the key does not carry the path.
+    #[test]
+    fn keys_identify_files_by_path_not_name() {
+        let _home = crate::test_support::temp_zdx_home();
+        let thread_id = format!("artifacts-keys-{}", uuid::Uuid::new_v4());
+        let worker_id = format!("artifacts-keys-worker-{}", uuid::Uuid::new_v4());
+        let own = artifact_dir_for_thread(Some(&thread_id)).join("report.html");
+        let worker = artifact_dir_for_thread(Some(&worker_id)).join("report.html");
+        for path in [&own, &worker] {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "<p>x</p>").unwrap();
+        }
+        let raw_worker = format!(
+            "{}/../{}/report.html",
+            worker.parent().unwrap().display(),
+            worker_id
+        );
+        let mut thread = Thread::with_id(thread_id.clone()).unwrap();
+        thread
+            .append(&ThreadEvent::assistant_message(format!(
+                "<media>{}</media><media>{raw_worker}</media>",
+                own.display()
+            )))
+            .unwrap();
+
+        let artifacts = list_thread_artifacts(&thread_id).unwrap();
+        assert_eq!(artifacts.len(), 2);
+        let own_key = artifact_key(&own);
+        let worker_key = artifact_key(Path::new(&raw_worker));
+        assert_ne!(own_key, worker_key);
+        assert_eq!(worker_key, artifact_key(&worker));
+        for (key, path) in [(&own_key, &own), (&worker_key, &worker)] {
+            assert_eq!(key.len(), ARTIFACT_KEY_LEN);
+            assert!(
+                key.bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            );
+            let row = artifacts.iter().find(|a| &a.key == key).unwrap();
+            assert_eq!(row.path, path.to_string_lossy());
+            assert!(!key.contains("report"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dotdot_through_a_symlink_is_not_the_listed_file() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!("artifacts-link-{}", uuid::Uuid::new_v4()));
+        let base = root.join("base");
+        let other = root.join("other/subdir");
+        fs::create_dir_all(&base).unwrap();
+        fs::create_dir_all(&other).unwrap();
+        fs::write(base.join("report.html"), "lexical").unwrap();
+        fs::write(root.join("other/report.html"), "physical").unwrap();
+        symlink(&other, base.join("link")).unwrap();
+
+        assert!(lexical_path_is_physical(&base.join("report.html")));
+        assert!(lexical_path_is_physical(&base.join("./report.html")));
+        assert!(!lexical_path_is_physical(&base.join("link/../report.html")));
+        assert!(!lexical_path_is_physical(&base.join("missing.html")));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn media_values_are_cleaned_the_same_way_for_sending_and_listing() {
+        assert_eq!(
+            clean_media_path("\"/tmp/report.html \"").as_deref(),
+            Some("/tmp/report.html")
+        );
+        assert_eq!(
+            clean_media_path(" /tmp/a.pdf; ").as_deref(),
+            Some("/tmp/a.pdf")
+        );
+        assert_eq!(clean_media_path("relative/a.pdf"), None);
     }
 
     #[test]

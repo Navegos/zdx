@@ -115,7 +115,9 @@ fn answer(state: &Mutex<State>, method: &str, body: &[u8]) -> Response {
         .get_mut(method)
         .and_then(VecDeque::pop_front)
         .unwrap_or_else(|| {
-            if quotes_an_internal_message_id(method, body) {
+            if text_is_too_long(method, body) {
+                Reply::Error(400, "Bad Request: message is too long", None)
+            } else if quotes_an_internal_message_id(method, body) {
                 Reply::Error(
                     400,
                     "Bad Request: field \"message_id\" must be a valid Number",
@@ -161,25 +163,54 @@ fn answer(state: &Mutex<State>, method: &str, body: &[u8]) -> Response {
     }
 }
 
-/// Mirrors the production refusal seen for synthetic prompts: a rich message
-/// whose `reply_parameters` quote an internal countdown id (near `i64::MAX`,
-/// beyond what Telegram accepts as a number). Only that form field is read,
-/// never uploaded file bytes.
+/// Mirrors the production refusal seen for synthetic prompts: a send whose
+/// reply target quotes an internal countdown id (near `i64::MAX`, beyond what
+/// Telegram accepts as a number), as `reply_to_message_id` or inside
+/// `reply_parameters`, in a JSON or multipart body. Only those fields are
+/// read, never uploaded file bytes.
 fn quotes_an_internal_message_id(method: &str, body: &[u8]) -> bool {
     const MAX_SAFE_ID: u64 = (1 << 53) - 1;
-    const FIELD: &str = "name=\"reply_parameters\"\r\n\r\n";
-    if method != "sendRichMessage" {
+    if !method.starts_with("send") {
         return false;
     }
-    let body = String::from_utf8_lossy(body);
-    let Some(start) = body.find(FIELD).map(|at| at + FIELD.len()) else {
-        return false;
+    let too_big = |value: Option<&Value>| {
+        value
+            .and_then(Value::as_u64)
+            .is_some_and(|id| id > MAX_SAFE_ID)
     };
-    let end = body[start..]
-        .find("\r\n")
-        .map_or(body.len(), |at| start + at);
-    serde_json::from_str::<Value>(&body[start..end])
-        .ok()
-        .and_then(|value| value.get("message_id").and_then(Value::as_u64))
-        .is_some_and(|id| id > MAX_SAFE_ID)
+    if let Ok(json) = serde_json::from_slice::<Value>(body) {
+        return too_big(json.get("reply_to_message_id"))
+            || too_big(json.pointer("/reply_parameters/message_id"));
+    }
+    let body = String::from_utf8_lossy(body);
+    let field = |name: &str| -> Option<Value> {
+        let marker = format!("name=\"{name}\"\r\n\r\n");
+        let start = body.find(&marker)? + marker.len();
+        let end = body[start..]
+            .find("\r\n")
+            .map_or(body.len(), |at| start + at);
+        serde_json::from_str(&body[start..end]).ok()
+    };
+    too_big(field("reply_to_message_id").as_ref())
+        || too_big(
+            field("reply_parameters")
+                .as_ref()
+                .and_then(|value| value.get("message_id")),
+        )
+}
+
+/// Telegram refuses `sendMessage` text over 4096 characters after entity
+/// parsing. The fake is stricter: it measures the raw text (tags included) in
+/// UTF-16 units, which is what the bot's split guarantees so that the
+/// plain-text fallback fits too.
+fn text_is_too_long(method: &str, body: &[u8]) -> bool {
+    method == "sendMessage"
+        && serde_json::from_slice::<Value>(body)
+            .ok()
+            .and_then(|json| {
+                json.get("text")
+                    .and_then(Value::as_str)
+                    .map(|text| text.encode_utf16().count())
+            })
+            .is_some_and(|len| len > 4096)
 }

@@ -1,7 +1,8 @@
 use std::fmt::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
+use zdx_engine::core::artifacts;
 use zdx_engine::core::delivery::{self, DeliveryItem, DeliveryRecord, DeliveryStatus};
 use zdx_engine::core::thread_persistence::{self, Thread, ThreadEvent};
 use zdx_engine::telegram::flood::{self, FailureClass};
@@ -12,14 +13,17 @@ use super::media::{
     send_media_file,
 };
 use crate::bot::context::BotContext;
-use crate::telegram::markdown::{rich_shape, telegram_html_to_rich_html, visible_utf16_len};
+use crate::telegram::markdown::{split_telegram_html, visible_utf16_len};
 use crate::telegram::{
-    InlineKeyboardMarkup, MediaSend, Message, ReplyParameters, TelegramClient, TextSend,
-    is_invalid_reply_error, rich_document_id,
+    InlineKeyboardButton, InlineKeyboardMarkup, MediaSend, Message, ReplyParameters,
+    TelegramClient, TextSend, is_invalid_reply_error,
 };
 
 /// Telegram's caption limit, in characters after entity parsing.
 const MAX_CAPTION_LEN: usize = 1024;
+/// Telegram's `sendMessage` text limit. Longer reply text is split into
+/// several messages (`markdown::split_telegram_html`).
+const MAX_MESSAGE_LEN: usize = 4096;
 
 /// Delivers a turn's final reply and records what reached the chat.
 ///
@@ -42,16 +46,20 @@ pub(super) async fn send_final_response(
 ) -> Result<()> {
     let parsed = parse_final_response(final_text);
     let has_text = !parsed.text.trim().is_empty();
+    let text_parts = if has_text {
+        let text = with_worker_links(context, incoming.chat_id, touched_workers, &parsed.text);
+        let text = with_thread_link(context, incoming.chat_id, thread_id, &text);
+        split_telegram_html(&text, MAX_MESSAGE_LEN)
+    } else {
+        Vec::new()
+    };
 
     // Mark the delivery as running and write its pending record before any
     // await, so a Mini App client polling the thread keeps polling from the
     // first moment until the outcome lands (see `delivery_tracker`).
     let delivery = (has_text || !parsed.media_paths.is_empty()).then(|| {
         let running = context.active_deliveries().start(thread_id);
-        let mut items = Vec::new();
-        if has_text {
-            items.push(DeliveryItem::text());
-        }
+        let mut items = text_items(text_parts.len());
         items.extend(
             parsed
                 .media_paths
@@ -91,24 +99,20 @@ pub(super) async fn send_final_response(
         return Ok(());
     };
 
-    let text = has_text.then(|| {
-        let text = with_worker_links(context, incoming.chat_id, touched_workers, &parsed.text);
-        with_thread_link(context, incoming.chat_id, thread_id, &text)
-    });
-
-    // Buttons ride on the reply text (or the captioned file); a reply without
-    // text keeps the separate suggestions message.
+    // Follow-ups ride on the reply text (or the captioned file); a reply
+    // without text keeps the separate suggestions message.
     let keyboard = if has_text {
         crate::followups::keyboard(&parsed.followups)
     } else {
         None
     };
+    let files = reply_files(context, incoming.chat_id, reply_ctx, &parsed.media_paths);
     let target = ReplyTarget::from_context(incoming.chat_id, reply_ctx);
     let keyboard_message = deliver_reply(
         &context.client().reliable(),
         &target,
-        text.as_deref(),
-        &parsed.media_paths,
+        &text_parts,
+        &files,
         keyboard.as_ref(),
         &mut record,
     )
@@ -136,6 +140,44 @@ pub(super) async fn send_final_response(
 
     send_delivery_summary(context, incoming.chat_id, reply_ctx.topic_id, &record).await;
     Ok(())
+}
+
+/// One delivery item per message of reply text: plain `text` when it fits one
+/// message, numbered parts when it was split.
+fn text_items(parts: usize) -> Vec<DeliveryItem> {
+    match parts {
+        0 => Vec::new(),
+        1 => vec![DeliveryItem::text()],
+        total => (1..=total)
+            .map(|index| DeliveryItem::text_part(index, total))
+            .collect(),
+    }
+}
+
+/// Reply files with their `Open artifact` links. The links name the topic
+/// that receives the reply (its session id, before any `alias_to` hop), not
+/// the thread that made the file: the topic's artifact list includes every
+/// file its replies sent, a worker's included, and feedback sent from the
+/// preview is routed back to that topic. A file whose listed (lexical) path
+/// is not the file sent gets no link rather than one to another file.
+fn reply_files(
+    context: &BotContext,
+    chat_id: i64,
+    reply_ctx: &ReplyContext,
+    paths: &[PathBuf],
+) -> Vec<ReplyFile> {
+    let base = super::mini_app_base_url(context, chat_id);
+    let topic_thread = super::thread_id_for_chat(chat_id, reply_ctx.topic_id);
+    paths
+        .iter()
+        .map(|path| ReplyFile {
+            path: path.clone(),
+            open_url: base
+                .as_deref()
+                .filter(|_| artifacts::lexical_path_is_physical(path))
+                .and_then(|base| artifact_link(base, &topic_thread, path)),
+        })
+        .collect()
 }
 
 /// Posts one summary after a partial delivery, through the same reliable
@@ -242,49 +284,58 @@ impl ReplyTarget {
     }
 }
 
+/// One file of a reply, with the Mini App link that opens this exact file
+/// (`None` when the Mini App is not configured for the chat, or no link fits).
+#[derive(Debug, Clone)]
+pub(super) struct ReplyFile {
+    pub(super) path: PathBuf,
+    pub(super) open_url: Option<String>,
+}
+
 /// Sends the reply text and files, filling in each item's status in
-/// `record` (items: optional text first, then one per file, in order).
-/// Returns the id of the message that carries `keyboard`, if it was sent.
+/// `record` (items: one per text part first, then one per file, in order).
+/// Returns the id of the message that carries `followups`, if it was sent.
 ///
-/// Text with one or more documents (no photos, voice notes, or audio) that
-/// fits the rich-message limits goes out as one rich message: the text, then
-/// the documents, then the keyboard. If Telegram refuses that message, or it
-/// cannot be built (a file too large to upload), the reply falls back to the
-/// paths below; a flood refusal or an unknown outcome does not fall back.
-/// A single file whose complete caption fits Telegram's limit is sent with
-/// the text as its caption (one message instead of two). Otherwise text goes
-/// first and files follow. After a flood refusal that the retry policy could
-/// not absorb, the remaining items are not attempted. An ambiguous failure is
-/// recorded as unknown and never resent.
+/// `text` is the reply text already split into messages that fit
+/// (`split_telegram_html`); empty when there is none. The parts go out in
+/// order and the follow-ups ride on the last one, so they appear once, after
+/// the whole explanation. A refused or unknown part does not stop the parts
+/// and files after it (each keeps its own outcome).
+///
+/// Follow-ups (what the agent can do next) ride on the reply text; every file
+/// is its own message, carrying its own `Open artifact` button (file
+/// actions). Documents are never merged into one message and never get the
+/// reply as a caption: a single photo, voice note, or audio file whose
+/// complete caption fits Telegram's limit is sent with the text as its caption
+/// (one message instead of two), and that message carries both the file's
+/// button and the follow-ups. Buttons always go out with the message they
+/// belong to; no request is spent only to add them. After a flood refusal that
+/// the retry policy could not absorb, the remaining items are not attempted.
+/// An ambiguous failure is recorded as unknown and never resent.
 pub(super) async fn deliver_reply(
     client: &TelegramClient,
     target: &ReplyTarget,
-    text: Option<&str>,
-    files: &[PathBuf],
-    keyboard: Option<&InlineKeyboardMarkup>,
+    text: &[String],
+    files: &[ReplyFile],
+    followups: Option<&InlineKeyboardMarkup>,
     record: &mut DeliveryRecord,
 ) -> Option<i64> {
-    let file_offset = usize::from(text.is_some());
-    for (idx, path) in files.iter().enumerate() {
-        if !is_valid_media_path(path) {
+    let file_offset = text.len();
+    for (idx, file) in files.iter().enumerate() {
+        if !is_valid_media_path(&file.path) {
             record.items[file_offset + idx].mark_failed("file not found or not a regular file");
         }
     }
 
-    if let Some(text) = text
-        && rich_document_layout(text, files, record)
-        && let Some(done) = send_rich_reply(client, target, text, files, keyboard, record).await
-    {
-        return done;
-    }
-
-    if let Some(text) = text
-        && let [path] = files
+    if let [text] = text
+        && let [file] = files
         && record.items[1].status == DeliveryStatus::Pending
+        && takes_reply_caption(&file.path)
         && visible_utf16_len(text) <= MAX_CAPTION_LEN
     {
-        let options = target.media_options(Some(text), keyboard);
-        match send_media_file(client, target.chat_id, path, &options).await {
+        let keyboard = captioned_keyboard(file.open_url.as_deref(), followups);
+        let options = target.media_options(Some(text), keyboard.as_ref());
+        match send_media_file(client, target.chat_id, &file.path, &options).await {
             Ok(message) => {
                 record.items[0].mark_sent(Some(message.id));
                 record.items[1].mark_sent(Some(message.id));
@@ -307,7 +358,7 @@ pub(super) async fn deliver_reply(
                     // The file itself was refused; the text can still go out.
                     FailureClass::Rejected | FailureClass::NotSent => {
                         record.items[1].mark_failed(&error);
-                        let sent = send_reply_text(client, target, text, keyboard).await;
+                        let sent = send_reply_text(client, target, text, followups).await;
                         return settle(&mut record.items[0], sent).ok().flatten();
                     }
                 }
@@ -317,17 +368,22 @@ pub(super) async fn deliver_reply(
 
     let mut keyboard_message = None;
     let mut flood_stopped: Option<String> = None;
-    if let Some(text) = text {
-        let sent = send_reply_text(client, target, text, keyboard).await;
-        match settle(&mut record.items[0], sent) {
-            Ok(id) => keyboard_message = id,
-            Err(FailureClass::FloodWait(_)) => {
-                flood_stopped = record.items[0].error.clone();
-            }
-            Err(_) => {}
+    for (idx, part) in text.iter().enumerate() {
+        let item = &mut record.items[idx];
+        if let Some(reason) = &flood_stopped {
+            item.mark_failed(&format!("not attempted after a flood refusal: {reason}"));
+            continue;
+        }
+        let last = idx + 1 == text.len();
+        let keyboard = if last { followups } else { None };
+        let sent = send_reply_text(client, target, part, keyboard).await;
+        match settle(item, sent) {
+            Ok(id) if last => keyboard_message = id,
+            Err(FailureClass::FloodWait(_)) => flood_stopped = item.error.clone(),
+            Ok(_) | Err(_) => {}
         }
     }
-    for (idx, path) in files.iter().enumerate() {
+    for (idx, file) in files.iter().enumerate() {
         let item = &mut record.items[file_offset + idx];
         if item.status != DeliveryStatus::Pending {
             continue;
@@ -336,8 +392,9 @@ pub(super) async fn deliver_reply(
             item.mark_failed(&format!("not attempted after a flood refusal: {reason}"));
             continue;
         }
-        let options = target.media_options(None, None);
-        let sent = send_media_file(client, target.chat_id, path, &options)
+        let keyboard = file.open_url.as_deref().map(open_artifact_keyboard);
+        let options = target.media_options(None, keyboard.as_ref());
+        let sent = send_media_file(client, target.chat_id, &file.path, &options)
             .await
             .map(|message| message.id);
         if let Err(FailureClass::FloodWait(_)) = settle(item, sent.map(Some)) {
@@ -347,102 +404,58 @@ pub(super) async fn deliver_reply(
     keyboard_message
 }
 
-/// Sends text and documents as one rich message. Returns `None` when the
-/// reply should fall back to separate messages (the rich message was refused
-/// or could not be built, so nothing was delivered); otherwise the id of the
-/// message carrying the keyboard, if any, with every item recorded.
-async fn send_rich_reply(
-    client: &TelegramClient,
-    target: &ReplyTarget,
-    text: &str,
-    files: &[PathBuf],
-    keyboard: Option<&InlineKeyboardMarkup>,
-    record: &mut DeliveryRecord,
-) -> Option<Option<i64>> {
-    let paths: Vec<&std::path::Path> = files.iter().map(PathBuf::as_path).collect();
-    let html = rich_reply_html(text, files.len());
-    let options = target.media_options(None, keyboard);
-    let err = match client
-        .send_rich_documents(target.chat_id, &html, &paths, &options)
-        .await
-    {
-        Ok(message) => {
-            for item in &mut record.items {
-                item.mark_sent(Some(message.id));
-            }
-            return Some(Some(message.id));
-        }
-        Err(err) => err,
-    };
-    let error = format!("{err:#}");
-    match flood::classify(&err) {
-        FailureClass::Unknown => {
-            for item in &mut record.items {
-                item.mark_unknown(&error);
-            }
-            Some(None)
-        }
-        FailureClass::FloodWait(_) => {
-            for item in &mut record.items {
-                item.mark_failed(&error);
-            }
-            Some(None)
-        }
-        FailureClass::Rejected | FailureClass::NotSent => {
-            tracing::warn!(
-                chat_id = target.chat_id,
-                err = %error,
-                "Rich document reply not sent; using separate messages"
-            );
-            None
-        }
+/// Whether a lone file may carry the reply text as its caption: photos, voice
+/// notes, and audio. A document always goes out on its own, after the text.
+fn takes_reply_caption(path: &Path) -> bool {
+    is_image_path(path) || is_voice_note_path(path) || is_audio_path(path)
+}
+
+const OPEN_ARTIFACT_LABEL: &str = "↗ Open artifact";
+
+/// The file action on one file message: open this exact file in the Mini App.
+fn open_artifact_keyboard(url: &str) -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup {
+        inline_keyboard: vec![vec![InlineKeyboardButton::url(OPEN_ARTIFACT_LABEL, url)]],
     }
 }
 
-/// Rich-message limits (Bot API "Rich Message Limits"): 32768 characters of
-/// text, 500 blocks, 16 levels of nesting, 50 media attachments.
-const RICH_MAX_TEXT_CHARS: usize = 32_768;
-const RICH_MAX_NESTING: usize = 16;
-const RICH_MAX_BLOCKS: usize = 500;
-const RICH_MAX_MEDIA: usize = 50;
-
-/// Whether this reply goes out as one rich message: there is text, every file
-/// is a valid document (not a photo, voice note, or audio file, which keep
-/// their own send methods), and the reply fits the limits. The checks are
-/// conservative: the text is measured in UTF-16 units (never fewer than
-/// characters) and every line break is counted as a possible block.
-fn rich_document_layout(text: &str, files: &[PathBuf], record: &DeliveryRecord) -> bool {
-    !files.is_empty()
-        && record.items[1..]
-            .iter()
-            .all(|item| item.status == DeliveryStatus::Pending)
-        && files
-            .iter()
-            .all(|path| !is_image_path(path) && !is_voice_note_path(path) && !is_audio_path(path))
-        && rich_layout_fits(text, files.len())
-}
-
-fn rich_layout_fits(text: &str, documents: usize) -> bool {
-    let shape = rich_shape(text);
-    documents <= RICH_MAX_MEDIA
-        && shape.blocks + documents <= RICH_MAX_BLOCKS
-        // Strictly below: one level for the message's own block.
-        && shape.depth < RICH_MAX_NESTING
-        && visible_utf16_len(text) <= RICH_MAX_TEXT_CHARS
-}
-
-/// Rich HTML body: the reply text, then one `<tg-document>` per file, in
-/// order, referencing the uploads by id.
-fn rich_reply_html(text: &str, documents: usize) -> String {
-    let mut html = telegram_html_to_rich_html(text);
-    for index in 0..documents {
-        let _ = write!(
-            html,
-            "<tg-document src=\"tg://document?id={}\"></tg-document>",
-            rich_document_id(index)
-        );
+/// Keyboard of a captioned file: its file action first, then the follow-ups.
+/// Follow-up taps and Dismiss keep the file action (see `followups`).
+fn captioned_keyboard(
+    open_url: Option<&str>,
+    followups: Option<&InlineKeyboardMarkup>,
+) -> Option<InlineKeyboardMarkup> {
+    let mut rows =
+        open_url.map_or_else(Vec::new, |url| open_artifact_keyboard(url).inline_keyboard);
+    if let Some(followups) = followups {
+        rows.extend(followups.inline_keyboard.iter().cloned());
     }
-    html
+    (!rows.is_empty()).then_some(InlineKeyboardMarkup {
+        inline_keyboard: rows,
+    })
+}
+
+/// Longest `startapp` value used: a conservative local limit, not an
+/// established Mini App limit. Telegram documents 64 characters only for bot
+/// `start` parameters and states no length for `startapp`; staying within 64
+/// keeps a margin. Characters are limited to `A-Z`, `a-z`, `0-9`, `_`, `-`
+/// (Telegram's documented start-parameter alphabet).
+const MAX_START_PARAM_LEN: usize = 64;
+
+/// Mini App deep link that opens one artifact: `startapp=a_<key>_<thread>`,
+/// where `key` is the engine's [`artifacts::artifact_key`] (fixed-length hex)
+/// and `thread` is the id of the topic that receives the reply, so feedback
+/// sent from the preview returns to this topic. The key does not embed the raw
+/// path; it is an opaque lookup identifier, not an authorization: the Mini App
+/// resolves it in that thread's artifact list with its own authenticated
+/// session. `None` when the value would not fit the limits above.
+pub(crate) fn artifact_link(base: &str, thread_id: &str, path: &Path) -> Option<String> {
+    let param = format!("a_{}_{thread_id}", artifacts::artifact_key(path));
+    let fits = param.len() <= MAX_START_PARAM_LEN
+        && param
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+    fits.then(|| format!("{base}?startapp={param}"))
 }
 
 /// Records a send result on `item`. Returns the message id on success, or the
@@ -585,7 +598,10 @@ mod tests {
 
     use zdx_engine::core::delivery::{DeliveryItem, DeliveryRecord, DeliveryStatus};
 
-    use super::{ReplyTarget, append_thread_link, append_worker_links, deliver_reply};
+    use super::{
+        ReplyFile, ReplyTarget, append_thread_link, append_worker_links, artifact_link,
+        deliver_reply,
+    };
     use crate::telegram::fake::{FakeTelegram, Reply, TOKEN};
     use crate::telegram::{InlineKeyboardButton, InlineKeyboardMarkup, TelegramClient};
 
@@ -623,11 +639,8 @@ mod tests {
         }
     }
 
-    fn record(text: bool, files: &[PathBuf]) -> DeliveryRecord {
-        let mut items = Vec::new();
-        if text {
-            items.push(DeliveryItem::text());
-        }
+    fn record(text_parts: usize, files: &[PathBuf]) -> DeliveryRecord {
+        let mut items = super::text_items(text_parts);
         items.extend(
             files
                 .iter()
@@ -636,25 +649,66 @@ mod tests {
         DeliveryRecord::new("telegram", Some(CHAT), Some(7), items)
     }
 
+    const MINI_APP: &str = "https://t.me/zdx_test_bot/app";
+    const TOPIC_THREAD: &str = "telegram--1001-topic-7";
+
+    fn linked(files: &[PathBuf]) -> Vec<ReplyFile> {
+        files
+            .iter()
+            .map(|path| ReplyFile {
+                path: path.clone(),
+                open_url: artifact_link(MINI_APP, TOPIC_THREAD, path),
+            })
+            .collect()
+    }
+
     async fn deliver(
         fake: &FakeTelegram,
         text: Option<&str>,
         files: &[PathBuf],
     ) -> (Option<i64>, DeliveryRecord) {
+        deliver_files(fake, text, &linked(files)).await
+    }
+
+    async fn deliver_files(
+        fake: &FakeTelegram,
+        text: Option<&str>,
+        files: &[ReplyFile],
+    ) -> (Option<i64>, DeliveryRecord) {
         let client =
             TelegramClient::with_base_url(TOKEN.to_string(), fake.base_url.clone()).reliable();
-        let mut record = record(text.is_some(), files);
+        let paths: Vec<PathBuf> = files.iter().map(|file| file.path.clone()).collect();
+        let parts = text.map_or_else(Vec::new, |text| {
+            crate::telegram::markdown::split_telegram_html(text, super::MAX_MESSAGE_LEN)
+        });
+        let mut record = record(parts.len(), &paths);
         let keyboard = keyboard();
         let id = deliver_reply(
             &client,
             &target(),
-            text,
+            &parts,
             files,
             Some(&keyboard),
             &mut record,
         )
         .await;
         (id, record)
+    }
+
+    /// The `Open artifact` URL a file message carries, if any.
+    fn open_url(body: &str) -> Option<String> {
+        let field = "name=\"reply_markup\"\r\n\r\n";
+        let start = body.find(field)? + field.len();
+        let end = body[start..]
+            .find("\r\n")
+            .map_or(body.len(), |at| start + at);
+        let markup: serde_json::Value = serde_json::from_str(&body[start..end]).ok()?;
+        markup["inline_keyboard"]
+            .as_array()?
+            .iter()
+            .flat_map(|row| row.as_array().into_iter().flatten())
+            .find(|button| button["text"] == super::OPEN_ARTIFACT_LABEL)
+            .and_then(|button| button["url"].as_str().map(str::to_string))
     }
 
     fn statuses(record: &DeliveryRecord) -> Vec<DeliveryStatus> {
@@ -748,142 +802,199 @@ mod tests {
         assert_eq!(record.items[0].status, DeliveryStatus::Sent);
     }
 
-    fn rich_json(body: &str) -> serde_json::Value {
-        let start = body
-            .find("name=\"rich_message\"")
-            .expect("rich_message field");
-        let json_start = body[start..].find("\r\n\r\n").expect("field body") + start + 4;
-        let json_end = body[json_start..].find("\r\n--").expect("field end") + json_start;
-        serde_json::from_str(&body[json_start..json_end]).expect("rich_message json")
-    }
-
-    fn rich_html(body: &str) -> String {
-        rich_json(body)["html"].as_str().expect("html").to_string()
-    }
-
+    /// One document: the explanation and follow-ups first, then the file on
+    /// its own with its own `Open artifact` button. The document never takes
+    /// the reply as its caption, and no request is spent only on buttons.
     #[tokio::test]
-    async fn text_and_one_document_go_out_as_one_rich_message() {
+    async fn one_document_follows_the_text_with_its_own_file_action() {
         let fake = FakeTelegram::start().await;
         let file = TempFile::new("html");
-        let text = "<b>Ready</b> &lt;tag&gt; &amp; <a href=\"https://example.com/a?b=1&amp;c=2\">link</a>\nsecond line";
-        let (id, record) = deliver(&fake, Some(text), std::slice::from_ref(&file.0)).await;
+        let (id, record) =
+            deliver(&fake, Some("<b>Ready</b>"), std::slice::from_ref(&file.0)).await;
 
-        assert_eq!(fake.methods(), ["sendRichMessage"]);
-        let body = &fake.seen()[0].body;
-        assert!(body.contains("fu:0"), "keyboard rides on the rich message");
+        assert_eq!(fake.methods(), ["sendMessage", "sendDocument"]);
+        let seen = fake.seen();
+        assert!(seen[0].body.contains("fu:0"), "follow-ups on the text");
+        assert!(!seen[0].body.contains("Open artifact"));
+        assert!(!seen[1].body.contains("fu:0"), "no follow-ups on the file");
+        assert!(!seen[1].body.contains("name=\"caption\""));
+        assert_eq!(
+            open_url(&seen[1].body),
+            artifact_link(MINI_APP, TOPIC_THREAD, &file.0)
+        );
         assert!(
-            body.contains("name=\"file0\""),
-            "document uploaded in the same request"
+            seen[1]
+                .body
+                .contains("name=\"reply_to_message_id\"\r\n\r\n42")
         );
-        assert!(body.contains("{\"message_id\":42,\"allow_sending_without_reply\":true}"));
-        assert!(body.contains("synthetic file"));
-        let media = &rich_json(body)["media"];
-        assert_eq!(media[0]["id"], "file0");
-        assert_eq!(media[0]["media"]["type"], "document");
-        assert_eq!(media[0]["media"]["media"], "attach://file0");
-        assert_eq!(
-            rich_html(body),
-            "<b>Ready</b> &lt;tag&gt; &amp; <a href=\"https://example.com/a?b=1&amp;c=2\">link</a><br>second line<tg-document src=\"tg://document?id=file0\"></tg-document>"
-        );
+        assert!(seen[1].body.contains("name=\"message_thread_id\"\r\n\r\n7"));
         assert_eq!(
             statuses(&record),
             [DeliveryStatus::Sent, DeliveryStatus::Sent]
         );
         assert_eq!(id, record.items[0].message_id);
-        assert_eq!(record.items[0].message_id, record.items[1].message_id);
+        assert_ne!(record.items[0].message_id, record.items[1].message_id);
+    }
+
+    /// The reported defect: several documents must each open their own file.
+    /// Each is a separate message whose button names that file, in order.
+    #[tokio::test]
+    async fn each_document_is_its_own_message_with_its_own_link() {
+        let fake = FakeTelegram::start().await;
+        let files: Vec<TempFile> = ["html", "pdf", "md"]
+            .into_iter()
+            .map(|ext| {
+                let file = TempFile::new(ext);
+                std::fs::write(&file.0, format!("synthetic {ext} body")).expect("write");
+                file
+            })
+            .collect();
+        let paths: Vec<PathBuf> = files.iter().map(|file| file.0.clone()).collect();
+        let (id, record) = deliver(&fake, Some("**done**"), &paths).await;
+
+        assert_eq!(
+            fake.methods(),
+            [
+                "sendMessage",
+                "sendDocument",
+                "sendDocument",
+                "sendDocument"
+            ]
+        );
+        let seen = fake.seen();
+        let mut urls = Vec::new();
+        for (index, (path, ext)) in paths.iter().zip(["html", "pdf", "md"]).enumerate() {
+            let body = &seen[index + 1].body;
+            assert!(
+                body.contains(&format!("synthetic {ext} body")),
+                "file {index} uploaded alone"
+            );
+            let url = open_url(body).expect("own button");
+            assert_eq!(
+                Some(url.clone()),
+                artifact_link(MINI_APP, TOPIC_THREAD, path)
+            );
+            urls.push(url);
+        }
+        urls.dedup();
+        assert_eq!(urls.len(), 3, "every button opens a different file");
+        assert_eq!(statuses(&record), [DeliveryStatus::Sent; 4]);
+        assert_eq!(id, record.items[0].message_id);
+        let mut ids: Vec<_> = record.items.iter().map(|item| item.message_id).collect();
+        ids.dedup();
+        assert_eq!(ids.len(), 4, "one message per item");
     }
 
     #[tokio::test]
-    async fn two_documents_follow_the_text_in_order_in_one_message() {
+    async fn documents_without_text_carry_only_their_file_actions() {
         let fake = FakeTelegram::start().await;
-        let first = TempFile::new("html");
-        let second = TempFile::new("csv");
-        let files = [first.0.clone(), second.0.clone()];
-        let (id, record) = deliver(&fake, Some("**done**"), &files).await;
+        let a = TempFile::new("pdf");
+        let b = TempFile::new("csv");
+        let (id, record) = deliver(&fake, None, &[a.0.clone(), b.0.clone()]).await;
 
-        assert_eq!(fake.methods(), ["sendRichMessage"]);
+        assert_eq!(id, None, "no message carries follow-ups");
+        assert_eq!(fake.methods(), ["sendDocument", "sendDocument"]);
+        for seen in fake.seen() {
+            assert!(open_url(&seen.body).is_some());
+            assert!(!seen.body.contains("fu:0"));
+        }
+        assert_eq!(statuses(&record), [DeliveryStatus::Sent; 2]);
+    }
+
+    /// Without a configured Mini App the files still go out separately, with
+    /// no button.
+    #[tokio::test]
+    async fn files_go_out_without_buttons_when_there_is_no_link() {
+        let fake = FakeTelegram::start().await;
+        let doc = TempFile::new("html");
+        let photo = TempFile::new("png");
+        let files = [ReplyFile {
+            path: doc.0.clone(),
+            open_url: None,
+        }];
+        let (_, record) = deliver_files(&fake, Some("done"), &files).await;
+        assert_eq!(fake.methods(), ["sendMessage", "sendDocument"]);
+        assert!(!fake.seen()[1].body.contains("reply_markup"));
+        assert_eq!(statuses(&record), [DeliveryStatus::Sent; 2]);
+
+        let fake = FakeTelegram::start().await;
+        let files = [ReplyFile {
+            path: photo.0.clone(),
+            open_url: None,
+        }];
+        let (_, _) = deliver_files(&fake, Some("done"), &files).await;
+        assert_eq!(fake.methods(), ["sendPhoto"]);
         let body = &fake.seen()[0].body;
-        let html = rich_html(body);
-        let one = html.find("id=file0").expect("first document");
-        let two = html.find("id=file1").expect("second document");
-        assert!(one < two);
-        assert!(body.find("name=\"file0\"") < body.find("name=\"file1\""));
-        assert_eq!(statuses(&record), [DeliveryStatus::Sent; 3]);
-        assert!(record.items.iter().all(|item| item.message_id == id));
+        assert!(body.contains("fu:0") && open_url(body).is_none());
+    }
+
+    /// A partial failure is recorded per file: a refused document fails, the
+    /// next one still goes out, and a flood refusal stops the rest.
+    #[tokio::test]
+    async fn document_failures_are_recorded_per_file() {
+        let fake = FakeTelegram::start().await;
+        fake.script(
+            "sendDocument",
+            &[
+                Reply::Error(400, "Bad Request: file is empty", None),
+                Reply::Ok,
+                Reply::Error(429, "Too Many Requests: retry after 500", Some(500)),
+            ],
+        );
+        let files: Vec<TempFile> = ["a", "b", "c", "d"]
+            .into_iter()
+            .map(|_| TempFile::new("pdf"))
+            .collect();
+        let paths: Vec<PathBuf> = files.iter().map(|file| file.0.clone()).collect();
+        let (id, record) = deliver(&fake, Some("done"), &paths).await;
+
+        assert_eq!(
+            fake.methods(),
+            [
+                "sendMessage",
+                "sendDocument",
+                "sendDocument",
+                "sendDocument"
+            ]
+        );
+        assert!(id.is_some());
+        assert_eq!(
+            statuses(&record),
+            [
+                DeliveryStatus::Sent,
+                DeliveryStatus::Failed,
+                DeliveryStatus::Sent,
+                DeliveryStatus::Failed,
+                DeliveryStatus::Failed,
+            ]
+        );
+        assert!(
+            record.items[4]
+                .error
+                .as_deref()
+                .is_some_and(|e| e.starts_with("not attempted after a flood refusal"))
+        );
     }
 
     #[tokio::test]
-    async fn a_refused_rich_message_falls_back_to_separate_messages() {
+    async fn an_ambiguous_document_send_is_unknown_and_not_resent() {
         let fake = FakeTelegram::start().await;
-        fake.script(
-            "sendRichMessage",
-            &[Reply::Error(
-                400,
-                "Bad Request: can't parse rich message",
-                None,
-            )],
-        );
-        let file = TempFile::new("html");
-        let (id, record) = deliver(&fake, Some("done"), std::slice::from_ref(&file.0)).await;
+        fake.script("sendDocument", &[Reply::Garbage]);
+        let a = TempFile::new("pdf");
+        let b = TempFile::new("pdf");
+        let (_, record) = deliver(&fake, Some("done"), &[a.0.clone(), b.0.clone()]).await;
 
-        assert_eq!(fake.methods(), ["sendRichMessage", "sendDocument"]);
+        assert_eq!(
+            fake.methods(),
+            ["sendMessage", "sendDocument", "sendDocument"]
+        );
         assert_eq!(
             statuses(&record),
-            [DeliveryStatus::Sent, DeliveryStatus::Sent]
-        );
-        assert_eq!(id, record.items[0].message_id);
-    }
-
-    #[tokio::test]
-    async fn an_unknown_rich_outcome_is_not_resent() {
-        let fake = FakeTelegram::start().await;
-        fake.script("sendRichMessage", &[Reply::Garbage]);
-        let file = TempFile::new("html");
-        let (id, record) = deliver(&fake, Some("done"), std::slice::from_ref(&file.0)).await;
-
-        assert_eq!(id, None);
-        assert_eq!(fake.methods(), ["sendRichMessage"]);
-        assert_eq!(
-            statuses(&record),
-            [DeliveryStatus::Unknown, DeliveryStatus::Unknown]
-        );
-    }
-
-    #[tokio::test]
-    async fn a_rich_flood_refusal_is_retried_with_the_files_or_fails_without_fallback() {
-        let fake = FakeTelegram::start().await;
-        fake.script(
-            "sendRichMessage",
-            &[Reply::Error(
-                429,
-                "Too Many Requests: retry after 1",
-                Some(1),
-            )],
-        );
-        let file = TempFile::new("html");
-        let (_, record) = deliver(&fake, Some("done"), std::slice::from_ref(&file.0)).await;
-        assert_eq!(fake.methods(), ["sendRichMessage", "sendRichMessage"]);
-        let retry = &fake.seen()[1].body;
-        assert!(retry.contains("name=\"file0\"") && retry.contains("synthetic file"));
-        assert_eq!(
-            statuses(&record),
-            [DeliveryStatus::Sent, DeliveryStatus::Sent]
-        );
-
-        let fake = FakeTelegram::start().await;
-        fake.script(
-            "sendRichMessage",
-            &[Reply::Error(
-                429,
-                "Too Many Requests: retry after 500",
-                Some(500),
-            )],
-        );
-        let (_, record) = deliver(&fake, Some("done"), std::slice::from_ref(&file.0)).await;
-        assert_eq!(fake.methods(), ["sendRichMessage"]);
-        assert_eq!(
-            statuses(&record),
-            [DeliveryStatus::Failed, DeliveryStatus::Failed]
+            [
+                DeliveryStatus::Sent,
+                DeliveryStatus::Unknown,
+                DeliveryStatus::Sent
+            ]
         );
     }
 
@@ -895,27 +1006,20 @@ mod tests {
         let files = [photo.0.clone(), doc.0.clone()];
         let (_, record) = deliver(&fake, Some("done"), &files).await;
         assert_eq!(fake.methods(), ["sendMessage", "sendPhoto", "sendDocument"]);
+        let seen = fake.seen();
+        assert_eq!(
+            open_url(&seen[1].body),
+            artifact_link(MINI_APP, TOPIC_THREAD, &photo.0)
+        );
+        assert_eq!(
+            open_url(&seen[2].body),
+            artifact_link(MINI_APP, TOPIC_THREAD, &doc.0)
+        );
         assert_eq!(statuses(&record), [DeliveryStatus::Sent; 3]);
     }
 
-    #[test]
-    fn rich_layout_respects_the_documented_limits() {
-        assert!(super::rich_layout_fits("short", 1));
-        assert!(super::rich_layout_fits("short", 50));
-        assert!(!super::rich_layout_fits("short", 51));
-        assert!(!super::rich_layout_fits(&"x".repeat(32_769), 1));
-        assert!(super::rich_layout_fits(&"x".repeat(32_768), 1));
-        assert!(!super::rich_layout_fits(&"line\n".repeat(499), 1));
-        // Adjacent blocks with no line breaks between them still count.
-        assert!(!super::rich_layout_fits(&"<pre>x</pre>".repeat(250), 1));
-        let deep = format!("{}x{}", "<b>".repeat(16), "</b>".repeat(16));
-        assert!(!super::rich_layout_fits(&deep, 1));
-        let ok = format!("{}x{}", "<b>".repeat(15), "</b>".repeat(15));
-        assert!(super::rich_layout_fits(&ok, 1));
-    }
-
     #[tokio::test]
-    async fn an_oversized_document_is_not_sent_rich_and_the_text_still_goes_out() {
+    async fn an_oversized_document_fails_and_the_text_still_goes_out() {
         let fake = FakeTelegram::start().await;
         let big = TempFile::new("html");
         std::fs::File::options()
@@ -925,14 +1029,348 @@ mod tests {
             .expect("grow file");
         let (_, record) = deliver(&fake, Some("done"), std::slice::from_ref(&big.0)).await;
 
-        assert_eq!(
-            fake.methods(),
-            ["sendMessage"],
-            "no rich or document request"
-        );
+        assert_eq!(fake.methods(), ["sendMessage"], "no document request");
         assert_eq!(
             statuses(&record),
             [DeliveryStatus::Sent, DeliveryStatus::Failed]
+        );
+    }
+
+    /// The link names where the reply goes, before any alias hop: a forum
+    /// topic, a supergroup's General (no topic), or a private chat, so the
+    /// Mini App reads that chat's artifacts and sends feedback back to it.
+    /// Images get the same link as documents.
+    #[test]
+    fn links_name_the_receiving_chat_or_topic() {
+        let _home = zdx_engine::test_support::temp_zdx_home();
+        let mut config = zdx_engine::config::Config::default();
+        config.telegram.server = Some(zdx_engine::config::TelegramServerConfig {
+            enabled: true,
+            port: 4141,
+            mini_app_url: Some(MINI_APP.to_string()),
+        });
+        let context = crate::bot::context::BotContext::for_test(
+            TelegramClient::with_base_url(TOKEN.to_string(), "http://127.0.0.1:9".to_string()),
+            config,
+            std::env::temp_dir(),
+        );
+        let doc = TempFile::new("html");
+        let image = TempFile::new("png");
+        let paths = [doc.0.clone(), image.0.clone()];
+        let ctx = |topic_id| super::ReplyContext {
+            reply_to_message_id: None,
+            topic_id,
+            cross_topic_reply_parameters: None,
+        };
+        // A resumed topic: its session aliases another thread.
+        zdx_engine::core::thread_persistence::Thread::with_id("telegram--1001-topic-9".to_string())
+            .expect("thread")
+            .set_alias(Some("resumed-source".to_string()))
+            .expect("alias");
+        for (chat, topic, thread) in [
+            (-1001, Some(7), "telegram--1001-topic-7"),
+            (-1001, Some(9), "telegram--1001-topic-9"),
+            (-1001, None, "telegram--1001"),
+            (424_242, None, "telegram-424242"),
+        ] {
+            let files = super::reply_files(&context, chat, &ctx(topic), &paths);
+            for (file, path) in files.iter().zip(&paths) {
+                assert_eq!(
+                    file.open_url,
+                    artifact_link(MINI_APP, thread, path),
+                    "{thread}"
+                );
+            }
+        }
+
+        let unconfigured = crate::bot::context::BotContext::for_test(
+            TelegramClient::with_base_url(TOKEN.to_string(), "http://127.0.0.1:9".to_string()),
+            zdx_engine::config::Config::default(),
+            std::env::temp_dir(),
+        );
+        let files = super::reply_files(&unconfigured, -1001, &ctx(Some(7)), &paths);
+        assert!(files.iter().all(|file| file.open_url.is_none()));
+    }
+
+    /// The link names the receiving topic and the file's key, within
+    /// Telegram's start-parameter rules, and never the path.
+    #[test]
+    fn artifact_links_are_short_opaque_and_valid_start_parameters() {
+        let path = std::path::Path::new("/Users/someone/.zdx/artifacts/threads/w/report.html");
+        let url =
+            artifact_link(MINI_APP, "telegram--1001234567890-topic-1234567", path).expect("link");
+        let param = url
+            .strip_prefix(&format!("{MINI_APP}?startapp="))
+            .expect("startapp link");
+        assert!(param.len() <= 64, "{param}");
+        assert!(
+            param
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        );
+        let key = zdx_engine::core::artifacts::artifact_key(path);
+        assert_eq!(
+            param,
+            format!("a_{key}_telegram--1001234567890-topic-1234567")
+        );
+        assert!(!url.contains("report") && !url.contains("someone"));
+
+        // Same name, different place: a different link.
+        let other = std::path::Path::new("/Users/someone/.zdx/artifacts/threads/x/report.html");
+        assert_ne!(
+            artifact_link(MINI_APP, TOPIC_THREAD, path),
+            artifact_link(MINI_APP, TOPIC_THREAD, other)
+        );
+        // Out of Telegram's rules: no link rather than a broken one.
+        assert!(artifact_link(MINI_APP, &"9".repeat(46), path).is_none());
+        assert!(artifact_link(MINI_APP, "thread with space", path).is_none());
+    }
+
+    fn sent_texts(fake: &FakeTelegram) -> Vec<String> {
+        fake.seen()
+            .iter()
+            .filter(|seen| seen.method == "sendMessage")
+            .map(|seen| {
+                let body: serde_json::Value = serde_json::from_str(&seen.body).expect("json");
+                body["text"].as_str().expect("text").to_string()
+            })
+            .collect()
+    }
+
+    /// Text without tags: what splitting must keep exactly.
+    fn visible(html: &str) -> String {
+        let mut out = String::new();
+        let mut in_tag = false;
+        for c in html.chars() {
+            match c {
+                '<' => in_tag = true,
+                '>' => in_tag = false,
+                c if !in_tag => out.push(c),
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// An explanation of about 5000 characters with markup and multi-byte
+    /// text, as the model writes when it describes several documents.
+    fn long_explanation() -> String {
+        use std::fmt::Write as _;
+
+        let mut text = String::from("<b>Reports</b> &amp; notes 😀\n\n");
+        for n in 0..42 {
+            let _ = writeln!(
+                text,
+                "<b>Section {n}</b>: the <i>comparison</i> of <code>a&lt;b</code> 中文 sizes, with a <a href=\"https://example.com/{n}?x=1&amp;y=2\">source</a>."
+            );
+        }
+        let len = text.encode_utf16().count();
+        assert!((5000..8000).contains(&len), "{len}");
+        text
+    }
+
+    /// The old failure, reproduced: the whole explanation in one request is
+    /// refused (the fake measures raw HTML, stricter than Telegram).
+    #[tokio::test]
+    async fn the_fake_refuses_text_over_the_limit_like_telegram() {
+        let fake = FakeTelegram::start().await;
+        let client = TelegramClient::with_base_url(TOKEN.to_string(), fake.base_url.clone());
+        let text = long_explanation();
+        let err = client
+            .send_text(&crate::telegram::TextSend {
+                chat_id: CHAT,
+                text: &text,
+                reply_to_message_id: None,
+                message_thread_id: Some(7),
+                reply_parameters: None,
+                reply_markup: None,
+                disable_preview: true,
+            })
+            .await
+            .expect_err("too long");
+        assert_eq!(
+            crate::telegram::api_error_description(&err),
+            Some("Bad Request: message is too long")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_long_explanation_is_split_before_the_document() {
+        let fake = FakeTelegram::start().await;
+        let file = TempFile::new("pdf");
+        let text = long_explanation();
+        let (id, record) = deliver(&fake, Some(&text), std::slice::from_ref(&file.0)).await;
+
+        assert_eq!(
+            fake.methods(),
+            ["sendMessage", "sendMessage", "sendDocument"]
+        );
+        let seen = fake.seen();
+        assert!(!seen[0].body.contains("fu:0"), "follow-ups once");
+        assert!(seen[1].body.contains("fu:0"), "on the last part");
+        assert!(open_url(&seen[2].body).is_some());
+        let texts = sent_texts(&fake);
+        assert!(texts.iter().all(|t| t.encode_utf16().count() <= 4096));
+        assert_eq!(visible(&texts.concat()), visible(&text), "no text lost");
+        assert_eq!(statuses(&record), [DeliveryStatus::Sent; 3]);
+        assert_eq!(id, record.items[1].message_id);
+        assert_ne!(record.items[0].message_id, record.items[1].message_id);
+        assert_eq!(
+            record.items[1].part,
+            Some(zdx_engine::core::delivery::TextPart { index: 2, total: 2 })
+        );
+    }
+
+    /// The reported case in plain words: 5000 visible characters and a
+    /// document. All of it arrives, text first.
+    #[tokio::test]
+    async fn a_5000_character_plain_explanation_and_a_document() {
+        let fake = FakeTelegram::start().await;
+        let file = TempFile::new("html");
+        let text = "Plain words, nothing else. ".repeat(186);
+        assert!(text.chars().count() > 5000);
+        let (id, record) = deliver(&fake, Some(&text), std::slice::from_ref(&file.0)).await;
+
+        assert_eq!(
+            fake.methods(),
+            ["sendMessage", "sendMessage", "sendDocument"]
+        );
+        assert_eq!(sent_texts(&fake).concat(), text, "exact text, in order");
+        assert_eq!(statuses(&record), [DeliveryStatus::Sent; 3]);
+        assert_eq!(id, record.items[1].message_id);
+    }
+
+    /// A refused middle part fails alone: the rest of the text and the file
+    /// still go out, the follow-ups stay on the last part, and each part keeps
+    /// its real outcome. A flood refusal stops everything after it.
+    #[tokio::test]
+    async fn a_failed_middle_part_is_recorded_and_the_rest_still_goes_out() {
+        let fake = FakeTelegram::start().await;
+        fake.script(
+            "sendMessage",
+            &[
+                Reply::Ok,
+                Reply::Error(400, "Bad Request: chat not found", None),
+            ],
+        );
+        let file = TempFile::new("pdf");
+        let text = format!("{}\n{}", long_explanation(), long_explanation());
+        let (id, record) = deliver(&fake, Some(&text), std::slice::from_ref(&file.0)).await;
+
+        let methods = fake.methods();
+        let parts = methods
+            .iter()
+            .filter(|m| m.as_str() == "sendMessage")
+            .count();
+        assert!(parts >= 3, "{methods:?}");
+        assert_eq!(methods.last().map(String::as_str), Some("sendDocument"));
+        let mut expected = vec![DeliveryStatus::Sent, DeliveryStatus::Failed];
+        expected.extend(std::iter::repeat_n(DeliveryStatus::Sent, parts - 1));
+        assert_eq!(statuses(&record), expected);
+        assert_eq!(
+            id,
+            record.items[parts - 1].message_id,
+            "follow-ups on the last part"
+        );
+
+        let fake = FakeTelegram::start().await;
+        fake.script(
+            "sendMessage",
+            &[
+                Reply::Ok,
+                Reply::Error(429, "Too Many Requests: retry after 500", Some(500)),
+            ],
+        );
+        let (id, record) = deliver(&fake, Some(&text), std::slice::from_ref(&file.0)).await;
+        assert_eq!(fake.methods(), ["sendMessage", "sendMessage"]);
+        assert_eq!(id, None);
+        assert_eq!(record.items[0].status, DeliveryStatus::Sent);
+        assert!(
+            record.items[1..]
+                .iter()
+                .all(|item| item.status == DeliveryStatus::Failed)
+        );
+    }
+
+    /// Through the whole reply path: the record has one item per part, and a
+    /// partial delivery names the missing part in the summary.
+    #[tokio::test]
+    async fn a_partial_long_reply_names_the_missing_part() {
+        use zdx_engine::core::thread_persistence::{Thread, ThreadEvent, load_thread_events};
+
+        let _home = zdx_engine::test_support::temp_zdx_home();
+        let fake = FakeTelegram::start().await;
+        fake.script(
+            "sendMessage",
+            &[
+                Reply::Ok,
+                Reply::Error(400, "Bad Request: chat not found", None),
+            ],
+        );
+        let context = crate::bot::context::BotContext::for_test(
+            TelegramClient::with_base_url(TOKEN.to_string(), fake.base_url.clone()),
+            zdx_engine::config::Config::default(),
+            std::env::temp_dir(),
+        );
+        let file = TempFile::new("pdf");
+        let thread_id = format!("telegram-long-reply-{}", uuid::Uuid::new_v4());
+        let mut thread = Thread::with_id(thread_id.clone()).expect("thread");
+        let incoming = crate::types::IncomingMessage {
+            chat_id: CHAT,
+            message_id: 42,
+            user_id: 1,
+            text: Some("go".to_string()),
+            images: Vec::new(),
+            audios: Vec::new(),
+            documents: Vec::new(),
+            videos: Vec::new(),
+            notices: Vec::new(),
+            message_thread_id: Some(7),
+            is_forum: true,
+        };
+        let reply_ctx = super::ReplyContext {
+            reply_to_message_id: Some(42),
+            topic_id: Some(7),
+            cross_topic_reply_parameters: None,
+        };
+        let final_text = format!(
+            "{}\n<media>{}</media>",
+            long_explanation(),
+            file.0.display()
+        );
+        super::send_final_response(
+            &context,
+            &incoming,
+            &reply_ctx,
+            None,
+            &final_text,
+            &thread_id,
+            &[],
+            &mut thread,
+        )
+        .await
+        .expect("send final response");
+
+        assert_eq!(
+            fake.methods(),
+            ["sendMessage", "sendMessage", "sendDocument", "sendMessage"]
+        );
+        let summary = sent_texts(&fake).pop().expect("summary");
+        assert!(
+            summary.contains("reply text part 2 of 2: not delivered"),
+            "{summary}"
+        );
+        let events = load_thread_events(&thread_id).expect("events");
+        let Some(ThreadEvent::Delivery { record, .. }) = events.last() else {
+            panic!("outcome recorded last");
+        };
+        assert_eq!(
+            statuses(record),
+            [
+                DeliveryStatus::Sent,
+                DeliveryStatus::Failed,
+                DeliveryStatus::Sent
+            ]
         );
     }
 
@@ -943,10 +1381,26 @@ mod tests {
         let (id, record) =
             deliver(&fake, Some("<b>Ready</b>"), std::slice::from_ref(&file.0)).await;
 
-        assert_eq!(fake.methods(), ["sendPhoto"]);
+        assert_eq!(
+            fake.methods(),
+            ["sendPhoto"],
+            "no extra request for buttons"
+        );
         let body = &fake.seen()[0].body;
         assert!(body.contains("<b>Ready</b>"));
-        assert!(body.contains("fu:0"), "buttons ride on the captioned file");
+        assert!(
+            body.contains("fu:0"),
+            "follow-ups ride on the captioned file"
+        );
+        assert_eq!(
+            open_url(body),
+            artifact_link(MINI_APP, TOPIC_THREAD, &file.0),
+            "and so does its file action"
+        );
+        assert!(
+            body.find("Open artifact") < body.find("fu:0"),
+            "file action first"
+        );
         assert_eq!(
             statuses(&record),
             [DeliveryStatus::Sent, DeliveryStatus::Sent]
@@ -966,6 +1420,7 @@ mod tests {
         let seen = fake.seen();
         assert!(seen[0].body.contains("fu:0"));
         assert!(!seen[1].body.contains("fu:0"));
+        assert!(open_url(&seen[1].body).is_some());
         assert_eq!(
             statuses(&record),
             [DeliveryStatus::Sent, DeliveryStatus::Sent]

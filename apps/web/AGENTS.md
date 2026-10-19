@@ -19,7 +19,14 @@ has been removed.
 - `src/lib/router.svelte.ts`: query-string router. Canonical: `?view=threads`, `?view=thread&id=…&tab=…`
   and `?view=monitor&section=…` (sections include `workspaces`). The bot's legacy `?view=threads&id=…`, `?view=git` and bare
   `startapp=<thread_id>` links are normalized — do not break those. `?view=threads` **with** an `id`
-  stays a single-thread link for that reason; only the bare form opens the list.
+  stays a single-thread link for that reason; only the bare form opens the list. A file's `Open artifact`
+  link is `startapp=a_<key>_<thread_id>`, read from initData `start_param`, else the `tgWebAppStartParam`
+  query parameter (parsed in `src/lib/artifactLink.ts`, no `$lib` imports, tested by
+  `artifact-link.test.mjs`): it opens the thread's Artifacts tab, and `ArtifactsPane` takes the pending key
+  once (`router.takeLinkedArtifact`, which also drops `artifact=<key>` from the URL) and opens that row's
+  preview, or a notice when the key is not listed or the file is gone. The pending link is a plain field,
+  not `$state`: changing `router.current` re-runs `ThreadView`'s load (its props are getters on the route),
+  which remounts the pane and would drop the preview. Only explicit thread ids, never `active`.
 - `src/lib/transcript.ts`: projects the flat activity stream into a three-level collapsible tree
   (`work` turn → folded `group` → single `tool`) and derives the one-line summaries
 - `src/lib/diff.ts`: unified-diff parser with word-level intra-line segmentation

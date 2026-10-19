@@ -89,6 +89,184 @@ pub(crate) fn truncate_telegram_html(input: &str, max_visible_chars: usize) -> S
     out
 }
 
+/// Splits rendered Telegram HTML into parts of at most `max_utf16` UTF-16
+/// units each. Tags and entities count in full, so a part also fits when
+/// Telegram refuses its HTML and the plain-text fallback sends it raw. A part
+/// ends after the last line break that keeps it at least half full, else
+/// after the last such space, else between two characters; never inside a tag
+/// or an entity. The break character stays at the end of its part, so the
+/// text of the parts, read in order, is exactly the input's text. Formatting
+/// open at a break is closed at the end of the part and reopened with the same
+/// opening tag at the start of the next, so every part is valid on its own.
+///
+/// When formatting cannot fit at all (one tag longer than a part, or nesting
+/// whose reopening and closing tags leave no room), the rest of the text is
+/// split without its tags: the words stay, that formatting is lost. Parts
+/// with no visible text are dropped, since Telegram refuses an empty message;
+/// only whitespace can be lost that way. Text that fits is returned unchanged.
+pub(crate) fn split_telegram_html(input: &str, max_utf16: usize) -> Vec<String> {
+    if utf16_len(input) <= max_utf16 {
+        return vec![input.to_string()];
+    }
+    let mut parts = Vec::new();
+    let mut open: Vec<OpenTag> = Vec::new();
+    let mut source = input.to_string();
+    let mut pos = 0;
+    loop {
+        let rest = &source[pos..];
+        let reopen: String = open.iter().map(|tag| tag.raw.as_str()).collect();
+        let reopen_len = utf16_len(&reopen);
+        if reopen_len + utf16_len(rest) <= max_utf16 {
+            push_part(&mut parts, format!("{reopen}{rest}"));
+            return parts;
+        }
+        let Some(cut) = find_cut(rest, &open, reopen_len, max_utf16) else {
+            if open.is_empty() && !has_tags(rest) {
+                // Only when `max_utf16` is below one character: nothing fits.
+                return parts;
+            }
+            source = strip_tags(&format!("{reopen}{rest}"));
+            pos = 0;
+            open.clear();
+            continue;
+        };
+        let mut part = reopen;
+        part.push_str(&rest[..cut.end]);
+        for tag in cut.open.iter().rev() {
+            part.push_str("</");
+            part.push_str(&tag.name);
+            part.push('>');
+        }
+        push_part(&mut parts, part);
+        pos += cut.end;
+        if pos >= source.len() {
+            return parts;
+        }
+        open = cut.open;
+    }
+}
+
+/// Longest entity kept whole. A longer `&#…;` run is split like text; it is
+/// never a real character reference.
+const MAX_ENTITY_LEN: usize = 12;
+
+#[derive(Clone)]
+struct OpenTag {
+    name: String,
+    raw: String,
+}
+
+#[derive(Clone)]
+struct Cut {
+    /// Byte offset where the part's text ends (and the next part's begins).
+    end: usize,
+    /// Tags open at `end`.
+    open: Vec<OpenTag>,
+}
+
+/// The cut for the next part of `rest`, or `None` when not even its first
+/// token fits with the formatting that must be reopened and closed.
+fn find_cut(rest: &str, open_at_start: &[OpenTag], reopen_len: usize, max: usize) -> Option<Cut> {
+    let closers = |open: &[OpenTag]| open.iter().map(|tag| tag.name.len() + 3).sum::<usize>();
+    let mut open = open_at_start.to_vec();
+    let mut used = reopen_len;
+    let mut cursor = 0;
+    let mut line: Option<Cut> = None;
+    let mut space: Option<Cut> = None;
+    let mut any: Option<Cut> = None;
+    while cursor < rest.len() {
+        let tail = &rest[cursor..];
+        let tag = parse_telegram_tag(tail);
+        let len = tag
+            .as_ref()
+            .map(|tag| tag.len)
+            .or_else(|| telegram_entity_len(tail).filter(|len| *len <= MAX_ENTITY_LEN))
+            .unwrap_or_else(|| tail.chars().next().map_or(1, char::len_utf8));
+        let token = &tail[..len];
+        used += utf16_len(token);
+        if let Some(tag) = tag {
+            if tag.closing {
+                if let Some(index) = open.iter().rposition(|open| open.name == tag.name) {
+                    open.truncate(index);
+                }
+            } else {
+                open.push(OpenTag {
+                    name: tag.name.to_string(),
+                    raw: token.to_string(),
+                });
+            }
+        }
+        if used + closers(&open) > max {
+            break;
+        }
+        cursor += len;
+        let cut = Cut {
+            end: cursor,
+            open: open.clone(),
+        };
+        match token {
+            "\n" => line = Some(cut.clone()),
+            " " => space = Some(cut.clone()),
+            _ => {}
+        }
+        any = Some(cut);
+    }
+    let any = any?;
+    let half_full = |cut: &Cut| cut.end * 2 >= any.end;
+    Some(
+        line.filter(half_full)
+            .or_else(|| space.filter(half_full))
+            .unwrap_or(any),
+    )
+}
+
+fn has_tags(input: &str) -> bool {
+    let mut found = false;
+    let mut cursor = 0;
+    while cursor < input.len() && !found {
+        let rest = &input[cursor..];
+        found = parse_telegram_tag(rest).is_some();
+        cursor += rest.chars().next().map_or(1, char::len_utf8);
+    }
+    found
+}
+
+/// `input` without its Telegram tags: text and entities only.
+fn strip_tags(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    map_visible(input, |text| out.push_str(text));
+    out
+}
+
+fn push_part(parts: &mut Vec<String>, part: String) {
+    let mut visible = false;
+    map_visible(&part, |text| visible |= !text.trim().is_empty());
+    if visible {
+        parts.push(part);
+    }
+}
+
+/// Calls `f` with each run of text between tags.
+fn map_visible(input: &str, mut f: impl FnMut(&str)) {
+    let mut cursor = 0;
+    let mut text_start = 0;
+    while cursor < input.len() {
+        let rest = &input[cursor..];
+        if let Some(tag) = parse_telegram_tag(rest) {
+            f(&input[text_start..cursor]);
+            cursor += tag.len;
+            text_start = cursor;
+        } else {
+            cursor += rest.chars().next().map_or(1, char::len_utf8);
+        }
+    }
+    f(&input[text_start..]);
+}
+
+fn utf16_len(text: &str) -> usize {
+    text.encode_utf16().count()
+}
+
 fn visible_char_count(input: &str) -> usize {
     let mut count = 0;
     let mut cursor = 0;
@@ -105,132 +283,6 @@ fn visible_char_count(input: &str) -> usize {
         }
     }
     count
-}
-
-/// Converts reply HTML (the Telegram HTML subset this module produces) into
-/// the `html` body of a rich message. Rich HTML treats a plain newline as a
-/// space, so line breaks in text become `<br>`, except inside `<pre>` (kept
-/// verbatim) and next to block elements (`<pre>`, `<blockquote>`), which
-/// already end a line. A legacy spoiler `<span>` (the only span this subset
-/// keeps) becomes `<tg-spoiler>`, the only spoiler form rich HTML lists. All
-/// other tags and entities pass through unchanged: rich HTML supports every
-/// tag this subset uses.
-pub(crate) fn telegram_html_to_rich_html(input: &str) -> String {
-    let input = map_html(input, |piece, out| match piece {
-        HtmlPiece::Tag(tag, _) if tag.name == "span" => {
-            out.push_str(if tag.closing {
-                "</tg-spoiler>"
-            } else {
-                "<tg-spoiler>"
-            });
-        }
-        HtmlPiece::Tag(_, raw) | HtmlPiece::Text(raw) => out.push_str(raw),
-    });
-    let mut out = String::with_capacity(input.len() + 32);
-    let mut rest = input.as_str();
-    let mut after_block = false;
-    loop {
-        let next = [("<pre", "</pre>"), ("<blockquote", "</blockquote>")]
-            .into_iter()
-            .filter_map(|(open, close)| rest.find(open).map(|at| (at, close, open == "<pre")))
-            .min_by_key(|(at, _, _)| *at);
-        let Some((start, close, verbatim)) = next else {
-            push_rich_breaks(&mut out, rest, after_block, false);
-            return out;
-        };
-        push_rich_breaks(&mut out, &rest[..start], after_block, true);
-        let block = &rest[start..];
-        let end = block.find(close).map_or(block.len(), |at| at + close.len());
-        if verbatim {
-            out.push_str(&block[..end]);
-        } else {
-            // Inside a quotation a line break stays a line break.
-            out.push_str(&text_breaks(block[..end].trim_end_matches('\n')));
-        }
-        rest = &block[end..];
-        after_block = true;
-    }
-}
-
-/// Conservative structure of reply HTML sent as a rich message: an upper
-/// estimate of its blocks (every line break, plus each `<pre>`/`<blockquote>`
-/// and the text around it) and its deepest tag nesting.
-pub(crate) struct RichShape {
-    pub(crate) blocks: usize,
-    pub(crate) depth: usize,
-}
-
-pub(crate) fn rich_shape(input: &str) -> RichShape {
-    let mut blocks = 1;
-    let mut depth = 0usize;
-    let mut max_depth = 0;
-    let _ = map_html(input, |piece, _| match piece {
-        HtmlPiece::Tag(tag, _) if tag.closing => depth = depth.saturating_sub(1),
-        HtmlPiece::Tag(tag, _) => {
-            depth += 1;
-            max_depth = max_depth.max(depth);
-            if matches!(tag.name, "pre" | "blockquote") {
-                blocks += 2;
-            }
-        }
-        HtmlPiece::Text(text) => blocks += text.matches('\n').count(),
-    });
-    RichShape {
-        blocks,
-        depth: max_depth,
-    }
-}
-
-enum HtmlPiece<'a> {
-    Tag(HtmlTag<'a>, &'a str),
-    Text(&'a str),
-}
-
-/// Walks `input` as recognised tags and text runs, building a new string.
-fn map_html(input: &str, mut f: impl FnMut(HtmlPiece<'_>, &mut String)) -> String {
-    let mut out = String::with_capacity(input.len());
-    let mut cursor = 0;
-    let mut text_start = 0;
-    while cursor < input.len() {
-        let rest = &input[cursor..];
-        if let Some(tag) = parse_telegram_tag(rest) {
-            if text_start < cursor {
-                f(HtmlPiece::Text(&input[text_start..cursor]), &mut out);
-            }
-            let len = tag.len;
-            f(HtmlPiece::Tag(tag, &rest[..len]), &mut out);
-            cursor += len;
-            text_start = cursor;
-        } else {
-            cursor += rest.chars().next().map_or(1, char::len_utf8);
-        }
-    }
-    if text_start < input.len() {
-        f(HtmlPiece::Text(&input[text_start..]), &mut out);
-    }
-    out
-}
-
-/// Replaces line breaks in text (never inside a tag) with `<br>`.
-fn text_breaks(input: &str) -> String {
-    map_html(input, |piece, out| match piece {
-        HtmlPiece::Text(text) => out.push_str(&text.replace('\n', "<br>")),
-        HtmlPiece::Tag(_, raw) => out.push_str(raw),
-    })
-}
-
-fn push_rich_breaks(out: &mut String, text: &str, after_block: bool, before_block: bool) {
-    let text = if after_block {
-        text.trim_start_matches('\n')
-    } else {
-        text
-    };
-    let text = if before_block {
-        text.trim_end_matches('\n')
-    } else {
-        text
-    };
-    out.push_str(&text_breaks(text));
 }
 
 /// Upper bound on Telegram's "characters after entities parsing" for HTML:
@@ -776,40 +828,163 @@ fn escape_attr(text: &str) -> String {
 }
 
 #[cfg(test)]
+mod split_tests {
+    use super::{
+        map_visible, parse_telegram_tag, split_telegram_html, telegram_entity_len, utf16_len,
+    };
+
+    /// Text without tags: what a split may not change (it only adds closing
+    /// and reopening tags).
+    fn content(html: &str) -> String {
+        let mut out = String::new();
+        map_visible(html, |text| out.push_str(text));
+        out
+    }
+
+    /// Every part fits, is balanced on its own, and nothing is lost.
+    fn check(input: &str, max: usize) -> Vec<String> {
+        let parts = split_telegram_html(input, max);
+        for part in &parts {
+            assert!(
+                utf16_len(part) <= max,
+                "part over {max}: {}",
+                utf16_len(part)
+            );
+            let mut open = Vec::new();
+            let mut cursor = 0;
+            while cursor < part.len() {
+                let rest = &part[cursor..];
+                if let Some(tag) = parse_telegram_tag(rest) {
+                    if tag.closing {
+                        assert_eq!(open.pop(), Some(tag.name.to_string()), "{part}");
+                    } else {
+                        open.push(tag.name.to_string());
+                    }
+                    cursor += tag.len;
+                } else {
+                    cursor += rest.chars().next().map_or(1, char::len_utf8);
+                }
+            }
+            assert!(open.is_empty(), "unclosed {open:?} in {part}");
+        }
+        assert_eq!(
+            parts.iter().map(|part| content(part)).collect::<String>(),
+            content(input)
+        );
+        parts
+    }
+
+    #[test]
+    fn text_that_fits_is_one_unchanged_part() {
+        assert_eq!(
+            split_telegram_html("<b>a</b> &amp; b", 4096),
+            ["<b>a</b> &amp; b"]
+        );
+    }
+
+    #[test]
+    fn breaks_at_lines_then_spaces() {
+        let input = format!("{}\n{}", "a".repeat(3000), "b ".repeat(1500));
+        let parts = check(&input, 4096);
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0], format!("{}\n", "a".repeat(3000)));
+
+        let words = "word ".repeat(1000);
+        let parts = check(&words, 4096);
+        assert_eq!(parts.len(), 2);
+        assert!(parts[0].ends_with("word "), "the space stays");
+    }
+
+    #[test]
+    fn formatting_spanning_a_break_is_closed_and_reopened() {
+        let input = format!(
+            "<b>{} <i>x</i></b> <a href=\"https://example.com/a?b=1&amp;c=2\">{}</a> <pre><code class=\"language-rust\">{}</code></pre>",
+            "bold ".repeat(900),
+            "link ".repeat(900),
+            "let x = 1;\n".repeat(400)
+        );
+        let parts = check(&input, 4096);
+        assert!(parts.len() >= 3, "{}", parts.len());
+        assert!(
+            parts[1].starts_with("<b>")
+                || parts[1].starts_with("<a href=\"https://example.com/a?b=1&amp;c=2\">")
+        );
+        assert!(
+            parts
+                .iter()
+                .skip(1)
+                .any(|part| part.starts_with("<pre><code class=\"language-rust\">"))
+        );
+    }
+
+    #[test]
+    fn entities_are_never_split() {
+        let input = "&amp;&lt;&#128512;".repeat(800);
+        for part in check(&input, 4096) {
+            for (at, _) in part.match_indices('&') {
+                assert!(
+                    telegram_entity_len(&part[at..]).is_some(),
+                    "split entity at {at}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn multibyte_text_is_measured_in_utf16_and_kept_whole() {
+        let input = "😀 中文 ".repeat(1500);
+        let parts = check(&input, 4096);
+        assert!(parts.len() >= 3);
+        assert!(parts.iter().all(|part| part.chars().count() < 4096));
+    }
+
+    #[test]
+    fn whitespace_inside_code_is_kept_across_a_break() {
+        let input = format!(
+            "<pre><code>{} {}</code></pre>",
+            "x".repeat(3000),
+            "y".repeat(2000)
+        );
+        let parts = check(&input, 4096);
+        assert_eq!(parts.len(), 2);
+        assert!(parts[0].ends_with(" </code></pre>"));
+        assert!(parts[1].starts_with("<pre><code>y"));
+    }
+
+    /// Formatting that cannot fit in any part is dropped; its text is not.
+    #[test]
+    fn formatting_too_large_for_a_part_falls_back_to_its_text() {
+        let anchor = format!(
+            "before <a href=\"https://e/{}\">x</a> after",
+            "a".repeat(5000)
+        );
+        let parts = check(&anchor, 4096);
+        assert_eq!(parts.concat(), "before x after");
+
+        let deep = format!(
+            "{}{}{}",
+            "<b><i><u>".repeat(5),
+            "z ".repeat(40),
+            "</u></i></b>".repeat(5)
+        );
+        let parts = check(&deep, 60);
+        assert!(parts.len() > 1);
+
+        let entity = format!("&#{};{}", "0".repeat(5000), "w".repeat(10));
+        check(&entity, 4096);
+    }
+
+    #[test]
+    fn a_word_longer_than_a_part_is_cut_between_characters() {
+        let input = "é".repeat(5000);
+        let parts = check(&input, 4096);
+        assert_eq!(parts.len(), 2);
+        assert_eq!(utf16_len(&parts[0]), 4096);
+    }
+}
+
+#[cfg(test)]
 mod tests {
-    #[test]
-    fn rich_html_keeps_formatting_and_turns_lines_into_breaks() {
-        use super::telegram_html_to_rich_html as rich;
-        assert_eq!(rich("<b>a</b>\nb &amp; c"), "<b>a</b><br>b &amp; c");
-        assert_eq!(
-            rich("intro\n<pre><code>x\n  y</code></pre>\nafter"),
-            "intro<pre><code>x\n  y</code></pre>after"
-        );
-        assert_eq!(
-            rich("<blockquote>one\ntwo</blockquote>\n\nafter"),
-            "<blockquote>one<br>two</blockquote>after"
-        );
-        assert_eq!(
-            rich("a <span class=\"tg-spoiler\">secret</span>"),
-            "a <tg-spoiler>secret</tg-spoiler>"
-        );
-        assert_eq!(rich("a\n\nb"), "a<br><br>b");
-        // A legacy spoiler with extra spacing still pairs up.
-        assert_eq!(
-            rich("<span class=\"tg-spoiler\" >secret</span>"),
-            "<tg-spoiler>secret</tg-spoiler>"
-        );
-    }
-
-    #[test]
-    fn rich_shape_counts_blocks_and_nesting_conservatively() {
-        let shape = super::rich_shape(&"<pre>x</pre>".repeat(3));
-        assert_eq!(shape.blocks, 7);
-        assert_eq!(shape.depth, 1);
-        let shape = super::rich_shape("<b><i><u>x</u></i></b>\nline");
-        assert_eq!((shape.blocks, shape.depth), (2, 3));
-    }
-
     use super::{to_telegram_html, truncate_telegram_html};
 
     #[test]

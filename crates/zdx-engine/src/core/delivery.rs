@@ -55,6 +55,18 @@ pub struct DeliveryItem {
     pub message_id: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// For reply text sent as several messages (too long for one): which
+    /// part this item is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub part: Option<TextPart>,
+}
+
+/// Position of one message of reply text that was split.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TextPart {
+    /// 1-based.
+    pub index: usize,
+    pub total: usize,
 }
 
 impl DeliveryItem {
@@ -66,6 +78,16 @@ impl DeliveryItem {
             status: DeliveryStatus::Pending,
             message_id: None,
             error: None,
+            part: None,
+        }
+    }
+
+    /// Part `index` (1-based) of reply text sent as `total` messages.
+    #[must_use]
+    pub fn text_part(index: usize, total: usize) -> Self {
+        Self {
+            part: Some(TextPart { index, total }),
+            ..Self::text()
         }
     }
 
@@ -77,6 +99,7 @@ impl DeliveryItem {
             status: DeliveryStatus::Pending,
             message_id: None,
             error: None,
+            part: None,
         }
     }
 
@@ -102,7 +125,10 @@ impl DeliveryItem {
 
     fn label(&self, full_path: bool) -> String {
         match self.kind {
-            DeliveryItemKind::Text => "reply text".to_string(),
+            DeliveryItemKind::Text => match self.part {
+                Some(TextPart { index, total }) => format!("reply text part {index} of {total}"),
+                None => "reply text".to_string(),
+            },
             DeliveryItemKind::File => {
                 let path = self.path.as_deref().unwrap_or("(unknown file)");
                 let shown = if full_path {
@@ -312,6 +338,23 @@ mod tests {
 
         let notice = notice_text(&record).expect("notice");
         assert!(notice.starts_with("Telegram delivery: file report.html"));
+    }
+
+    #[test]
+    fn a_missing_text_part_is_named_by_its_position() {
+        let mut first = DeliveryItem::text_part(1, 2);
+        first.mark_sent(Some(1));
+        let mut second = DeliveryItem::text_part(2, 2);
+        second.mark_failed("Bad Request: message is too long");
+        let record = record(vec![first, second]);
+
+        let summary = user_summary(&record).expect("summary");
+        assert!(summary.contains("• reply text part 2 of 2: not delivered"));
+        assert!(!summary.contains("part 1 of 2"));
+        let json = serde_json::to_string(&record).expect("json");
+        assert!(json.contains("\"part\":{\"index\":2,\"total\":2}"));
+        let single = serde_json::to_string(&DeliveryItem::text()).expect("json");
+        assert!(!single.contains("part"), "unchanged for one-message text");
     }
 
     #[test]

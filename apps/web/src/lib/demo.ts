@@ -715,6 +715,7 @@ export const demoTrajectory: ThreadTrajectoryReport = {
 export const demoArtifacts: ArtifactsResponse = {
   artifacts: [
     {
+      key: "1a2b3c4d5e6f7a8b",
       name: "provider-comparison.html",
       path: "/Users/me/.zdx/artifacts/threads/demo/provider-comparison.html",
       rel: "provider-comparison.html",
@@ -727,6 +728,7 @@ export const demoArtifacts: ArtifactsResponse = {
       modified_at: "2026-09-20T17:12:05.220Z",
     },
     {
+      key: "4d5e6f7a8b9c0d1e",
       name: "voice-note.ogg",
       path: "/Users/me/.zdx/artifacts/threads/demo/voice-note.ogg",
       rel: "voice-note.ogg",

@@ -5,8 +5,9 @@
 //! itself (a separate "Suggested replies" message only when the reply has no
 //! text). A tap dispatches that suggestion as the user's next message (a
 //! normal new turn). Taps change only the keyboard, never the message text,
-//! because the buttons usually sit on the answer. Nothing blocks while the
-//! buttons sit unanswered.
+//! because the buttons usually sit on the answer, and keep any link buttons
+//! the message also carries (a captioned file's `Open artifact`). Nothing
+//! blocks while the buttons sit unanswered.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -91,16 +92,18 @@ pub(crate) async fn send_followups(
     }
 }
 
-/// Keyboard left after a tap: the chosen suggestion, inert.
-fn chosen_keyboard(item: &str) -> InlineKeyboardMarkup {
+/// Keyboard left after a tap: the `kept` link rows, then the chosen
+/// suggestion, inert.
+fn chosen_keyboard(mut kept: Vec<Vec<InlineKeyboardButton>>, item: &str) -> InlineKeyboardMarkup {
+    kept.push(vec![InlineKeyboardButton::callback(
+        truncate_chars(
+            &format!("▶️ {}", strip_markdown_markers(item)),
+            MAX_BUTTON_CHARS,
+        ),
+        "fu:-",
+    )]);
     InlineKeyboardMarkup {
-        inline_keyboard: vec![vec![InlineKeyboardButton::callback(
-            truncate_chars(
-                &format!("▶️ {}", strip_markdown_markers(item)),
-                MAX_BUTTON_CHARS,
-            ),
-            "fu:-",
-        )]],
+        inline_keyboard: kept,
     }
 }
 
@@ -121,8 +124,12 @@ pub(crate) async fn handle_callback(
     };
     let chat_id = message.chat.id;
 
-    // Dismiss: remove the buttons without starting a turn. The message text
-    // stays, since it is usually the reply itself.
+    // File actions on the same message (a captioned file's `Open artifact`)
+    // outlive the suggestions, so every edit below keeps them.
+    let kept = message.link_rows();
+
+    // Dismiss: remove the suggestions without starting a turn. The message
+    // text stays, since it is usually the reply itself.
     if data == "x" {
         {
             let mut map = context
@@ -131,8 +138,11 @@ pub(crate) async fn handle_callback(
                 .expect("followup lock poisoned");
             map.remove(&(chat_id, message.id));
         }
+        let markup = InlineKeyboardMarkup {
+            inline_keyboard: kept,
+        };
         let _ = client
-            .edit_message_reply_markup(chat_id, message.id, &InlineKeyboardMarkup::empty())
+            .edit_message_reply_markup(chat_id, message.id, &markup)
             .await;
         let _ = client.answer_callback_query(&callback.id, None).await;
         return;
@@ -159,7 +169,7 @@ pub(crate) async fn handle_callback(
     };
 
     let _ = client
-        .edit_message_reply_markup(chat_id, message.id, &chosen_keyboard(&item))
+        .edit_message_reply_markup(chat_id, message.id, &chosen_keyboard(kept, &item))
         .await;
     let _ = client.answer_callback_query(&callback.id, None).await;
 
@@ -221,7 +231,7 @@ mod tests {
         assert!(keyboard(&[]).is_none());
         let markup = keyboard(&["One".to_string(), "Two".to_string()]).expect("keyboard");
         assert_eq!(markup.inline_keyboard.len(), 3);
-        let chosen = chosen_keyboard("Two");
+        let chosen = chosen_keyboard(Vec::new(), "Two");
         assert_eq!(chosen.inline_keyboard.len(), 1);
     }
 
@@ -274,6 +284,70 @@ mod tests {
                 .any(|m| m == "editMessageText" || m == "deleteMessage"),
             "{methods:?}"
         );
+    }
+
+    /// A captioned file carries its `Open artifact` link and the follow-ups.
+    /// Dismiss (even with no suggestions on record, as after a restart) and a
+    /// tap replace only the follow-ups; the file action stays.
+    #[tokio::test]
+    async fn taps_and_dismiss_keep_the_file_action() {
+        use crate::telegram::fake::{FakeTelegram, TOKEN};
+
+        let _home = zdx_engine::test_support::temp_zdx_home();
+        let fake = FakeTelegram::start().await;
+        let client = TelegramClient::with_base_url(TOKEN.to_string(), fake.base_url.clone());
+        let context = Arc::new(BotContext::for_test(
+            client.clone(),
+            zdx_engine::config::Config::default(),
+            std::env::temp_dir(),
+        ));
+        let queues = crate::bot::queue::new_chat_queues();
+        let link =
+            "https://t.me/zdx_test_bot/app?startapp=a_0123456789abcdef_telegram--1001-topic-7";
+        let callback = |data: &str| -> CallbackQuery {
+            serde_json::from_value(json!({
+                "id": "cb1",
+                "from": { "id": 7, "is_bot": false },
+                "data": data,
+                "message": {
+                    "message_id": 901,
+                    "chat": { "id": -1001, "type": "supergroup", "is_forum": true },
+                    "message_thread_id": 7,
+                    "reply_markup": { "inline_keyboard": [
+                        [{ "text": "↗ Open artifact", "url": link }],
+                        [{ "text": "Next step", "callback_data": "fu:0" }],
+                        [{ "text": "✕ Dismiss", "callback_data": "fu:x" }],
+                    ]},
+                },
+            }))
+            .expect("callback")
+        };
+        let markups = || -> Vec<serde_json::Value> {
+            fake.seen()
+                .into_iter()
+                .filter(|seen| seen.method == "editMessageReplyMarkup")
+                .map(|seen| {
+                    let body: serde_json::Value = serde_json::from_str(&seen.body).expect("json");
+                    body["reply_markup"]["inline_keyboard"].clone()
+                })
+                .collect()
+        };
+        let open = json!([{ "text": "↗ Open artifact", "url": link }]);
+
+        handle_callback(&context, &queues, &client, &callback("fu:x"), "x").await;
+        register(&context, -1001, 901, vec!["Next step".to_string()]);
+        handle_callback(&context, &queues, &client, &callback("fu:0"), "0").await;
+
+        let edits = markups();
+        assert_eq!(edits.len(), 2, "{edits:?}");
+        assert_eq!(
+            edits[0],
+            json!([open.clone()]),
+            "dismiss keeps only the link"
+        );
+        assert_eq!(edits[1][0], open, "tap keeps the link first");
+        assert_eq!(edits[1][1][0]["callback_data"], "fu:-");
+        assert_eq!(edits[1].as_array().map(Vec::len), Some(2));
     }
 
     #[test]

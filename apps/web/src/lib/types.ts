@@ -142,6 +142,9 @@ export interface ArtifactAttachment {
 
 /** One row of the thread Artifacts tab. */
 export interface ArtifactItem extends ArtifactAttachment {
+  /** Opaque id of the file in this thread (`artifact_key`): a lookup id for
+   *  `Open artifact` links, not a path and not an authorization. */
+  key: string;
   /** Relative to the thread artifact dir when inside it, else null. */
   rel: string | null;
   source: ArtifactSource;

@@ -123,21 +123,10 @@ fn extract_media_tags(input: &str) -> (String, Vec<String>) {
     (cleaned, media_values)
 }
 
+/// Same rule as the shared artifact projection, so the file sent is the file
+/// the Mini App lists (and an `Open artifact` link names).
 fn parse_media_path(raw: &str) -> Option<PathBuf> {
-    let candidate = raw
-        .trim()
-        .trim_matches('`')
-        .trim_matches('"')
-        .trim_matches('\'')
-        .trim_start_matches('(')
-        .trim_end_matches(')')
-        .trim_end_matches([',', ';']);
-
-    if candidate.starts_with('/') {
-        Some(PathBuf::from(candidate))
-    } else {
-        None
-    }
+    zdx_engine::core::artifacts::clean_media_path(raw).map(PathBuf::from)
 }
 
 pub(super) fn is_valid_media_path(path: &Path) -> bool {

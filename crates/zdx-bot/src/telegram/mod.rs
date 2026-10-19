@@ -1228,97 +1228,6 @@ impl TelegramClient {
             .await
     }
 
-    /// Sends one rich message (Bot API `sendRichMessage`) whose `html` body
-    /// references `files` with `<tg-document src="tg://document?id=…">` tags
-    /// (see [`rich_document_id`]). All files are uploaded in the same
-    /// multipart request; the form is rebuilt for every attempt. A reply
-    /// target is sent as `reply_parameters`, the only form this method takes.
-    ///
-    /// # Errors
-    /// Returns an error if a file cannot be read or is too large, or the
-    /// request fails.
-    pub async fn send_rich_documents(
-        &self,
-        chat_id: i64,
-        html: &str,
-        files: &[&Path],
-        options: &MediaSend<'_>,
-    ) -> Result<Message> {
-        let mut uploads = Vec::with_capacity(files.len());
-        for path in files {
-            let data = std::fs::read(path)
-                .with_context(|| format!("read document file {}", path.display()))?;
-            if data.len() > TELEGRAM_DOCUMENT_MAX_BYTES {
-                bail!(
-                    "document exceeds Telegram limit ({} bytes > {} bytes)",
-                    data.len(),
-                    TELEGRAM_DOCUMENT_MAX_BYTES
-                );
-            }
-            let name = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("document.bin")
-                .to_string();
-            let mime = infer::get(&data).map_or_else(
-                || "application/octet-stream".to_string(),
-                |kind| kind.mime_type().to_string(),
-            );
-            uploads.push((name, mime, data));
-        }
-        let media: Vec<Value> = (0..uploads.len())
-            .map(|index| {
-                let id = rich_document_id(index);
-                serde_json::json!({
-                    "id": id,
-                    "media": { "type": "document", "media": format!("attach://{id}") },
-                })
-            })
-            .collect();
-        let rich_message = serde_json::json!({ "html": html, "media": media }).to_string();
-        let reply_parameters = options.reply_parameters.clone().or_else(|| {
-            options
-                .reply_to_message_id
-                .map(|message_id| ReplyParameters {
-                    message_id,
-                    chat_id: None,
-                    allow_sending_without_reply: Some(true),
-                })
-        });
-        let build = || -> Result<reqwest::multipart::Form> {
-            let mut form = reqwest::multipart::Form::new()
-                .text("chat_id", chat_id.to_string())
-                .text("rich_message", rich_message.clone());
-            if let Some(thread) = options.message_thread_id {
-                form = form.text("message_thread_id", thread.to_string());
-            }
-            if let Some(markup) = options.reply_markup {
-                form = form.text(
-                    "reply_markup",
-                    serde_json::to_string(markup).context("serialize reply_markup")?,
-                );
-            }
-            if let Some(reply) = &reply_parameters {
-                form = form.text(
-                    "reply_parameters",
-                    serde_json::to_string(reply).context("serialize reply_parameters")?,
-                );
-            }
-            for (index, (name, mime, data)) in uploads.iter().enumerate() {
-                let part = reqwest::multipart::Part::bytes(data.clone())
-                    .file_name(name.clone())
-                    .mime_str(mime)
-                    .context("set document mime type")?;
-                form = form.part(rich_document_id(index), part);
-            }
-            Ok(form)
-        };
-        let spec = CallSpec::new_message("sendRichMessage", chat_id, options.message_thread_id);
-        let url = self.url("sendRichMessage");
-        self.call(spec, || Ok(self.http.post(&url).multipart(build()?)))
-            .await
-    }
-
     async fn send_file_raw(
         &self,
         chat_id: i64,
@@ -1544,12 +1453,6 @@ fn skipped(spec: &CallSpec<'_>, chat: i64, remaining: Duration) -> anyhow::Error
         remaining,
     }
     .into()
-}
-
-/// Media id of the `index`-th document in a rich message: used both in the
-/// `tg://document?id=` link and as the multipart field name.
-pub(crate) fn rich_document_id(index: usize) -> String {
-    format!("file{index}")
 }
 
 /// Telegram's description for an API refusal anywhere in the chain.

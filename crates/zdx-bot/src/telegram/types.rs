@@ -131,6 +131,11 @@ pub struct Message {
     /// Original message this message replies to.
     #[serde(default, rename = "reply_to_message")]
     pub reply_to: Option<Box<Message>>,
+    /// Inline keyboard of a message the bot sent, as Telegram returns it on a
+    /// callback query. Kept raw: an unknown button type must not fail the
+    /// update. Read through [`Message::link_rows`].
+    #[serde(default)]
+    pub(crate) reply_markup: Option<serde_json::Value>,
     /// Internal marker used when we route a General message into a newly
     /// created topic before handling it.
     #[serde(skip)]
@@ -159,6 +164,34 @@ impl Message {
     pub fn effective_thread_id(&self) -> Option<i64> {
         self.thread_id
             .or_else(|| self.reply_to.as_ref().and_then(|m| m.thread_id))
+    }
+
+    /// Rows of this message's inline keyboard in which every button only
+    /// opens a link (`url`), such as a file's `Open artifact`. Edits that
+    /// replace the follow-up buttons keep these rows.
+    pub(crate) fn link_rows(&self) -> Vec<Vec<InlineKeyboardButton>> {
+        let Some(rows) = self
+            .reply_markup
+            .as_ref()
+            .and_then(|markup| markup.get("inline_keyboard"))
+            .and_then(serde_json::Value::as_array)
+        else {
+            return Vec::new();
+        };
+        rows.iter()
+            .filter_map(|row| {
+                let buttons = row.as_array()?;
+                let links = buttons
+                    .iter()
+                    .map(|button| {
+                        let text = button.get("text")?.as_str()?;
+                        let url = button.get("url")?.as_str()?;
+                        Some(InlineKeyboardButton::url(text, url))
+                    })
+                    .collect::<Option<Vec<_>>>()?;
+                (!links.is_empty()).then_some(links)
+            })
+            .collect()
     }
 
     /// Plain text the sender wrote, from `text` or from a rich message.
