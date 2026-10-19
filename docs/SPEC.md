@@ -307,11 +307,12 @@ Behavior at the boundary:
 
 - Posts into a Telegram chat or forum topic other than the current conversation. One tool with an `action` enum: `send_message`, `send_document`, `create_topic`.
 - Requires `chat_id`; `message_thread_id` selects a forum topic and is omitted for the group's General topic. `create_topic` returns the new topic id.
+- `send_message` and `send_document` return the receipt from Telegram's answer: `chat_id`, `message_id`, `message_thread_id` (set only when Telegram marks the message as a forum-topic message), and `url`, the message link (`https://t.me/c/<internal_chat_id>/<topic_id>/<message_id>` in a topic, `https://t.me/c/<internal_chat_id>/<message_id>` otherwise; `null` for private chats and basic groups, which have no such link). An accepted answer without a `message_id` is reported as possibly delivered, never as a made-up id. Each call sends exactly one message, so there is one receipt.
 - `send_message` defaults to `parse_mode: html` and sends text raw — the Markdown conversion on the normal reply path does not apply. Body is capped at 4096 characters and captions at 1024; both are rejected locally with a clear message rather than by the Telegram API.
 - `send_document` resolves paths like other file tools. An optional `bot_token` overrides the configured bot; otherwise the token resolves from `telegram.bot_token`, then `ZDX_TELEGRAM_BOT_TOKEN`, then `TELEGRAM_BOT_TOKEN`.
 - A Telegram flood refusal (HTTP 429 with `retry_after`) is retried after the full wait, at most three attempts within two minutes. A timeout or unreadable answer is reported as possibly delivered and is never resent automatically. This client has no pacing gate: it runs outside the bot process and cannot see the bot's per-chat state.
 - Needs no shell, so the orchestrator can post to other topics; it previously could not.
-- Shares its implementation with the `zdx telegram` CLI subcommands, which are unchanged apart from `--parse-mode markdown` now sending Markdown instead of HTML.
+- Shares its implementation with the `zdx telegram` CLI subcommands. `zdx telegram send-message` and `send-document` print `Sent message to Telegram (message_id <id>): <url>` (or `(message_id <id>).` with no link), or with `--json` one line `{"chat_id":…,"message_thread_id":…,"message_id":…,"url":…}`. `create-topic` prints the new topic id. `--parse-mode markdown` sends Markdown, not HTML.
 - Posting is externally visible and cannot be cleanly unsent; the tool description instructs confirming the destination unless the user named it in the current turn.
 
 ### `gh_api`

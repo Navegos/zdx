@@ -917,7 +917,8 @@ enum TelegramCommands {
         bot_token: Option<String>,
     },
 
-    /// Send a message to a chat (optionally to a forum topic)
+    /// Send a message to a chat (optionally to a forum topic); prints the
+    /// posted message id and, in a supergroup, its message link
     SendMessage {
         /// Telegram chat ID
         #[arg(long, value_name = "CHAT_ID", allow_hyphen_values = true)]
@@ -943,8 +944,13 @@ enum TelegramCommands {
         /// Bot token override
         #[arg(long, value_name = "TOKEN")]
         bot_token: Option<String>,
+
+        /// Print the receipt as one JSON object instead of text
+        #[arg(long)]
+        json: bool,
     },
-    /// Send a document (file) to a chat (optionally to a forum topic)
+    /// Send a document (file) to a chat (optionally to a forum topic); prints
+    /// the posted message id and, in a supergroup, its message link
     SendDocument {
         /// Telegram chat ID
         #[arg(long, value_name = "CHAT_ID", allow_hyphen_values = true)]
@@ -965,6 +971,10 @@ enum TelegramCommands {
         /// Bot token override
         #[arg(long, value_name = "TOKEN")]
         bot_token: Option<String>,
+
+        /// Print the receipt as one JSON object instead of text
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -1750,6 +1760,7 @@ async fn dispatch_telegram(command: TelegramCommands, context: &DispatchContext<
             message_thread_id,
             parse_mode,
             bot_token,
+            json,
         } => {
             commands::telegram::send_message(
                 context.config,
@@ -1758,6 +1769,7 @@ async fn dispatch_telegram(command: TelegramCommands, context: &DispatchContext<
                 message_thread_id,
                 &text,
                 &parse_mode,
+                json,
             )
             .await
         }
@@ -1767,6 +1779,7 @@ async fn dispatch_telegram(command: TelegramCommands, context: &DispatchContext<
             caption,
             message_thread_id,
             bot_token,
+            json,
         } => {
             commands::telegram::send_document(
                 context.config,
@@ -1775,6 +1788,7 @@ async fn dispatch_telegram(command: TelegramCommands, context: &DispatchContext<
                 message_thread_id,
                 &path,
                 caption.as_deref(),
+                json,
             )
             .await
         }

@@ -12,7 +12,8 @@ use serde_json::{Value, json};
 use super::{ToolContext, ToolDefinition, resolve_existing_path};
 use crate::core::events::ToolOutput;
 use crate::telegram::{
-    MAX_CAPTION_CHARS, MAX_MESSAGE_CHARS, ParseMode, TelegramOutbound, resolve_bot_token,
+    MAX_CAPTION_CHARS, MAX_MESSAGE_CHARS, ParseMode, SentMessage, TelegramOutbound,
+    resolve_bot_token,
 };
 
 /// Returns the tool definition for the telegram tool.
@@ -20,7 +21,7 @@ pub fn definition() -> ToolDefinition {
     ToolDefinition {
         name: "Telegram".to_string(),
         description: format!(
-            "Post into a Telegram chat or forum topic other than the current conversation: send a message, send a file, or create a forum topic. Use when the user asks to send something to another topic, group, or chat (\"manda isso pro tópico X\", \"post this summary in group Z\", \"create a new topic with the trip info\"). Do NOT use it to reply in the current conversation — that is just your normal answer.\n\nResolving `chat_id`: never guess it. Prefer a named profile in the Telegram Workspaces block or `$ZDX_HOME/config.toml` `[telegram.profiles.<name>]`; otherwise read it off an attachment path (`$ZDX_HOME/telegram/<chat_id>/...`); otherwise ask the user. Supergroup ids are negative (`-100...`) — keep the minus sign. `message_thread_id` is the forum topic id; omit it to post in the group's General topic.\n\nFormatting: `parse_mode` defaults to `html`, and the text is sent raw — the Markdown conversion used on the normal reply path does not run here, and one unsupported tag rejects the whole message. Supported tags: b, strong, i, em, u, s, code, pre, a href, blockquote, tg-spoiler. Not supported: headings, ul/ol/li, tables, br, div, span. Use plain newlines and bullet characters, and escape literal &, <, and >. Use `parse_mode: \"plain\"` when the text is not marked up. If the content is a table, a diagram, or longer than a couple of screens, write a file and use `send_document` instead of fighting the markup.\n\nLimits: message body {MAX_MESSAGE_CHARS} characters, caption {MAX_CAPTION_CHARS}. Split long content by section into several calls rather than truncating it.\n\nWhat this actually creates: `create_topic` plus `send_message` produces a topic containing text, not a resumable agent conversation. The posted content is not part of any thread history, and a user replying there starts a fresh thread with no context. Say so plainly instead of implying continuity.\n\nPosting is externally visible and cannot be cleanly unsent. Send without confirming only when the user named the destination in the current turn; otherwise confirm the target chat and topic first, especially for chats with other people in them."
+            "Post into a Telegram chat or forum topic other than the current conversation: send a message, send a file, or create a forum topic. Use when the user asks to send something to another topic, group, or chat (\"manda isso pro tópico X\", \"post this summary in group Z\", \"create a new topic with the trip info\"). Do NOT use it to reply in the current conversation — that is just your normal answer.\n\nResolving `chat_id`: never guess it. Prefer a named profile in the Telegram Workspaces block or `$ZDX_HOME/config.toml` `[telegram.profiles.<name>]`; otherwise read it off an attachment path (`$ZDX_HOME/telegram/<chat_id>/...`); otherwise ask the user. Supergroup ids are negative (`-100...`) — keep the minus sign. `message_thread_id` is the forum topic id; omit it to post in the group's General topic.\n\nFormatting: `parse_mode` defaults to `html`, and the text is sent raw — the Markdown conversion used on the normal reply path does not run here, and one unsupported tag rejects the whole message. Supported tags: b, strong, i, em, u, s, code, pre, a href, blockquote, tg-spoiler. Not supported: headings, ul/ol/li, tables, br, div, span. Use plain newlines and bullet characters, and escape literal &, <, and >. Use `parse_mode: \"plain\"` when the text is not marked up. If the content is a table, a diagram, or longer than a couple of screens, write a file and use `send_document` instead of fighting the markup.\n\nLimits: message body {MAX_MESSAGE_CHARS} characters, caption {MAX_CAPTION_CHARS}. Split long content by section into several calls rather than truncating it.\n\nA send returns the posted `message_id` and, in a supergroup, its `url` (a `t.me/c` message link). Use that link when you need to point at the post; never build one from the topic id.\n\nWhat this actually creates: `create_topic` plus `send_message` produces a topic containing text, not a resumable agent conversation. The posted content is not part of any thread history, and a user replying there starts a fresh thread with no context. Say so plainly instead of implying continuity.\n\nPosting is externally visible and cannot be cleanly unsent. Send without confirming only when the user named the destination in the current turn; otherwise confirm the target chat and topic first, especially for chats with other people in them."
         ),
         input_schema: json!({
             "type": "object",
@@ -150,11 +151,7 @@ pub async fn execute(input: &Value, ctx: &ToolContext) -> ToolOutput {
                 .send_message(input.chat_id, text, input.message_thread_id, parse_mode)
                 .await
             {
-                Ok(()) => ToolOutput::success(json!({
-                    "sent": true,
-                    "chat_id": input.chat_id,
-                    "message_thread_id": input.message_thread_id,
-                })),
+                Ok(sent) => ToolOutput::success(sent_json(&sent, None)),
                 Err(err) => failure(&err),
             }
         }
@@ -179,12 +176,10 @@ pub async fn execute(input: &Value, ctx: &ToolContext) -> ToolOutput {
                 )
                 .await
             {
-                Ok(()) => ToolOutput::success(json!({
-                    "sent": true,
-                    "chat_id": input.chat_id,
-                    "message_thread_id": input.message_thread_id,
-                    "file": resolved.resolved_path.display().to_string(),
-                })),
+                Ok(sent) => ToolOutput::success(sent_json(
+                    &sent,
+                    Some(resolved.resolved_path.display().to_string()),
+                )),
                 Err(err) => failure(&err),
             }
         }
@@ -208,6 +203,20 @@ pub async fn execute(input: &Value, ctx: &ToolContext) -> ToolOutput {
             Some("Expected send_message, send_document, or create_topic".to_string()),
         ),
     }
+}
+
+fn sent_json(sent: &SentMessage, file: Option<String>) -> Value {
+    let mut value = json!({
+        "sent": true,
+        "chat_id": sent.chat_id,
+        "message_thread_id": sent.message_thread_id,
+        "message_id": sent.message_id,
+        "url": sent.url,
+    });
+    if let Some(file) = file {
+        value["file"] = file.into();
+    }
+    value
 }
 
 fn failure(err: &anyhow::Error) -> ToolOutput {
