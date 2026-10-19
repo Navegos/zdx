@@ -184,11 +184,10 @@ impl Default for TelegramServerConfig {
 /// Per-chat Telegram project profile.
 ///
 /// A profile plays one of two roles. An ordinary **workspace** profile binds a
-/// chat to a root and owns that root for workspace skill attribution and the
-/// orchestrator's workspace list. An **orchestrator** profile
-/// (`orchestrator = true`) is a management home base: it keeps the same
-/// chat→root binding for its own turns but is excluded from both, so a
-/// management group and a workspace group may share a `cwd`.
+/// chat to a root, lists that root's skills, and appears in the orchestrator's
+/// workspace list; several workspaces may share a root. An **orchestrator**
+/// profile (`orchestrator = true`) is a management home base: it keeps the
+/// same chat→root binding for its own turns but is excluded from both.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TelegramProfileConfig {
     /// Telegram chat ID routed to this profile.
@@ -226,8 +225,8 @@ impl TelegramProfileConfig {
             .map_or_else(|| self.cwd_path(), expand_tilde)
     }
 
-    /// Whether this profile owns its root for workspace skill attribution and
-    /// is listed as a worker destination. Orchestrator homes never do.
+    /// Whether this profile lists its root's skills and is listed as a worker
+    /// destination. Orchestrator homes never do.
     #[must_use]
     pub fn is_routable_workspace(&self) -> bool {
         !self.orchestrator
@@ -1193,8 +1192,7 @@ impl Config {
     ///
     /// # Errors
     /// Returns an error if profile names/cwds are blank, chat IDs are
-    /// duplicated, two routable workspaces resolve to the same root, or a
-    /// `worker_root` is blank or missing on disk.
+    /// duplicated, or a `worker_root` is blank or missing on disk.
     pub fn validate_telegram_profiles(&self) -> Result<()> {
         let mut seen_chat_ids: BTreeMap<i64, &str> = BTreeMap::new();
         for (name, profile) in &self.telegram.profiles {
@@ -1223,25 +1221,6 @@ impl Config {
                 bail!(
                     "telegram profiles '{existing_name}' and '{name}' use duplicate chat ID {}",
                     profile.chat_id
-                );
-            }
-        }
-
-        // Only routable workspaces own a root. Two of them on one root would
-        // make workspace skill attribution depend on profile name ordering,
-        // so reject it. An orchestrator home sharing a workspace's
-        // root stays legal: that is the separation this enables.
-        let mut seen_roots: BTreeMap<PathBuf, &str> = BTreeMap::new();
-        for (name, profile) in &self.telegram.profiles {
-            if !profile.is_routable_workspace() {
-                continue;
-            }
-            let root = canonical_or_self(&profile.cwd_path());
-            if let Some(existing_name) = seen_roots.insert(root.clone(), name) {
-                bail!(
-                    "telegram workspaces '{existing_name}' and '{name}' resolve to the same root {}; \
-                     skill attribution would depend on profile name order",
-                    root.display()
                 );
             }
         }
@@ -4851,7 +4830,7 @@ allowlist_user_ids = [42]
     }
 
     #[test]
-    fn validate_rejects_two_workspaces_on_one_root_but_allows_an_orchestrator() {
+    fn validate_allows_profiles_to_share_a_root() {
         let dir = tempfile::tempdir().unwrap();
         let shared = dir.path().join("work");
         fs::create_dir_all(&shared).unwrap();
@@ -4862,32 +4841,18 @@ allowlist_user_ids = [42]
             worker_root: None,
         };
 
-        // Management group + workspace group on one root: the whole point.
-        let ok = Config {
+        let config = Config {
             telegram: TelegramConfig {
                 profiles: BTreeMap::from([
                     ("commons".to_string(), profile(-100_002, false)),
                     ("control".to_string(), profile(-100_001, true)),
-                ]),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        ok.validate_telegram_profiles().unwrap();
-
-        // Two routable workspaces on one root would attribute skills by name order.
-        let clash = Config {
-            telegram: TelegramConfig {
-                profiles: BTreeMap::from([
-                    ("commons".to_string(), profile(-100_002, false)),
                     ("other".to_string(), profile(-100_003, false)),
                 ]),
                 ..Default::default()
             },
             ..Default::default()
         };
-        let err = format!("{:#}", clash.validate_telegram_profiles().unwrap_err());
-        assert!(err.contains("same root"), "{err}");
+        config.validate_telegram_profiles().unwrap();
     }
 
     #[test]

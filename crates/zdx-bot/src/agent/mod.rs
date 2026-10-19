@@ -319,24 +319,30 @@ const WORKSPACE_SKILL_DESCRIPTION_CHARS: usize = 140;
 /// Project-level skills each Telegram workspace's workers will discover, keyed
 /// by profile name. Only project sources are scanned (user/global skills are
 /// already in the orchestrator's own catalog). A skill reachable from several
-/// nested workspaces is attributed once, to the deepest root that contains it.
+/// nested workspaces is attributed once, to the deepest root that contains it,
+/// and listed under every workspace bound to that root.
 ///
 /// Orchestrator homes are skipped: they are not rendered, so letting one win
-/// attribution would drop the skills from the prompt entirely. Equal-depth ties
-/// go to the first profile in name order, so a management group sharing a
-/// workspace's root could otherwise silently claim its skills.
+/// attribution would drop the skills from the prompt entirely.
 fn workspace_skills(config: &Config) -> HashMap<String, Vec<(String, String)>> {
     use zdx_engine::config::SkillSourceToggles;
     use zdx_engine::skills::{LoadSkillsOptions, SkillSource, load_skills};
 
-    // skill file → (owning profile, depth of that profile's root)
-    let mut owner: HashMap<PathBuf, (String, usize, String, String)> = HashMap::new();
+    // skill file → (owning root, its depth, skill name, description)
+    let mut owner: HashMap<PathBuf, (PathBuf, usize, String, String)> = HashMap::new();
+    let mut profiles_by_root: HashMap<PathBuf, Vec<String>> = HashMap::new();
     for (name, profile) in &config.telegram.profiles {
         if !profile.is_routable_workspace() {
             continue;
         }
         let root = profile.cwd_path();
         let root = root.canonicalize().unwrap_or(root);
+        let sharing = profiles_by_root.entry(root.clone()).or_default();
+        sharing.push(name.clone());
+        if sharing.len() > 1 {
+            // Same root, same skills: already scanned for an earlier profile.
+            continue;
+        }
         let depth = root.components().count();
         let options = LoadSkillsOptions {
             sources: SkillSourceToggles {
@@ -367,7 +373,7 @@ fn workspace_skills(config: &Config) -> HashMap<String, Vec<(String, String)>> {
                 owner.insert(
                     skill.file_path.clone(),
                     (
-                        name.clone(),
+                        root.clone(),
                         rank,
                         skill.name.clone(),
                         truncate_description(&skill.description, WORKSPACE_SKILL_DESCRIPTION_CHARS),
@@ -378,11 +384,13 @@ fn workspace_skills(config: &Config) -> HashMap<String, Vec<(String, String)>> {
     }
 
     let mut by_profile: HashMap<String, Vec<(String, String)>> = HashMap::new();
-    for (profile, _, skill_name, description) in owner.into_values() {
-        by_profile
-            .entry(profile)
-            .or_default()
-            .push((skill_name, description));
+    for (root, _, skill_name, description) in owner.into_values() {
+        for profile in profiles_by_root.get(&root).into_iter().flatten() {
+            by_profile
+                .entry(profile.clone())
+                .or_default()
+                .push((skill_name.clone(), description.clone()));
+        }
     }
     for skills in by_profile.values_mut() {
         skills.sort();
@@ -911,6 +919,49 @@ mod tests {
         let block = telegram_workspaces_block(&config, None).unwrap();
         assert!(block.contains("  - skill `dub-attest`: Run device attestation end to end."));
         assert_eq!(block.matches("skill `parity-flow`").count(), 1);
+    }
+
+    /// Two workspace groups may share one root. Neither silently claims the
+    /// root's skills: both list them.
+    #[test]
+    fn workspaces_sharing_a_root_both_list_its_skills() {
+        use std::collections::BTreeMap;
+
+        use zdx_engine::config::{TelegramConfig, TelegramProfileConfig};
+
+        let _home = zdx_engine::test_support::temp_zdx_home();
+
+        let root = make_temp_dir();
+        std::fs::create_dir_all(root.join(".zdx/skills/shared-flow")).unwrap();
+        std::fs::write(
+            root.join(".zdx/skills/shared-flow/SKILL.md"),
+            "---\nname: shared-flow\ndescription: Shared flow.\n---\nbody\n",
+        )
+        .unwrap();
+        let workspace = |chat_id: i64| TelegramProfileConfig {
+            chat_id,
+            cwd: root.display().to_string(),
+            orchestrator: false,
+            worker_root: None,
+        };
+        let config = Config {
+            telegram: TelegramConfig {
+                profiles: BTreeMap::from([
+                    ("alpha".to_string(), workspace(-1001)),
+                    ("beta".to_string(), workspace(-1002)),
+                ]),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let expected = vec![("shared-flow".to_string(), "Shared flow.".to_string())];
+        let skills = workspace_skills(&config);
+        assert_eq!(skills.get("alpha"), Some(&expected));
+        assert_eq!(skills.get("beta"), Some(&expected));
+
+        let block = telegram_workspaces_block(&config, None).unwrap();
+        assert_eq!(block.matches("skill `shared-flow`").count(), 2);
     }
 
     #[test]
