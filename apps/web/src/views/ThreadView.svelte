@@ -27,6 +27,13 @@
   let { id, tab, onmenu }: Props = $props();
 
   let data = $state<ThreadResponse | null>(null);
+  /** For a legacy `?id=active` link: the concrete thread the first load
+   *  resolved, pinned so a later poll cannot move an open preview to another
+   *  thread. Artifact views write (feedback), so they never use `active`. */
+  let pinnedActive = $state<{ route: string; id: string } | null>(null);
+  let artifactThreadId = $derived(
+    id === "active" ? (pinnedActive?.route === id ? pinnedActive.id : null) : id,
+  );
   let error = $state("");
   let loading = $state(true);
   let polling = false;
@@ -90,8 +97,12 @@
   async function load(showSpinner = true) {
     if (showSpinner) loading = true;
     error = "";
+    const target = id;
     try {
-      data = await api.thread(id);
+      data = await api.thread(target);
+      if (target === "active" && target === id && pinnedActive?.route !== target) {
+        pinnedActive = { route: target, id: data.id };
+      }
     } catch (e) {
       error = e instanceof ApiError ? e.message : String(e);
     } finally {
@@ -431,9 +442,13 @@
     loading={workersLoading}
   />
 {:else if activeTab === "transcript"}
-  <TranscriptPane activity={data?.activity ?? []} threadId={id} highlight={artifactJump} />
+  <TranscriptPane activity={data?.activity ?? []} threadId={artifactThreadId ?? id} highlight={artifactJump} />
 {:else if activeTab === "artifacts"}
-  <ArtifactsPane threadId={id} ongoto={gotoMessage} />
+  {#if artifactThreadId}
+    <ArtifactsPane threadId={artifactThreadId} ongoto={gotoMessage} />
+  {:else}
+    <p class="flex-1 py-8 text-center text-xs text-muted-foreground">Loading…</p>
+  {/if}
 {:else if activeTab === "trajectory"}
   {#if trajectoryLoading && !currentTrajectory}
     <p class="flex-1 py-8 text-center text-xs text-muted-foreground">Loading trajectory…</p>

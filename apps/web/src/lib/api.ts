@@ -1,5 +1,8 @@
+import type { FeedbackSubmissionPayload } from "./annotate";
 import { tg } from "./telegram";
 import type {
+  ArtifactFeedbackResponse,
+  ArtifactImageCopy,
   ArtifactsResponse,
   GitDiffResponse,
   GitFileKind,
@@ -73,6 +76,10 @@ async function get<T>(path: string, params: Record<string, string> = {}): Promis
 }
 
 async function getBlob(path: string, params: Record<string, string> = {}): Promise<Blob> {
+  return await (await getResponse(path, params)).blob();
+}
+
+async function getResponse(path: string, params: Record<string, string>): Promise<Response> {
   const auth = authHeader();
   if (!auth) {
     throw new ApiError("Open this from Telegram to authenticate.", 401);
@@ -95,7 +102,62 @@ async function getBlob(path: string, params: Record<string, string> = {}): Promi
     throw new ApiError(body || `Request failed (${res.status})`, res.status);
   }
 
-  return await res.blob();
+  return res;
+}
+
+/** Reads the canonical copy's identity headers (`get_thread_artifact_image` in server.rs). */
+async function getArtifactImage(id: string, path: string): Promise<ArtifactImageCopy> {
+  const res = await getResponse(`/api/threads/${encodeURIComponent(id)}/artifacts/image`, { path });
+  const header = (name: string) => res.headers.get(name) ?? "";
+  const width = Number(header("x-zdx-canonical-width"));
+  const height = Number(header("x-zdx-canonical-height"));
+  const sourceWidth = Number(header("x-zdx-source-width"));
+  const sourceHeight = Number(header("x-zdx-source-height"));
+  const sourceSha256 = header("x-zdx-source-sha256");
+  const canonicalSha256 = header("x-zdx-canonical-sha256");
+  const hex = /^[0-9a-f]{64}$/;
+  if (
+    !hex.test(sourceSha256) ||
+    !hex.test(canonicalSha256) ||
+    !(width > 0) ||
+    !(height > 0) ||
+    !(sourceWidth > 0) ||
+    !(sourceHeight > 0)
+  ) {
+    throw new ApiError("The image preview came without its identity. Reload and try again.", 502);
+  }
+  return { blob: await res.blob(), sourceSha256, canonicalSha256, width, height, sourceWidth, sourceHeight };
+}
+
+/**
+ * The one write call. `submission_id` makes a retry after a lost response safe:
+ * the server answers `duplicate` instead of queueing the feedback twice.
+ */
+async function postJson<T>(path: string, body: unknown): Promise<T> {
+  const auth = authHeader();
+  if (!auth) {
+    throw new ApiError("Open this from Telegram to authenticate.", 401);
+  }
+
+  const res = await fetch(new URL(path, window.location.origin), {
+    method: "POST",
+    headers: { Authorization: auth, "Content-Type": "application/json" },
+    cache: "no-store",
+    body: JSON.stringify(body),
+  });
+
+  if (!res.ok) {
+    const text = (await res.text().catch(() => "")).trim();
+    if (res.status === 401) {
+      throw new ApiError("Telegram authorization expired. Close and reopen the Mini App.", res.status);
+    }
+    if (res.status === 413) {
+      throw new ApiError("The feedback is too large. Remove some attachments and try again.", res.status);
+    }
+    throw new ApiError(text || `Request failed (${res.status})`, res.status);
+  }
+
+  return (await res.json()) as T;
 }
 
 export function formatBytes(bytes: number): string {
@@ -205,5 +267,30 @@ export const api = {
       if (demo.demoEnabled()) return demo.demoArtifactBlob(path);
     }
     return getBlob(`/api/threads/${encodeURIComponent(id)}/artifacts/file`, { path });
+  },
+
+  /**
+   * The canonical copy of an image artifact: what the preview shows, what
+   * marks are fractions of, and what the agent gets. `422` (an `ApiError`)
+   * when the image cannot be annotated, with the reason.
+   */
+  artifactImage: async (id: string, path: string): Promise<ArtifactImageCopy> => {
+    if (import.meta.env.DEV) {
+      const demo = await import("./demo");
+      if (demo.demoEnabled()) {
+        const copy = await demo.demoArtifactImage(path);
+        if ("error" in copy) throw new ApiError(copy.error, 422);
+        return copy;
+      }
+    }
+    return getArtifactImage(id, path);
+  },
+
+  sendArtifactFeedback: async (id: string, payload: FeedbackSubmissionPayload) => {
+    if (import.meta.env.DEV) {
+      const demo = await import("./demo");
+      if (demo.demoEnabled()) return demo.demoSendFeedback(payload);
+    }
+    return postJson<ArtifactFeedbackResponse>(`/api/threads/${encodeURIComponent(id)}/artifacts/feedback`, payload);
   },
 };

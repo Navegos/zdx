@@ -299,7 +299,7 @@ fn awaiting_btw_input(context: &BotContext, message: &Message) -> bool {
 
 /// Quick check if message should be processed (allowlist + bot filter).
 /// Returns false for messages that should be silently ignored.
-fn should_process_message(context: &BotContext, message: &Message) -> bool {
+pub(crate) fn should_process_message(context: &BotContext, message: &Message) -> bool {
     // Check sender exists and is not a bot
     let Some(user) = message.from.as_ref() else {
         tracing::debug!(chat_id = message.chat.id, "Ignoring message without sender");

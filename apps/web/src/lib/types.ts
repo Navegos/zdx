@@ -158,6 +158,39 @@ export interface ArtifactsResponse {
   artifacts: ArtifactItem[];
 }
 
+/**
+ * `POST /api/threads/{id}/artifacts/feedback` (`FeedbackResponse` in server.rs).
+ * The request body is `FeedbackSubmissionPayload` in `lib/annotate.ts`, which
+ * mirrors `zdx_engine::core::artifact_feedback::FeedbackSubmission`.
+ */
+/**
+ * `GET /api/threads/{id}/artifacts/image` (`get_thread_artifact_image` in
+ * server.rs): the canonical copy's bytes plus its identity headers.
+ */
+export interface ArtifactImageCopy {
+  blob: Blob;
+  /** SHA-256 of the original file: the artifact version. */
+  sourceSha256: string;
+  /** SHA-256 of the copy's bytes: the frame marks refer to. */
+  canonicalSha256: string;
+  width: number;
+  height: number;
+  /** The original's upright size; larger than the copy when it was shrunk. */
+  sourceWidth: number;
+  sourceHeight: number;
+}
+
+export interface ArtifactFeedbackResponse {
+  /**
+   * `queued`: on the chat's queue. `duplicate`: already queued earlier. The
+   * queue is in memory: neither means a model has read it yet.
+   */
+  status: "queued" | "duplicate";
+  annotations: number;
+  /** Sent although the file changed after annotation. */
+  stale: boolean;
+}
+
 export interface ReasoningActivity extends ActivityBase {
   type: "reasoning";
   text: string;

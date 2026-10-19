@@ -285,7 +285,8 @@ async fn route_worker_topic_message(
         .send_message(
             incoming.chat_id,
             &reply,
-            Some(incoming.message_id),
+            // A synthetic prompt (Mini App feedback) has no message to quote.
+            reply_ctx.reply_to_message_id,
             reply_ctx.topic_id,
         )
         .await
@@ -369,6 +370,10 @@ struct TurnStatus {
 fn message_has_audio(message: &Message) -> bool {
     message.voice.is_some()
         || message.audio.is_some()
+        || message
+            .local_attachments
+            .iter()
+            .any(|attachment| matches!(attachment, crate::types::LocalAttachment::Audio { .. }))
         || message
             .document
             .as_ref()

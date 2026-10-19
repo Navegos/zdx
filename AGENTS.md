@@ -63,6 +63,8 @@ All common tasks are available via `just` (see `justfile`). Run `just` to list a
 - `just build-release` (build release binary; skips the web build when input fingerprints and dist contents match)
 - `just web-demo` / `just web-dev` / `just web-check` / `just web-build` (Svelte Mini App in `apps/web`; requires `bun`)
 - `bun test apps/web/build-cached.test.mjs` (web-build cache/invalidation regression tests)
+- `bun test apps/web/annotate.test.mjs` (artifact annotation bridge and message-validation tests)
+- `bun test apps/web/image-marks.test.mjs` (image annotation geometry, reveal/badge placement, and payload tests)
 - `bun test apps/web/artifact-link.test.mjs` (`Open artifact` start-parameter parsing and key lookup)
 
 ## Verification

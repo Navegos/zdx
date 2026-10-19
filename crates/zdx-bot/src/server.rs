@@ -7,12 +7,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context as _;
 use axum::Router;
-use axum::extract::{Path, Query, Request, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::header::AUTHORIZATION;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Json, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use hmac::{Hmac, Mac};
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
@@ -23,6 +23,9 @@ use tokio::process::Command;
 use tokio::sync::{Mutex, RwLock};
 use tower_http::compression::CompressionLayer;
 use zdx_engine::config::{Config, paths};
+use zdx_engine::core::artifact_feedback::{
+    self, FeedbackError, FeedbackSubmission, SaveOutcome, SavedFeedback,
+};
 use zdx_engine::core::artifacts::{self, Artifact, ArtifactAttachment};
 use zdx_engine::core::events::NoticeKind;
 use zdx_engine::core::thread_index;
@@ -39,7 +42,11 @@ use zdx_engine::service::{self, Service};
 use zdx_engine::workspace_config::{self, WorkspaceReport};
 use zdx_engine::{agent_activity, background_activity, jobs};
 
+use crate::artifact_feedback::{
+    FeedbackDelivery, FeedbackRoute, FeedbackSink, resolve_destination,
+};
 use crate::delivery_tracker::ActiveDeliveries;
+use crate::types::LocalAttachment;
 
 const INIT_DATA_MAX_AGE_SECS: u64 = 60 * 60;
 const INIT_DATA_FUTURE_SKEW_SECS: u64 = 30;
@@ -595,6 +602,17 @@ pub(crate) struct ServerState {
     subscription_refresh: Arc<Mutex<()>>,
     /// Reply deliveries running in this process (shared with the reply path).
     deliveries: ActiveDeliveries,
+    /// Where artifact feedback goes. `None` refuses feedback submissions.
+    feedback: Option<Arc<dyn FeedbackSink>>,
+    feedback_in_flight: FeedbackInFlight,
+    feedback_permits: Arc<tokio::sync::Semaphore>,
+    /// Image previews served at once (`GET /artifacts/image`): each reads and
+    /// hashes an original of up to 25 MiB (`canonical::MAX_SOURCE_BYTES`,
+    /// checked from the file length first). Making the copy is bounded
+    /// separately, process-wide, by the engine
+    /// (`canonical::MAX_NORMALIZATIONS`, shared with feedback saves).
+    /// Requests wait for a permit instead of failing: a preview is a read.
+    image_permits: Arc<tokio::sync::Semaphore>,
 }
 
 impl ServerState {
@@ -614,11 +632,20 @@ impl ServerState {
             subscription_cache: Mutex::new(None),
             subscription_refresh: Arc::new(Mutex::new(())),
             deliveries: ActiveDeliveries::default(),
+            feedback: None,
+            feedback_in_flight: FeedbackInFlight::default(),
+            feedback_permits: Arc::new(tokio::sync::Semaphore::new(FEEDBACK_CONCURRENCY)),
+            image_permits: Arc::new(tokio::sync::Semaphore::new(IMAGE_READS)),
         }
     }
 
     fn with_deliveries(mut self, deliveries: ActiveDeliveries) -> Self {
         self.deliveries = deliveries;
+        self
+    }
+
+    fn with_feedback(mut self, feedback: Arc<dyn FeedbackSink>) -> Self {
+        self.feedback = Some(feedback);
         self
     }
 }
@@ -637,6 +664,21 @@ pub(crate) fn create_router(state: Arc<ServerState>) -> Router {
         .route(
             "/threads/{id}/artifacts/file",
             get(get_thread_artifact_file),
+        )
+        .route(
+            "/threads/{id}/artifacts/image",
+            get(get_thread_artifact_image),
+        )
+        .route(
+            "/threads/{id}/artifacts/feedback",
+            post(post_artifact_feedback)
+                .layer(DefaultBodyLimit::max(
+                    artifact_feedback::MAX_SUBMISSION_BYTES,
+                ))
+                .layer(middleware::from_fn_with_state(
+                    Arc::clone(&state),
+                    limit_feedback,
+                )),
         )
         .route("/threads/{id}", get(get_thread))
         .route("/threads/{id}/workers", get(get_thread_workers))
@@ -711,13 +753,20 @@ async fn serve_asset(Path(path): Path<String>) -> Response {
     }
 }
 
+/// The Telegram user `authorize_api` verified, for handlers that act on it.
+/// Read from request extensions so a long upload is not re-checked against
+/// `initData` that expired while the body was arriving.
+#[derive(Clone, Copy)]
+struct AuthorizedUser(i64);
+
 async fn authorize_api(
     State(state): State<Arc<ServerState>>,
     headers: HeaderMap,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
-    authorize(&headers, &state)?;
+    let user_id = authorize(&headers, &state)?;
+    request.extensions_mut().insert(AuthorizedUser(user_id));
     Ok(next.run(request).await)
 }
 
@@ -1288,6 +1337,358 @@ async fn get_thread_artifact_file(
         .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
         .body(body)
         .map_err(|_build| (StatusCode::INTERNAL_SERVER_ERROR, "Artifact read failed"))
+}
+
+/// Image previews read at once (see `ServerState::image_permits`).
+const IMAGE_READS: usize = 2;
+
+/// The canonical copy of an image artifact (`zdx_engine::core::
+/// artifact_feedback::canonical`): small, upright, made once and cached. The
+/// Mini App previews and annotates exactly these bytes and sends back their
+/// hash, so marks refer to the pixels the agent gets. The original is served
+/// unchanged by `/artifacts/file`. Identity travels in headers:
+/// `X-Zdx-Source-Sha256` (the artifact version), `X-Zdx-Canonical-Sha256`,
+/// `X-Zdx-Canonical-Width` and `-Height`, and the original's upright size in
+/// `X-Zdx-Source-Width` and `-Height` (so the app can say it shows an
+/// optimized copy). `422` with a reason when the image
+/// cannot be annotated (format or limits); the app then shows the original.
+async fn get_thread_artifact_image(
+    State(state): State<Arc<ServerState>>,
+    Path(id): Path<String>,
+    Query(query): Query<ArtifactFileQuery>,
+) -> Response {
+    let target_id = resolve_thread_param(id);
+    if !valid_thread_id(&target_id) {
+        return (StatusCode::BAD_REQUEST, "Invalid thread ID").into_response();
+    }
+    if query.path.trim().is_empty() || query.path.contains('\0') {
+        return (StatusCode::BAD_REQUEST, "Invalid artifact path").into_response();
+    }
+    let effective = resolve_alias_id(&target_id);
+    let Ok(permit) = Arc::clone(&state.image_permits).acquire_owned().await else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Image previews are unavailable",
+        )
+            .into_response();
+    };
+    // The permit lives in the blocking task: a client that leaves early does
+    // not free it while the read runs. The engine's normalization slot is
+    // taken inside, after the cache check, and held until the decode and
+    // shrink finish.
+    let made = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        artifact_feedback::canonical::canonical_for_artifact(&effective, &query.path)
+    })
+    .await;
+    let image = match made {
+        Ok(Ok(image)) => image,
+        Ok(Err(FeedbackError::ArtifactNotFound)) => {
+            return (StatusCode::NOT_FOUND, "Artifact not found").into_response();
+        }
+        Ok(Err(FeedbackError::UnsupportedArtifact(kind))) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("Annotation works on PNG, JPEG, and WebP images, not {kind} files."),
+            )
+                .into_response();
+        }
+        Ok(Err(FeedbackError::Invalid(message))) => {
+            return (StatusCode::UNPROCESSABLE_ENTITY, message).into_response();
+        }
+        Ok(Err(error @ FeedbackError::Busy)) => {
+            return (StatusCode::SERVICE_UNAVAILABLE, error.to_string()).into_response();
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(error = %error, "Failed to make an image copy");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Image preview failed").into_response();
+        }
+        Err(error) => {
+            tracing::warn!(%error, "Image copy task failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Image preview failed").into_response();
+        }
+    };
+    let meta = image.meta;
+    Response::builder()
+        .header(header::CONTENT_TYPE, meta.mime.as_str())
+        .header(header::CACHE_CONTROL, "private, no-store")
+        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+        .header("x-zdx-source-sha256", meta.source_sha256.as_str())
+        .header("x-zdx-canonical-sha256", meta.sha256.as_str())
+        .header("x-zdx-canonical-width", meta.width.to_string())
+        .header("x-zdx-canonical-height", meta.height.to_string())
+        .header("x-zdx-source-width", meta.source_upright().0.to_string())
+        .header("x-zdx-source-height", meta.source_upright().1.to_string())
+        .body(axum::body::Body::from(image.bytes))
+        .unwrap_or_else(|_build| {
+            (StatusCode::INTERNAL_SERVER_ERROR, "Image preview failed").into_response()
+        })
+}
+
+#[derive(Serialize)]
+struct FeedbackResponse {
+    /// `queued`: on the chat's queue. `duplicate`: this submission was already
+    /// queued, so nothing was sent again. The queue is in memory: neither means
+    /// a model has read it, and a restart before the turn starts loses it.
+    status: &'static str,
+    annotations: usize,
+    /// Sent although the file changed after annotation (`allow_stale`).
+    stale: bool,
+}
+
+type FeedbackFailure = (StatusCode, String);
+
+/// Submissions being saved or delivered right now, keyed by effective thread
+/// and `submission_id`. One bot process serves the API, so this is the only
+/// place two requests for the same submission can meet.
+#[derive(Default)]
+struct FeedbackInFlight(std::sync::Mutex<HashSet<String>>);
+
+struct InFlightGuard {
+    state: Arc<ServerState>,
+    key: String,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        if let Ok(mut keys) = self.state.feedback_in_flight.0.lock() {
+            keys.remove(&self.key);
+        }
+    }
+}
+
+/// Feedback submissions decoded at once. A submission can be tens of MiB of
+/// base64, so the cap holds before the body is read.
+const FEEDBACK_CONCURRENCY: usize = 2;
+
+/// The upload permit, handed from [`limit_feedback`] to the handler. The
+/// handler moves it into the blocking save (decode, render, write), so a
+/// client that disconnects mid-save does not free the slot while that work
+/// still runs. Until then the request owns it, so a body that never finishes
+/// arriving frees it when the request is dropped.
+#[derive(Clone)]
+struct FeedbackPermit(Arc<std::sync::Mutex<Option<tokio::sync::OwnedSemaphorePermit>>>);
+
+impl FeedbackPermit {
+    fn take(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        self.0.lock().ok().and_then(|mut slot| slot.take())
+    }
+}
+
+async fn limit_feedback(
+    State(state): State<Arc<ServerState>>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let Ok(permit) = Arc::clone(&state.feedback_permits).try_acquire_owned() else {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            "Another feedback upload is in progress. Try again in a moment.",
+        )
+            .into_response();
+    };
+    request
+        .extensions_mut()
+        .insert(FeedbackPermit(Arc::new(std::sync::Mutex::new(Some(
+            permit,
+        )))));
+    next.run(request).await
+}
+
+/// Accepts annotations on a thread artifact and queues them as a turn in the
+/// chat that owns the thread.
+///
+/// Ordering is what keeps this safe: the route and the sender are checked
+/// before anything is saved, the engine validates the payload and the artifact
+/// version before writing, and a bundle counts as sent only once the sink
+/// marked it queued, so a retry after a lost response is answered `duplicate`
+/// while a retry after a failure queues it. Delivery runs on its own task: a
+/// client that disconnects mid-request cannot cancel it halfway through.
+async fn post_artifact_feedback(
+    State(state): State<Arc<ServerState>>,
+    Path(id): Path<String>,
+    axum::Extension(AuthorizedUser(user_id)): axum::Extension<AuthorizedUser>,
+    axum::Extension(permit): axum::Extension<FeedbackPermit>,
+    Json(submission): Json<FeedbackSubmission>,
+) -> Response {
+    let Some(sink) = state.feedback.clone() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Feedback delivery is not available on this server",
+        )
+            .into_response();
+    };
+
+    let task_state = Arc::clone(&state);
+    let permit = permit.take();
+    let saved = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        save_feedback_for_thread(&task_state, user_id, &id, &submission)
+    })
+    .await;
+    let (route, saved, guard) = match saved {
+        Ok(Ok(Some(saved))) => saved,
+        Ok(Ok(None)) => {
+            return (
+                StatusCode::OK,
+                Json(FeedbackResponse {
+                    status: "duplicate",
+                    annotations: 0,
+                    stale: false,
+                }),
+            )
+                .into_response();
+        }
+        Ok(Err(failure)) => return failure.into_response(),
+        Err(error) => {
+            tracing::warn!(%error, "Mini App feedback task failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Saving feedback failed").into_response();
+        }
+    };
+
+    let annotations = saved.annotation_count;
+    let sent_stale = saved.stale;
+    let delivered = tokio::spawn(async move {
+        let _guard = guard;
+        let delivery = FeedbackDelivery {
+            route,
+            user_id,
+            attachments: feedback_attachments(&saved),
+            prompt: saved.prompt,
+            artifact_name: saved.artifact_name,
+            annotation_count: saved.annotation_count,
+            bundle_dir: saved.dir,
+        };
+        sink.deliver(delivery).await
+    })
+    .await;
+    match delivered {
+        Ok(Ok(())) => (
+            StatusCode::ACCEPTED,
+            Json(FeedbackResponse {
+                status: "queued",
+                annotations,
+                stale: sent_stale,
+            }),
+        )
+            .into_response(),
+        Ok(Err(error)) => {
+            tracing::error!(error = %format!("{error:#}"), "Failed to queue artifact feedback");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Feedback could not be queued. Try again.",
+            )
+                .into_response()
+        }
+        Err(error) => {
+            tracing::error!(%error, "Artifact feedback delivery task failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Feedback could not be queued. Try again.",
+            )
+                .into_response()
+        }
+    }
+}
+
+type SavedForDelivery = (FeedbackRoute, SavedFeedback, InFlightGuard);
+
+/// Blocking half of [`post_artifact_feedback`]: route, permission, then save.
+/// `Ok(None)` is a duplicate submission.
+fn save_feedback_for_thread(
+    state: &Arc<ServerState>,
+    user_id: i64,
+    id: &str,
+    submission: &FeedbackSubmission,
+) -> Result<Option<SavedForDelivery>, FeedbackFailure> {
+    // `active` moves to whichever thread was used last, so a write through it
+    // could land in a different conversation than the one previewed.
+    if id == "active" {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Reopen the thread from its chat to send feedback.".to_string(),
+        ));
+    }
+    if !valid_thread_id(id) {
+        return Err((StatusCode::BAD_REQUEST, "Invalid thread ID".to_string()));
+    }
+    let Some(sink) = state.feedback.as_ref() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Feedback delivery is not available on this server".to_string(),
+        ));
+    };
+    // Routing uses the requested id (the chat topic); the artifact belongs to
+    // the effective thread behind a resumed or mirror alias.
+    let route =
+        resolve_destination(id).map_err(|message| (StatusCode::CONFLICT, message.to_string()))?;
+    if !sink.allows(user_id, route) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "You cannot send feedback into this chat".to_string(),
+        ));
+    }
+    let effective = resolve_alias_id(id);
+    let key = format!("{effective}/{}", submission.submission_id);
+    let fresh = state
+        .feedback_in_flight
+        .0
+        .lock()
+        .is_ok_and(|mut keys| keys.insert(key.clone()));
+    if !fresh {
+        return Err((
+            StatusCode::CONFLICT,
+            "This feedback is still being sent. Try again in a moment.".to_string(),
+        ));
+    }
+    let guard = InFlightGuard {
+        state: Arc::clone(state),
+        key,
+    };
+    // Part of the retry identity: the same id from another user or for
+    // another destination is a conflict, not a duplicate.
+    let binding = format!("user={user_id};dest={id}");
+    match artifact_feedback::save_feedback(&effective, &binding, submission) {
+        Ok(SaveOutcome::Saved(saved)) => Ok(Some((route, saved, guard))),
+        Ok(SaveOutcome::Duplicate) => Ok(None),
+        Err(error) => Err(feedback_failure(&effective, &error)),
+    }
+}
+
+fn feedback_failure(thread_id: &str, error: &FeedbackError) -> FeedbackFailure {
+    let status = match error {
+        FeedbackError::Invalid(_) => StatusCode::BAD_REQUEST,
+        FeedbackError::ArtifactNotFound => StatusCode::NOT_FOUND,
+        FeedbackError::UnsupportedArtifact(_) => StatusCode::UNPROCESSABLE_ENTITY,
+        // Distinct from the 409s so the client can offer "send anyway".
+        FeedbackError::VersionMismatch => StatusCode::PRECONDITION_FAILED,
+        FeedbackError::IdConflict => StatusCode::CONFLICT,
+        FeedbackError::Busy => StatusCode::SERVICE_UNAVAILABLE,
+        FeedbackError::Storage(err) => {
+            tracing::error!(thread_id, error = %format!("{err:#}"), "Failed to save artifact feedback");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Saving feedback failed".to_string(),
+            );
+        }
+    };
+    (status, error.to_string())
+}
+
+pub(crate) fn feedback_attachments(saved: &SavedFeedback) -> Vec<LocalAttachment> {
+    saved
+        .audios
+        .iter()
+        .map(|audio| LocalAttachment::Audio {
+            path: audio.path.clone(),
+            mime: audio.mime.clone(),
+            label: audio.label.clone(),
+        })
+        .chain(saved.images.iter().map(|image| LocalAttachment::Image {
+            path: image.path.clone(),
+            label: image.label.clone(),
+        }))
+        .collect()
 }
 
 /// Appends a `ToolRunning` record for each in-flight tool from the active-run
@@ -2835,9 +3236,12 @@ pub(crate) fn spawn_server(
     root: PathBuf,
     workers: Arc<WorkerManager>,
     deliveries: ActiveDeliveries,
+    feedback: Arc<dyn FeedbackSink>,
 ) {
     let state = Arc::new(
-        ServerState::new(bot_token, allowlist_user_ids, root, workers).with_deliveries(deliveries),
+        ServerState::new(bot_token, allowlist_user_ids, root, workers)
+            .with_deliveries(deliveries)
+            .with_feedback(feedback),
     );
     let app = create_router(state);
 
@@ -3120,6 +3524,706 @@ mod tests {
             .expect("request foreign path");
         assert_eq!(foreign.status(), StatusCode::NOT_FOUND);
 
+        server.abort();
+        drop(home);
+    }
+
+    /// Records deliveries instead of queueing a turn, so feedback tests never
+    /// reach a real chat or worker.
+    struct RecordingSink {
+        allow: bool,
+        fail_next: std::sync::atomic::AtomicBool,
+        deliveries: std::sync::Mutex<Vec<FeedbackDelivery>>,
+    }
+
+    impl RecordingSink {
+        fn new(allow: bool) -> Arc<Self> {
+            Arc::new(Self {
+                allow,
+                fail_next: std::sync::atomic::AtomicBool::new(false),
+                deliveries: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+
+        fn count(&self) -> usize {
+            self.deliveries.lock().unwrap().len()
+        }
+    }
+
+    impl FeedbackSink for RecordingSink {
+        fn allows(&self, _user_id: i64, _route: FeedbackRoute) -> bool {
+            self.allow
+        }
+
+        fn deliver(
+            &self,
+            delivery: FeedbackDelivery,
+        ) -> crate::artifact_feedback::DeliverFuture<'_> {
+            if self
+                .fail_next
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Box::pin(async { Err(anyhow::anyhow!("queue refused")) });
+            }
+            if let Err(err) = artifact_feedback::mark_queued(&delivery.bundle_dir) {
+                return Box::pin(async move { Err(err) });
+            }
+            self.deliveries.lock().unwrap().push(delivery);
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    const FEEDBACK_PAGE: &str = "<html><body><h1>Example</h1></body></html>";
+    /// Smallest valid PNG (1×1, transparent).
+    const PNG_1X1: &[u8] = &[
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F,
+        0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00,
+        0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49,
+        0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+    ];
+
+    fn feedback_body(submission_id: &str, sha: &str) -> serde_json::Value {
+        use base64::Engine as _;
+        let png = base64::engine::general_purpose::STANDARD.encode(PNG_1X1);
+        serde_json::json!({
+            "submission_id": submission_id,
+            "artifact_path": "report.html",
+            "artifact_sha256": sha,
+            "annotations": [
+                {
+                    "intent": "change",
+                    "comment": "Make the heading larger",
+                    "target": {
+                        "kind": "element",
+                        "element": {
+                            "selector": "body > h1",
+                            "tag": "h1",
+                            "text": "Example",
+                            "rect": { "x": 8.0, "y": 21.0, "width": 300.0, "height": 37.0 },
+                        },
+                    },
+                },
+                {
+                    "intent": "keep",
+                    "target": {
+                        "kind": "drawing",
+                        "bounds": { "x": 0.0, "y": 0.0, "width": 40.0, "height": 40.0 },
+                        "elements": [],
+                        "sketch": { "kind": "image", "mime": "image/png", "data": png },
+                    },
+                },
+            ],
+        })
+    }
+
+    fn sha_of(text: &str) -> String {
+        use sha2::Digest as _;
+        sha2::Sha256::digest(text.as_bytes())
+            .iter()
+            .fold(String::new(), |mut out, byte| {
+                use std::fmt::Write as _;
+                let _ = write!(out, "{byte:02x}");
+                out
+            })
+    }
+
+    fn new_id() -> String {
+        format!("sub-{}", uuid::Uuid::new_v4())
+    }
+
+    fn write_feedback_thread(thread_id: &str) {
+        let dir = paths::artifact_dir_for_thread(Some(thread_id));
+        std::fs::create_dir_all(&dir).expect("create artifact dir");
+        std::fs::write(dir.join("report.html"), FEEDBACK_PAGE).expect("write artifact");
+        thread_persistence::Thread::with_id(thread_id.to_string())
+            .expect("thread")
+            .append(&ThreadEvent::assistant_message("made a report"))
+            .expect("append");
+    }
+
+    async fn spawn_feedback_app(
+        sink: Arc<RecordingSink>,
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let app = create_router(Arc::new(
+            ServerState::new(
+                SAMPLE_BOT_TOKEN.to_string(),
+                sample_allowlist(),
+                PathBuf::from("."),
+                WorkerManager::new().0,
+            )
+            .with_feedback(sink),
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("read test server address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve test app");
+        });
+        (addr, server)
+    }
+
+    struct FeedbackClient {
+        client: reqwest::Client,
+        addr: SocketAddr,
+        auth: String,
+    }
+
+    impl FeedbackClient {
+        async fn post(&self, thread: &str, body: &serde_json::Value) -> (StatusCode, String) {
+            let response = self
+                .client
+                .post(format!(
+                    "http://{}/api/threads/{thread}/artifacts/feedback",
+                    self.addr
+                ))
+                .header(AUTHORIZATION, &self.auth)
+                .json(body)
+                .send()
+                .await
+                .expect("post feedback");
+            let status = response.status();
+            (status, response.text().await.unwrap_or_default())
+        }
+    }
+
+    /// Feedback over HTTP: authenticated, routed to the thread's own topic,
+    /// queued once per submission, a failed queue retried, and refused without
+    /// side effects for a reused id, a changed file, `active`, a foreign path,
+    /// a thread with no chat, or a chat the sender may not use.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // one scripted request sequence
+    async fn queues_artifact_feedback_once_into_the_threads_topic() {
+        let home = zdx_engine::test_support::temp_zdx_home();
+        let topic_thread = "telegram--100777-topic-9";
+        write_feedback_thread(topic_thread);
+        let sha = sha_of(FEEDBACK_PAGE);
+
+        let sink = RecordingSink::new(true);
+        let (addr, server) = spawn_feedback_app(Arc::clone(&sink)).await;
+        let api = FeedbackClient {
+            client: reqwest::Client::new(),
+            addr,
+            auth: format!("tma {}", fresh_init_data(279_058_397)),
+        };
+        let submission_id = new_id();
+
+        let unauthenticated = api
+            .client
+            .post(format!(
+                "http://{addr}/api/threads/{topic_thread}/artifacts/feedback"
+            ))
+            .json(&feedback_body(&submission_id, &sha))
+            .send()
+            .await
+            .expect("post without auth");
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+        sink.fail_next
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let (status, _) = api
+            .post(topic_thread, &feedback_body(&submission_id, &sha))
+            .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(sink.count(), 0);
+
+        // The retry after a failure queues; it is not a duplicate.
+        let (status, body) = api
+            .post(topic_thread, &feedback_body(&submission_id, &sha))
+            .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert!(body.contains("\"queued\""), "{body}");
+
+        let (status, body) = api
+            .post(topic_thread, &feedback_body(&submission_id, &sha))
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("\"duplicate\""), "{body}");
+        assert_eq!(sink.count(), 1, "a retry must not queue a second turn");
+
+        // The same id with different content is refused, not deduplicated.
+        let mut changed = feedback_body(&submission_id, &sha);
+        changed["note"] = serde_json::json!("something else");
+        let (status, _) = api.post(topic_thread, &changed).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(sink.count(), 1);
+
+        {
+            let deliveries = sink.deliveries.lock().unwrap();
+            let delivery = &deliveries[0];
+            assert_eq!(
+                delivery.route,
+                FeedbackRoute {
+                    chat_id: -100_777,
+                    topic_id: Some(9)
+                }
+            );
+            assert_eq!(delivery.user_id, 279_058_397);
+            assert!(delivery.prompt.contains("Make the heading larger"));
+            assert!(delivery.prompt.contains("note-2-drawing.png"));
+            assert!(matches!(
+                delivery.attachments.as_slice(),
+                [LocalAttachment::Image { path, label }]
+                    if path.is_file() && label == "Drawing sketch for note 2"
+            ));
+        }
+
+        // A changed file needs the user's explicit "send anyway".
+        let stale_id = new_id();
+        let mut stale = feedback_body(&stale_id, &"0".repeat(64));
+        let (status, body) = api.post(topic_thread, &stale).await;
+        assert_eq!(status, StatusCode::PRECONDITION_FAILED);
+        assert!(body.contains("changed"), "{body}");
+        stale["allow_stale"] = serde_json::json!(true);
+        let (status, body) = api.post(topic_thread, &stale).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert!(body.contains("\"stale\":true"), "{body}");
+        assert_eq!(sink.count(), 2);
+
+        let mut foreign = feedback_body(&new_id(), &sha);
+        foreign["artifact_path"] = serde_json::json!("/etc/hosts");
+        let (status, _) = api.post(topic_thread, &foreign).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let (status, _) = api.post("active", &feedback_body(&new_id(), &sha)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let (status, _) = api
+            .post("cli-thread-1", &feedback_body(&new_id(), &sha))
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(sink.count(), 2);
+        server.abort();
+
+        let refusing = RecordingSink::new(false);
+        let (addr, server) = spawn_feedback_app(Arc::clone(&refusing)).await;
+        let api = FeedbackClient { addr, ..api };
+        let refused_id = new_id();
+        let (status, _) = api
+            .post(topic_thread, &feedback_body(&refused_id, &sha))
+            .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(refusing.count(), 0);
+        assert!(
+            !artifact_feedback::feedback_dir_for_thread(topic_thread)
+                .join(&refused_id)
+                .exists(),
+            "a refused submission saves nothing"
+        );
+
+        let oversized = api
+            .client
+            .post(format!(
+                "http://{addr}/api/threads/{topic_thread}/artifacts/feedback"
+            ))
+            .header(AUTHORIZATION, &api.auth)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(vec![b' '; artifact_feedback::MAX_SUBMISSION_BYTES + 1])
+            .send()
+            .await
+            .expect("post oversized body");
+        assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        server.abort();
+        drop(home);
+    }
+
+    /// Holds every save inside `allows` (which runs in the blocking save
+    /// task) until the test releases it.
+    struct GatedSink {
+        entered: std::sync::Mutex<std::sync::mpsc::Sender<()>>,
+        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl FeedbackSink for GatedSink {
+        fn allows(&self, _user_id: i64, _route: FeedbackRoute) -> bool {
+            let _ = self.entered.lock().unwrap().send(());
+            let _ = self.release.lock().unwrap().recv();
+            true
+        }
+
+        fn deliver(
+            &self,
+            _delivery: FeedbackDelivery,
+        ) -> crate::artifact_feedback::DeliverFuture<'_> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// The upload slot stays taken while the blocking save runs, even after
+    /// the client hung up: the decode and render keep running, so freeing the
+    /// slot on disconnect would let more of them pile up than the cap allows.
+    #[tokio::test]
+    async fn feedback_slot_is_held_until_the_save_finishes_after_a_disconnect() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let home = zdx_engine::test_support::temp_zdx_home();
+        let topic_thread = "telegram--100777-topic-9";
+        write_feedback_thread(topic_thread);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let state = Arc::new(
+            ServerState::new(
+                SAMPLE_BOT_TOKEN.to_string(),
+                sample_allowlist(),
+                PathBuf::from("."),
+                WorkerManager::new().0,
+            )
+            .with_feedback(Arc::new(GatedSink {
+                entered: std::sync::Mutex::new(entered_tx),
+                release: std::sync::Mutex::new(release_rx),
+            })),
+        );
+        let permits = Arc::clone(&state.feedback_permits);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("read test server address");
+        let app = create_router(state);
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve test app");
+        });
+
+        let body = feedback_body(&new_id(), &sha_of(FEEDBACK_PAGE)).to_string();
+        let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let request = format!(
+            "POST /api/threads/{topic_thread}/artifacts/feedback HTTP/1.1\r\nHost: test\r\nAuthorization: tma {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            fresh_init_data(279_058_397),
+            body.len()
+        );
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .expect("send request");
+        tokio::task::spawn_blocking(move || entered_rx.recv_timeout(Duration::from_secs(10)))
+            .await
+            .expect("join")
+            .expect("save started");
+        assert_eq!(permits.available_permits(), FEEDBACK_CONCURRENCY - 1);
+
+        // Hang up mid-save and give the server time to drop the request.
+        drop(stream);
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(
+            permits.available_permits(),
+            FEEDBACK_CONCURRENCY - 1,
+            "the slot is held while the save still runs"
+        );
+
+        release_tx.send(()).expect("release the save");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while permits.available_permits() < FEEDBACK_CONCURRENCY {
+            assert!(Instant::now() < deadline, "slot freed once the save ends");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        server.abort();
+        drop(home);
+    }
+
+    /// The image route serves the canonical copy (bounded, upright) with its
+    /// identity in headers, only for the thread's artifacts and only with
+    /// auth; feedback naming that copy is accepted and a different frame is
+    /// refused; formats that cannot be annotated answer `422` with a reason.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // one scripted request sequence
+    async fn image_route_serves_the_canonical_copy_feedback_refers_to() {
+        let home = zdx_engine::test_support::temp_zdx_home();
+        let topic_thread = "telegram--100777-topic-9";
+        write_feedback_thread(topic_thread);
+        let dir = paths::artifact_dir_for_thread(Some(topic_thread));
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            2000,
+            1000,
+            image::Rgb([10, 80, 10]),
+        ))
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .unwrap();
+        std::fs::write(dir.join("chart.png"), &png).unwrap();
+        std::fs::write(dir.join("anim.gif"), b"GIF89a\x01\0\x01\0\0\0\0;").unwrap();
+        // One byte over the annotation limit (the PNG is padded at the end).
+        let mut over = png.clone();
+        over.resize(
+            usize::try_from(artifact_feedback::canonical::MAX_SOURCE_BYTES + 1).unwrap(),
+            0,
+        );
+        std::fs::write(dir.join("over.png"), over).unwrap();
+
+        let sink = RecordingSink::new(true);
+        let (addr, server) = spawn_feedback_app(Arc::clone(&sink)).await;
+        let api = FeedbackClient {
+            client: reqwest::Client::new(),
+            addr,
+            auth: format!("tma {}", fresh_init_data(279_058_397)),
+        };
+        let get = |path: &str, auth: bool| {
+            let request = api.client.get(format!(
+                "http://{addr}/api/threads/{topic_thread}/artifacts/image?path={path}"
+            ));
+            if auth {
+                request.header(AUTHORIZATION, &api.auth)
+            } else {
+                request
+            }
+        };
+
+        let unauthenticated = get("chart.png", false).send().await.expect("get");
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+        let foreign = get("/etc/hosts", true).send().await.expect("get");
+        assert_eq!(foreign.status(), StatusCode::NOT_FOUND);
+        let gif = get("anim.gif", true).send().await.expect("get");
+        assert_eq!(gif.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(gif.text().await.unwrap().contains("not GIF files"));
+        let over = get("over.png", true).send().await.expect("get");
+        assert_eq!(over.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(over.text().await.unwrap().contains("larger than 25 MiB"));
+
+        let response = get("chart.png", true).send().await.expect("get");
+        assert_eq!(response.status(), StatusCode::OK);
+        let header = |name: &str| {
+            response.headers()[name]
+                .to_str()
+                .expect("header")
+                .to_string()
+        };
+        assert_eq!(header("content-type"), "image/jpeg");
+        assert_eq!(header("x-zdx-source-sha256"), sha_of_bytes(&png));
+        let (canonical, width, height) = (
+            header("x-zdx-canonical-sha256"),
+            header("x-zdx-canonical-width"),
+            header("x-zdx-canonical-height"),
+        );
+        assert_eq!((width.as_str(), height.as_str()), ("1568", "784"));
+        assert_eq!(
+            (header("x-zdx-source-width"), header("x-zdx-source-height")),
+            ("2000".to_string(), "1000".to_string())
+        );
+        let bytes = response.bytes().await.expect("body");
+        assert_eq!(
+            sha_of_bytes(&bytes),
+            canonical,
+            "the header names these bytes"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("chart.png")).unwrap(),
+            png,
+            "original kept"
+        );
+
+        let body = |frame: serde_json::Value| {
+            serde_json::json!({
+                "submission_id": new_id(),
+                "artifact_path": "chart.png",
+                "artifact_sha256": sha_of_bytes(&png),
+                "image": frame,
+                "annotations": [
+                    { "intent": "change", "comment": "Bigger", "target": { "kind": "image_pin", "point": { "x": 0.5, "y": 0.5 } } },
+                ],
+            })
+        };
+        let (status, text) = api
+            .post(
+                topic_thread,
+                &body(serde_json::json!({ "canonical_sha256": canonical, "width": 2000, "height": 1000 })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+        assert!(text.contains("different preview"), "{text}");
+        let (status, text) = api
+            .post(
+                topic_thread,
+                &body(serde_json::json!({ "canonical_sha256": canonical, "width": 1568, "height": 784 })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{text}");
+        assert_eq!(sink.count(), 1);
+        server.abort();
+        drop(home);
+    }
+
+    fn sha_of_bytes(bytes: &[u8]) -> String {
+        use sha2::Digest as _;
+        sha2::Sha256::digest(bytes)
+            .iter()
+            .fold(String::new(), |mut out, byte| {
+                use std::fmt::Write as _;
+                let _ = write!(out, "{byte:02x}");
+                out
+            })
+    }
+
+    /// Previews and feedback saves share the engine's normalization limit, a
+    /// slot outlives a client that hangs up mid-decode, and a waiter proceeds
+    /// once a slot frees: no deadlock with the request permits.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // one scripted sequence
+    async fn previews_and_feedback_share_the_normalization_limit() {
+        use tokio::io::AsyncWriteExt as _;
+        use zdx_engine::core::artifact_feedback::canonical::{
+            self, MAX_NORMALIZATIONS, normalizations_running, test_hooks,
+        };
+
+        let home = zdx_engine::test_support::temp_zdx_home();
+        let topic_thread = "telegram--100777-topic-9";
+        write_feedback_thread(topic_thread);
+        let dir = paths::artifact_dir_for_thread(Some(topic_thread));
+        let mut shas = Vec::new();
+        for (name, shade) in [("a.png", 10u8), ("b.png", 90), ("c.png", 170)] {
+            let mut png = Vec::new();
+            image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+                300,
+                200,
+                image::Rgb([shade, 40, 40]),
+            ))
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+            std::fs::write(dir.join(name), &png).unwrap();
+            shas.push(sha_of_bytes(&png));
+        }
+        let pause_a = test_hooks::pause(&shas[0]);
+        let pause_b = test_hooks::pause(&shas[1]);
+
+        let sink = RecordingSink::new(true);
+        let (addr, server) = spawn_feedback_app(Arc::clone(&sink)).await;
+        let auth = format!("tma {}", fresh_init_data(279_058_397));
+        let wait_until = |what: &'static str, done: Box<dyn Fn() -> bool + Send>| async move {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !done() {
+                assert!(Instant::now() < deadline, "timed out waiting: {what}");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        let cached = |sha: &str| canonical::cached(sha).is_some();
+
+        // A preview of a.png from a client that will hang up mid-decode.
+        let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        stream
+            .write_all(
+                format!(
+                    "GET /api/threads/{topic_thread}/artifacts/image?path=a.png HTTP/1.1\r\nHost: test\r\nAuthorization: {auth}\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("send request");
+        // A feedback save on b.png: it normalizes the original too.
+        let client = reqwest::Client::new();
+        let post_body = serde_json::json!({
+            "submission_id": new_id(),
+            "artifact_path": "b.png",
+            "artifact_sha256": shas[1],
+            "image": { "canonical_sha256": "a".repeat(64), "width": 1, "height": 1 },
+            "annotations": [
+                { "intent": "change", "comment": "x", "target": { "kind": "image_pin", "point": { "x": 0.5, "y": 0.5 } } },
+            ],
+        });
+        let post = tokio::spawn({
+            let client = client.clone();
+            let auth = auth.clone();
+            async move {
+                client
+                    .post(format!(
+                        "http://{addr}/api/threads/{topic_thread}/artifacts/feedback"
+                    ))
+                    .header(AUTHORIZATION, auth)
+                    .json(&post_body)
+                    .send()
+                    .await
+                    .expect("post")
+                    .status()
+            }
+        });
+        wait_until(
+            "both slots taken by the paused preview and save",
+            Box::new(|| normalizations_running() == MAX_NORMALIZATIONS),
+        )
+        .await;
+
+        // A third normalization (an unpaused preview) has to wait.
+        let third = tokio::spawn({
+            let client = client.clone();
+            let auth = auth.clone();
+            async move {
+                client
+                    .get(format!(
+                        "http://{addr}/api/threads/{topic_thread}/artifacts/image?path=c.png"
+                    ))
+                    .header(AUTHORIZATION, auth)
+                    .send()
+                    .await
+                    .expect("get c")
+                    .status()
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(
+            !third.is_finished(),
+            "a third normalization waits for a slot"
+        );
+        assert!(!cached(&shas[2]));
+
+        // The preview's client hangs up: its decode keeps its slot.
+        drop(stream);
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(normalizations_running(), MAX_NORMALIZATIONS);
+        assert!(!third.is_finished(), "the disconnect freed no slot");
+
+        // a.png finishes for nobody (and is cached); its slot goes to c.png.
+        drop(pause_a);
+        assert_eq!(third.await.expect("join"), StatusCode::OK);
+        assert!(cached(&shas[0]), "the abandoned decode completed");
+        assert!(cached(&shas[2]));
+        assert!(!post.is_finished(), "the save is still paused");
+
+        drop(pause_b);
+        assert_eq!(
+            post.await.expect("join"),
+            StatusCode::BAD_REQUEST,
+            "the frame does not match"
+        );
+        wait_until(
+            "every slot released",
+            Box::new(|| normalizations_running() == 0),
+        )
+        .await;
+        server.abort();
+        drop(home);
+    }
+
+    /// A worker thread opened directly is refused, drafts stay on the client,
+    /// nothing is saved or queued, and nothing is rerouted to its orchestrator.
+    #[tokio::test]
+    async fn worker_feedback_is_refused_not_rerouted() {
+        let home = zdx_engine::test_support::temp_zdx_home();
+        let worker = format!("worker-{}", uuid::Uuid::new_v4());
+        // Lineage is recorded when the thread file is created.
+        let mut thread = thread_persistence::Thread::with_id(worker.clone()).expect("thread");
+        thread.set_origin(None, Some("telegram--100777-topic-9".to_string()), None);
+        thread
+            .append(&ThreadEvent::assistant_message("started"))
+            .expect("append");
+        write_feedback_thread(&worker);
+
+        let sink = RecordingSink::new(true);
+        let (addr, server) = spawn_feedback_app(Arc::clone(&sink)).await;
+        let api = FeedbackClient {
+            client: reqwest::Client::new(),
+            addr,
+            auth: format!("tma {}", fresh_init_data(279_058_397)),
+        };
+        let id = new_id();
+        let (status, body) = api
+            .post(&worker, &feedback_body(&id, &sha_of(FEEDBACK_PAGE)))
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(body.contains("worker thread"), "{body}");
+        assert_eq!(sink.count(), 0);
+        assert!(
+            !artifact_feedback::feedback_dir_for_thread(&worker)
+                .join(&id)
+                .exists()
+        );
         server.abort();
         drop(home);
     }

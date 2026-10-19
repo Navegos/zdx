@@ -387,12 +387,24 @@ impl BotContext {
     /// A context with empty per-process maps, for tests that need a whole
     /// context (for example with a client pointed at a fake Bot API).
     pub(crate) fn for_test(client: TelegramClient, config: Config, root: PathBuf) -> Self {
+        Self::for_test_allowing(client, config, root, HashSet::new(), HashSet::new())
+    }
+
+    /// [`Self::for_test`] with allowlists, for tests that go through the
+    /// queue's sender gate.
+    pub(crate) fn for_test_allowing(
+        client: TelegramClient,
+        config: Config,
+        root: PathBuf,
+        allowlist_user_ids: HashSet<i64>,
+        allowlist_chat_ids: HashSet<i64>,
+    ) -> Self {
         Self::new(
             client,
             config,
             BotContextDeps {
-                allowlist_user_ids: HashSet::new(),
-                allowlist_chat_ids: HashSet::new(),
+                allowlist_user_ids,
+                allowlist_chat_ids,
                 root,
                 bot_instruction_layer: None,
                 tool_config: ToolConfig::default(),

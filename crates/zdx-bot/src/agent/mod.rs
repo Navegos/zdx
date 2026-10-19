@@ -553,7 +553,16 @@ pub(crate) fn build_user_text(incoming: &IncomingMessage) -> String {
     }
 
     for audio in &incoming.audios {
+        // A labelled clip (Mini App feedback) names the note it belongs to,
+        // so the transcript stays attached to it.
+        let prefix = audio
+            .label
+            .as_ref()
+            .map_or_else(String::new, |label| format!("{label}: "));
         if let Some(transcript) = &audio.transcript {
+            if !prefix.is_empty() {
+                parts.push(format!("{prefix}transcript"));
+            }
             parts.push(zdx_engine::providers::wrap_voice_transcript(transcript));
             parts.push(format!(
                 "(Audio file saved at {} — use the `ask_media` tool on it if you need more than the transcript.)",
@@ -561,7 +570,7 @@ pub(crate) fn build_user_text(incoming: &IncomingMessage) -> String {
             ));
         } else {
             parts.push(format!(
-                "Audio attachment saved at {} (transcription unavailable).",
+                "{prefix}Audio attachment saved at {} (transcription unavailable).",
                 audio.local_path.display()
             ));
         }
@@ -569,28 +578,33 @@ pub(crate) fn build_user_text(incoming: &IncomingMessage) -> String {
 
     for image in &incoming.images {
         let path = image.local_path.display();
-        parts.push(match &image.delivery {
+        let (prefix, subject) = match &image.label {
+            Some(label) => (format!("{label}: "), "image attachment"),
+            None => (String::new(), "Image attachment"),
+        };
+        let text = match &image.delivery {
             ImageDelivery::Inline {
                 downscaled: false, ..
-            } => format!("Image attachment saved at {path}."),
+            } => format!("{subject} saved at {path}."),
             ImageDelivery::Inline {
                 downscaled: true, ..
             } => format!(
-                "Image attachment saved at {path}. You see a downscaled copy; the saved file is the full-resolution original — use `ask_media` on it if you need fine detail."
+                "{subject} saved at {path}. You see a downscaled copy; the saved file is the full-resolution original — use `ask_media` on it if you need fine detail."
             ),
             ImageDelivery::SavedOnly {
                 reason,
                 ask_media: true,
             } => format!(
-                "Image attachment saved at {path}, but it was not attached for you to see: {reason}. Use the `ask_media` tool on the saved file to inspect it."
+                "{subject} saved at {path}, but it was not attached for you to see: {reason}. Use the `ask_media` tool on the saved file to inspect it."
             ),
             ImageDelivery::SavedOnly {
                 reason,
                 ask_media: false,
             } => format!(
-                "Image attachment saved at {path}, but it was not attached for you to see: {reason}. `ask_media` cannot read this file either; ask the user to resend it as a PNG or JPEG."
+                "{subject} saved at {path}, but it was not attached for you to see: {reason}. `ask_media` cannot read this file either; ask the user to resend it as a PNG or JPEG."
             ),
-        });
+        };
+        parts.push(format!("{prefix}{text}"));
     }
 
     for doc in &incoming.documents {

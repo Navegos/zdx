@@ -1,7 +1,10 @@
 <script lang="ts">
   import { onDestroy, untrack } from "svelte";
   import { api, ApiError } from "$lib/api";
-  import type { ArtifactAttachment } from "$lib/types";
+  import { draftKey, loadDraftRecord } from "$lib/draftStore";
+  import { confirmAction, telegramUserId } from "$lib/telegram";
+  import type { ArtifactAttachment, ArtifactImageCopy } from "$lib/types";
+  import ArtifactAnnotator from "./ArtifactAnnotator.svelte";
   import Icon from "./Icon.svelte";
 
   interface Props {
@@ -13,8 +16,23 @@
   let { threadId, artifact, onclose }: Props = $props();
 
   let url = $state<string | null>(null);
+  /** HTML bytes as served, for the annotator (it injects its helper into a copy). */
+  let htmlBlob = $state<Blob | null>(null);
+  /** An image's canonical copy from the server: what is shown, marked, and
+   *  sent to the agent. The app never re-encodes or re-orients it. */
+  let imageCopy = $state<ArtifactImageCopy | null>(null);
+  /** Why an image is shown as a preview only (the server's reason). */
+  let passiveReason = $state<string | null>(null);
   let error = $state("");
   let loading = $state(true);
+  /** The annotator has an open note, a recording, or a stroke closing would lose. */
+  let unsaved = $state(false);
+
+  /** Saved notes survive closing; only unsaved editor work asks first. */
+  async function requestClose() {
+    if (unsaved && !(await confirmAction("Discard the note you are editing?"))) return;
+    onclose();
+  }
 
   /** Fetches the bytes once and keeps the blob URL for the open preview. */
   async function fetchBytes(): Promise<string | null> {
@@ -44,6 +62,29 @@
     anchor.remove();
   }
 
+  /** The canonical copy when the server can make one; otherwise the original,
+   *  shown as a passive preview with the server's reason. */
+  async function loadImage(target: string, path: string): Promise<{ copy: ArtifactImageCopy | null; reason: string | null; blob: Blob | null }> {
+    try {
+      return { copy: await api.artifactImage(target, path), reason: null, blob: null };
+    } catch (e) {
+      if (!(e instanceof ApiError) || e.status !== 422) throw e;
+      // Notes made while the image could be annotated stay on the device
+      // untouched; say so instead of hiding them.
+      const record = await loadDraftRecord(draftKey(telegramUserId(), target, path)).catch(() => null);
+      const kept = record?.drafts.length ?? 0;
+      const notes =
+        kept > 0
+          ? ` Your ${kept === 1 ? "unsent note on it is" : `${kept} unsent notes on it are`} kept on this device.`
+          : "";
+      return {
+        copy: null,
+        reason: `${e.message} It is shown as a preview only.${notes}`,
+        blob: await api.artifactBlob(target, path),
+      };
+    }
+  }
+
   // Tracks the artifact identity only; the fetch writes `url`/`loading`/`error`
   // and must not feed back into this effect's dependency set.
   $effect(() => {
@@ -55,6 +96,9 @@
     return untrack(() => {
       const previous = url;
       url = null;
+      htmlBlob = null;
+      imageCopy = null;
+      passiveReason = null;
       if (previous) URL.revokeObjectURL(previous);
       loading = true;
       error = "";
@@ -65,11 +109,19 @@
         return;
       }
       let cancelled = false;
-      void api
-        .artifactBlob(target, path)
-        .then((blob) => {
+      const load =
+        kind === "image"
+          ? loadImage(target, path)
+          : api.artifactBlob(target, path).then((blob) => ({ copy: null, reason: null, blob }));
+      void load
+        .then(({ copy, reason, blob }) => {
           if (cancelled) return;
-          url = URL.createObjectURL(blob);
+          passiveReason = reason;
+          if (copy) imageCopy = copy;
+          else if (blob) {
+            if (kind === "html") htmlBlob = blob;
+            url = URL.createObjectURL(blob);
+          }
         })
         .catch((e: unknown) => {
           if (!cancelled) error = e instanceof ApiError ? e.message : String(e);
@@ -88,7 +140,10 @@
   });
 
   function backdropKey(event: KeyboardEvent) {
-    if (event.key === "Escape") onclose();
+    // Escape in a text field cancels the field, not the whole preview.
+    const target = event.target as HTMLElement | null;
+    if (target?.closest("input, textarea, [contenteditable]")) return;
+    if (event.key === "Escape") void requestClose();
   }
 </script>
 
@@ -98,7 +153,7 @@
   class="preview-backdrop"
   role="presentation"
   onclick={(e) => {
-    if (e.target === e.currentTarget) onclose();
+    if (e.target === e.currentTarget) void requestClose();
   }}
 >
   <div class="preview-sheet" role="dialog" aria-label={artifact.name}>
@@ -113,7 +168,7 @@
           <span>Download</span>
         </button>
       {/if}
-      <button type="button" onclick={onclose} aria-label="Close preview" class="preview-icon-btn">
+      <button type="button" onclick={requestClose} aria-label="Close preview" class="preview-icon-btn">
         <Icon name="x" />
       </button>
     </header>
@@ -129,19 +184,17 @@
         <p class="mx-3 rounded-md border border-destructive px-3 py-2 text-xs text-destructive">
           {error}
         </p>
+      {:else if artifact.kind === "html" && htmlBlob}
+        <ArtifactAnnotator {threadId} {artifact} blob={htmlBlob} bind:unsaved />
+      {:else if artifact.kind === "image" && imageCopy}
+        <ArtifactAnnotator {threadId} {artifact} blob={imageCopy.blob} image={imageCopy} bind:unsaved />
       {:else if artifact.kind === "image" && url}
+        {#if passiveReason}<p class="passive-note">{passiveReason}</p>{/if}
         <img src={url} alt={artifact.name} class="preview-media" />
       {:else if artifact.kind === "audio" && url}
         <div class="p-4">
           <audio controls src={url} class="w-full"></audio>
         </div>
-      {:else if artifact.kind === "html" && url}
-        <!-- Opaque origin: no `allow-same-origin`, so the document gets no
-             access to app storage, cookies or Telegram credentials. The bytes
-             arrive over an authenticated fetch and the blob URL itself carries
-             no auth, which is what makes this safe to hand to a scripted page.
-             `allow-scripts` stays so dashboards and reports still run. -->
-        <iframe title={artifact.name} src={url} sandbox="allow-scripts" class="preview-frame"></iframe>
       {:else}
         <div class="flex flex-col items-center gap-2 py-8">
           <p class="m-0 text-xs text-muted-foreground">No inline preview for this file type.</p>
@@ -194,13 +247,12 @@
     background: var(--color-accent);
   }
 
-  .preview-frame {
-    display: block;
-    width: 100%;
-    height: calc(100dvh - 12rem);
-    min-height: 24rem;
-    border: 0;
-    background: white;
+  .passive-note {
+    margin: 0;
+    border-bottom: 1px solid var(--color-border);
+    padding: 0.5rem 0.75rem;
+    font-size: 0.75rem;
+    color: var(--color-muted-foreground);
   }
 
   .preview-btn {

@@ -18,10 +18,30 @@ pub struct IncomingMessage {
     pub is_forum: bool,
 }
 
+/// A file already saved on the bot host by a surface other than Telegram
+/// (Mini App artifact feedback). Ingest loads it through the same image and
+/// transcription paths as a downloaded attachment.
+/// `label` says what the file belongs to (`Voice note 1 for note 2`) and is
+/// kept next to it in the prompt.
+#[derive(Debug, Clone)]
+pub enum LocalAttachment {
+    Image {
+        path: PathBuf,
+        label: String,
+    },
+    Audio {
+        path: PathBuf,
+        mime: String,
+        label: String,
+    },
+}
+
 pub struct IncomingImage {
     /// The original file as received, kept at full resolution.
     pub local_path: PathBuf,
     pub delivery: ImageDelivery,
+    /// What the image belongs to, for local attachments; `None` for Telegram.
+    pub label: Option<String>,
 }
 
 pub enum ImageDelivery {
@@ -54,6 +74,8 @@ impl IncomingImage {
 pub struct IncomingAudio {
     pub local_path: PathBuf,
     pub transcript: Option<String>,
+    /// What the clip belongs to, for local attachments; `None` for Telegram.
+    pub label: Option<String>,
 }
 
 pub struct IncomingDocument {

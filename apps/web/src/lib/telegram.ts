@@ -26,6 +26,9 @@ interface TelegramWebApp {
   isVersionAtLeast?(version: string): boolean;
   openTelegramLink?(url: string): void;
   requestFullscreen?(): void;
+  enableClosingConfirmation?(): void;
+  showConfirm?(message: string, callback: (ok: boolean) => void): void;
+  disableClosingConfirmation?(): void;
   disableVerticalSwipes?(): void;
   setHeaderColor?(color: string): void;
   setBackgroundColor?(color: string): void;
@@ -65,6 +68,26 @@ export function selectionChanged(): void {
 
 export function notify(type: "error" | "success" | "warning"): void {
   tg?.HapticFeedback?.notificationOccurred?.(type);
+}
+
+/** Telegram user id from initData, or `"dev"` outside Telegram. Scopes local drafts. */
+export function telegramUserId(): string {
+  return String(tg?.initDataUnsafe?.user?.id ?? "dev");
+}
+
+/** Ask before Telegram closes the Mini App (unsent drafts). Saved drafts survive either way. */
+export function setClosingConfirmation(on: boolean): void {
+  if (on) tg?.enableClosingConfirmation?.();
+  else tg?.disableClosingConfirmation?.();
+}
+
+/** A yes/no question: Telegram's native popup inside Telegram, `confirm` elsewhere. */
+export function confirmAction(message: string): Promise<boolean> {
+  const show = tg?.showConfirm;
+  if (show && tg?.isVersionAtLeast?.("6.2")) {
+    return new Promise((resolve) => show.call(tg, message, (ok) => resolve(Boolean(ok))));
+  }
+  return Promise.resolve(window.confirm(message));
 }
 
 /** Telegram's `startapp=` payload, used to deep-link straight to a thread. */

@@ -168,7 +168,9 @@ pub(super) async fn setup_preprocessing_status(
         map.insert(key, token.clone());
     }
 
+    // A synthetic prompt's id is an internal counter, not a message to quote.
     let reply_to_message_id = if synthetic_topic_routed_from_general
+        || message.synthetic.is_some()
         || message.effective_thread_id() == Some(message.id)
     {
         None

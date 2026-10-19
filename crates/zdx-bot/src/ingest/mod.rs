@@ -14,7 +14,7 @@ use crate::telegram::{Audio, Document, Message, PhotoSize, TelegramClient, Video
 use crate::transcribe;
 use crate::types::{
     ImageDelivery, IncomingAudio, IncomingDocument, IncomingImage, IncomingMessage, IncomingVideo,
-    VideoStatus,
+    LocalAttachment, VideoStatus,
 };
 
 /// Bot API `getFile` refuses anything larger, so a bigger file can never be
@@ -367,6 +367,30 @@ async fn collect_attachments(
         }
     }
 
+    for attachment in &message.local_attachments {
+        had_attachments = true;
+        match attachment {
+            LocalAttachment::Image { path, label } => {
+                push_attachment(
+                    &mut images,
+                    &mut notices,
+                    async { load_local_image(path, label).map(Some) },
+                    "image",
+                )
+                .await?;
+            }
+            LocalAttachment::Audio { path, mime, label } => {
+                push_attachment(
+                    &mut audios,
+                    &mut notices,
+                    load_local_audio(config, path, mime, label, cancel_token),
+                    "voice note",
+                )
+                .await?;
+            }
+        }
+    }
+
     Ok(AttachmentCollection {
         images,
         audios,
@@ -517,6 +541,7 @@ async fn load_image(
     Ok(Some(IncomingImage {
         local_path,
         delivery,
+        label: None,
     }))
 }
 
@@ -760,6 +785,70 @@ async fn load_audio_by_id(
     Ok(Some(IncomingAudio {
         local_path,
         transcript,
+        label: None,
+    }))
+}
+
+/// Loads an image a surface already saved on this host, the same way as a
+/// downloaded one: the saved file stays the original, the model gets a fitted
+/// copy or a reason it cannot see it.
+pub(crate) fn load_local_image(path: &Path, label: &str) -> Result<IncomingImage> {
+    let bytes = fs::read(path).map_err(|err| {
+        tracing::warn!(path = %path.display(), err = %err, "Failed to read local image attachment");
+        AttachmentNotice(format!(
+            "An image attachment saved at {} could not be read, so it is missing from this message. Tell the user.",
+            path.display()
+        ))
+    })?;
+    let delivery = prepare_inline_image(path, &bytes);
+    Ok(IncomingImage {
+        local_path: path.to_path_buf(),
+        delivery,
+        label: Some(label.to_string()),
+    })
+}
+
+/// Transcribes a voice note a surface already saved on this host. A failed or
+/// unconfigured transcription leaves `transcript` empty; the saved file stays.
+pub(crate) async fn load_local_audio(
+    config: &Config,
+    path: &Path,
+    mime: &str,
+    label: &str,
+    cancel_token: Option<&CancellationToken>,
+) -> Result<Option<IncomingAudio>> {
+    if cancel_token.is_some_and(CancellationToken::is_cancelled) {
+        return Err(transcribe::OperationCancelled.into());
+    }
+    let bytes = fs::read(path).map_err(|err| {
+        tracing::warn!(path = %path.display(), err = %err, "Failed to read local audio attachment");
+        AttachmentNotice(format!(
+            "A voice note saved at {} could not be read, so it is missing from this message. Tell the user.",
+            path.display()
+        ))
+    })?;
+    let filename = file_name_from_path(&path.to_string_lossy())
+        .unwrap_or_else(|| "voice-note.webm".to_string());
+    let transcript = match transcribe::transcribe_audio_if_configured(
+        config,
+        bytes,
+        &filename,
+        Some(mime),
+        cancel_token,
+    )
+    .await
+    {
+        Ok(transcript) => transcript,
+        Err(err) if transcribe::is_operation_cancelled(&err) => return Err(err),
+        Err(err) => {
+            tracing::error!(error = %format!("{err:#}"), "Audio transcription failed");
+            None
+        }
+    };
+    Ok(Some(IncomingAudio {
+        local_path: path.to_path_buf(),
+        transcript,
+        label: Some(label.to_string()),
     }))
 }
 
@@ -1036,6 +1125,66 @@ mod tests {
             panic!("video was not saved");
         };
         path.clone()
+    }
+
+    /// Mini App feedback rides on a synthetic prompt with files already on
+    /// disk: images take the normal inline path, and a file that cannot be read
+    /// becomes a notice instead of vanishing.
+    #[tokio::test]
+    async fn local_attachments_load_like_downloaded_ones() {
+        let home = zdx_engine::test_support::temp_zdx_home();
+        let (base_url, get_file_calls, server) = fake_telegram().await;
+        let image_path = home.path().join("annotation-1-drawing.png");
+        let mut png = Vec::new();
+        image::DynamicImage::new_rgba8(4, 4)
+            .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
+            .expect("encode png");
+        fs::write(&image_path, &png).expect("write png");
+        let missing_audio = home.path().join("annotation-1-voice-1.webm");
+
+        let mut message = with(13, &json!({ "text": "[artifact feedback] keep this" }));
+        message.local_attachments = vec![
+            crate::types::LocalAttachment::Image {
+                path: image_path.clone(),
+                label: "Drawing sketch for note 1".to_string(),
+            },
+            crate::types::LocalAttachment::Audio {
+                path: missing_audio.clone(),
+                mime: "audio/webm".to_string(),
+                label: "Voice note 1 for note 1".to_string(),
+            },
+        ];
+
+        let incoming = ingest(base_url, message).await.expect("turn runs");
+        assert_eq!(
+            get_file_calls.load(Ordering::SeqCst),
+            0,
+            "nothing downloaded"
+        );
+        assert_eq!(incoming.images.len(), 1);
+        assert_eq!(incoming.images[0].local_path, image_path);
+        assert!(incoming.images[0].inline().is_some());
+        assert!(incoming.audios.is_empty());
+        let prompt = build_user_text(&incoming);
+        assert!(
+            prompt.starts_with("[artifact feedback] keep this"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains(&format!(
+                "Drawing sketch for note 1: image attachment saved at {}",
+                image_path.display()
+            )),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains(&format!(
+                "A voice note saved at {} could not be read",
+                missing_audio.display()
+            )),
+            "{prompt}"
+        );
+        server.abort();
     }
 
     /// The reported regression: a captioned video used to reach the agent as

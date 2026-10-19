@@ -21,6 +21,7 @@ use crate::handlers::message::{
 use crate::telegram::{CallbackQuery, InlineKeyboardMarkup, TelegramClient, TelegramSettings};
 
 mod agent;
+mod artifact_feedback;
 mod bot;
 mod command_picker;
 mod commands;
@@ -186,15 +187,13 @@ async fn run_bot(config: Config, settings: TelegramSettings, root: PathBuf) -> R
         completion_rx,
     );
 
-    // Start embedded Mini App web server if enabled
-    if let Some((bot_token, allowlist_user_ids, port)) = miniapp_server {
-        crate::server::spawn_server(
-            bot_token,
-            allowlist_user_ids,
-            port,
+    if let Some(settings) = miniapp_server {
+        spawn_miniapp_server(
+            settings,
             miniapp_root,
-            Arc::clone(&worker_manager),
-            context.active_deliveries().clone(),
+            &worker_manager,
+            &context,
+            &chat_queues,
         );
     }
 
@@ -262,6 +261,29 @@ async fn run_bot(config: Config, settings: TelegramSettings, root: PathBuf) -> R
     }
 
     Ok(())
+}
+
+/// Starts the embedded Mini App web server. Artifact feedback it accepts goes
+/// through the same chat queues as Telegram messages.
+fn spawn_miniapp_server(
+    (bot_token, allowlist_user_ids, port): (String, HashSet<i64>, u16),
+    root: PathBuf,
+    worker_manager: &Arc<zdx_engine::core::workers::WorkerManager>,
+    context: &Arc<BotContext>,
+    chat_queues: &ChatQueueMap,
+) {
+    crate::server::spawn_server(
+        bot_token,
+        allowlist_user_ids,
+        port,
+        root,
+        Arc::clone(worker_manager),
+        context.active_deliveries().clone(),
+        Arc::new(crate::artifact_feedback::BotFeedbackSink::new(
+            Arc::clone(context),
+            Arc::clone(chat_queues),
+        )),
+    );
 }
 
 /// When and how an update was received, for the intake log.

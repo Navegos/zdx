@@ -8,7 +8,10 @@
  * Guarded by `import.meta.env.DEV`, so this module is dropped from production
  * bundles entirely.
  */
+import type { FeedbackSubmissionPayload } from "./annotate";
 import type {
+  ArtifactFeedbackResponse,
+  ArtifactImageCopy,
   ArtifactsResponse,
   GitDiffResponse,
   GitResponse,
@@ -728,6 +731,32 @@ export const demoArtifacts: ArtifactsResponse = {
       modified_at: "2026-09-20T17:12:05.220Z",
     },
     {
+      key: "2b3c4d5e6f7a8b9c",
+      name: "latency-chart.png",
+      path: "/Users/me/.zdx/artifacts/threads/demo/latency-chart.png",
+      rel: "latency-chart.png",
+      mime: "image/png",
+      kind: "image",
+      size_bytes: 61234,
+      exists: true,
+      source: "generated",
+      message_sequences: [],
+      modified_at: "2026-09-20T17:11:00.000Z",
+    },
+    {
+      key: "3c4d5e6f7a8b9c0d",
+      name: "logo.svg",
+      path: "/Users/me/.zdx/artifacts/threads/demo/logo.svg",
+      rel: "logo.svg",
+      mime: "image/svg+xml",
+      kind: "image",
+      size_bytes: 412,
+      exists: true,
+      source: "generated",
+      message_sequences: [],
+      modified_at: "2026-09-20T17:09:00.000Z",
+    },
+    {
       key: "4d5e6f7a8b9c0d1e",
       name: "voice-note.ogg",
       path: "/Users/me/.zdx/artifacts/threads/demo/voice-note.ogg",
@@ -743,14 +772,110 @@ export const demoArtifacts: ArtifactsResponse = {
   ],
 };
 
-/** Demo bytes for artifact previews: a tiny SVG image, silence audio, a page. */
-export function demoArtifactBlob(path: string): Blob {
+/**
+ * A page that exercises annotation: a fixed header, an inner scroll container,
+ * a transformed card, a canvas chart, a link, and a button.
+ */
+function demoArtifactPage(path: string): string {
+  const rows = Array.from(
+    { length: 12 },
+    (_, i) => `<tr><td>Provider ${i + 1}</td><td>${((i * 7) % 40) + 10} ms</td><td>$${(i * 0.13 + 0.4).toFixed(2)}</td></tr>`,
+  ).join("");
+  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Demo</title>
+<style>body{font-family:system-ui,sans-serif;margin:0;color:#1b1f1b}header{position:fixed;top:0;left:0;right:0;background:#183323;color:#e9f5ed;padding:10px 16px;z-index:5}
+main{padding:56px 16px 16px}h1{font-size:22px}.card{border:1px solid #ccd;border-radius:8px;padding:12px;margin:12px 0}.tilt{transform:rotate(-1.5deg)}
+.scroll{max-height:140px;overflow:auto}.grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}.plan h3{margin:0 0 4px}.price{font-weight:600}table{width:100%;border-collapse:collapse}td{border-bottom:1px solid #eee;padding:6px}button{padding:8px 12px}</style></head>
+<body><header id="top">Provider report · ünïcødé ✓</header><main><h1 id="title">Provider comparison</h1><p class="lede">Latency and cost per provider, from ${path}.</p>
+<div class="card" id="summary"><h2>Summary</h2><p>Provider 3 is fastest. <a href="https://example.com/details" id="details">Details</a></p>
+<button id="refresh" onclick="document.getElementById('clicked').textContent='clicked'">Refresh</button> <span id="clicked"></span></div>
+<section id="plans" class="plans"><h2>Plans</h2><div class="grid"><div class="card plan"><h3>Basic</h3><p class="price">$9 per month</p><ul><li>1 project</li><li>Email support</li></ul></div><div class="card plan"><h3>Pro</h3><p class="price">$29 per month</p><ul><li>10 projects</li><li>Priority support</li></ul></div></div></section>
+<div class="card tilt" id="chart-card"><h2>Chart</h2><canvas id="chart" width="320" height="120"></canvas></div>
+<div class="card"><h2>Table</h2><div class="scroll" id="table-scroll"><table>${rows}</table></div></div><footer><p>Generated for the demo.</p></footer></main>
+<script>const c=document.getElementById('chart').getContext('2d');[40,80,30,100,60].forEach((h,i)=>{c.fillStyle='#2f8052';c.fillRect(20+i*60,120-h,40,h)});</script></body></html>`;
+}
+
+/** Demo submit: keeps the last payload on `window` so a browser test can read it. */
+export function demoSendFeedback(payload: FeedbackSubmissionPayload): ArtifactFeedbackResponse {
+  const w = window as unknown as { __zdxFeedback?: FeedbackSubmissionPayload[] };
+  w.__zdxFeedback = [...(w.__zdxFeedback ?? []), payload];
+  return { status: "queued", annotations: payload.annotations.length, stale: payload.allow_stale };
+}
+
+let demoChart: Promise<Blob> | null = null;
+
+/**
+ * A landscape PNG chart, so a portrait phone shows it letterboxed. Encoded
+ * once: the same bytes every time, like a file on disk.
+ */
+function demoChartPng(): Promise<Blob> {
+  demoChart ??= drawDemoChart();
+  return demoChart;
+}
+
+async function drawDemoChart(): Promise<Blob> {
+  const canvas = document.createElement("canvas");
+  canvas.width = 1200;
+  canvas.height = 800;
+  const ctx = canvas.getContext("2d")!;
+  ctx.fillStyle = "#ffffff";
+  ctx.fillRect(0, 0, 1200, 800);
+  ctx.fillStyle = "#1b1f1b";
+  ctx.font = "600 44px system-ui, sans-serif";
+  ctx.fillText("Latency by provider (ms)", 60, 90);
+  [220, 480, 160, 600, 340, 420].forEach((h, i) => {
+    ctx.fillStyle = i === 3 ? "#c0392b" : "#2f8052";
+    ctx.fillRect(100 + i * 170, 720 - h, 110, h);
+    ctx.fillStyle = "#4b504a";
+    ctx.font = "28px system-ui, sans-serif";
+    ctx.fillText(`P${i + 1}`, 130 + i * 170, 765);
+  });
+  ctx.strokeStyle = "#8a8f89";
+  ctx.lineWidth = 3;
+  ctx.strokeRect(2, 2, 1196, 796);
+  return await new Promise<Blob>((resolve) => canvas.toBlob((blob) => resolve(blob!), "image/png"));
+}
+
+type DemoOverride = Blob | Omit<ArtifactImageCopy, "blob"> & { blob: Blob } | { error: string; original: Blob };
+
+function demoOverride(path: string): DemoOverride | undefined {
+  return (window as unknown as { __zdxDemoArtifacts?: Record<string, DemoOverride> }).__zdxDemoArtifacts?.[path];
+}
+
+async function sha256Of(blob: Blob): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", await blob.arrayBuffer());
+  return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/**
+ * Stands in for `GET /artifacts/image`. The demo chart is already a small
+ * upright PNG, so it is its own canonical copy. A browser test serves a copy
+ * the engine made through `window.__zdxDemoArtifacts[path]` (`{ blob,
+ * sourceSha256, canonicalSha256, width, height, sourceWidth, sourceHeight }`), or a refusal
+ * (`{ error, original }`). Other images (the SVG) are refused like the server.
+ */
+export async function demoArtifactImage(path: string): Promise<ArtifactImageCopy | { error: string }> {
+  const override = demoOverride(path);
+  if (override && "error" in override) return { error: override.error };
+  if (override && "canonicalSha256" in override) return override;
+  if (!path.endsWith(".png")) return { error: "Annotation works on PNG, JPEG, and WebP images, not SVG files." };
+  const blob = await demoChartPng();
+  const sha = await sha256Of(blob);
+  return { blob, sourceSha256: sha, canonicalSha256: sha, width: 1200, height: 800, sourceWidth: 1200, sourceHeight: 800 };
+}
+
+/**
+ * Demo bytes for artifact previews: a page, a PNG chart, a passive SVG, and
+ * silence audio. A browser test can serve other bytes for a path through
+ * `window.__zdxDemoArtifacts`.
+ */
+export async function demoArtifactBlob(path: string): Promise<Blob> {
+  const override = demoOverride(path);
+  if (override instanceof Blob) return override;
+  if (override && "original" in override) return override.original;
   if (path.endsWith(".html")) {
-    return new Blob(
-      [`<html><body style="font-family:sans-serif"><h1>Demo artifact</h1><p>${path}</p></body></html>`],
-      { type: "text/html" },
-    );
+    return new Blob([demoArtifactPage(path)], { type: "text/html" });
   }
+  if (path.endsWith(".png")) return await demoChartPng();
   if (/\.(png|jpg|jpeg|gif|webp|svg)$/.test(path)) {
     return new Blob(
       [

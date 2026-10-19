@@ -2,7 +2,7 @@
 
 Svelte 5 + Vite + Tailwind v4 frontend for the zdx Telegram Mini App.
 
-Consumes the read-only JSON API served by `crates/zdx-bot/src/server.rs`, which also embeds this
+Consumes the JSON API served by `crates/zdx-bot/src/server.rs` (read-only except artifact feedback), which also embeds this
 app's build output and serves it at `/app`. This is the Mini App — the old vanilla `app.html` shell
 has been removed.
 
@@ -15,6 +15,11 @@ has been removed.
 - `src/app.css`: the whole design system — Tailwind v4 `@theme` tokens
 - `src/lib/telegram.ts`: `window.Telegram.WebApp` bridge (scheme, safe areas, haptics, back button, `start_param`, `openTelegramLink`)
 - `src/lib/api.ts`: typed fetch client; sends `Authorization: tma <initData>`
+- `src/lib/annotate.ts`: artifact annotation — the bridge injected into previewed HTML (its source is a string here; it runs after the doctype, removes itself, builds messages with object spread rather than page-patchable helpers, and only answers parent requests), validation of its untrusted `postMessage` events (the per-load nonce filters stray messages; it does not make a report trusted), mark geometry, drawing sketch rendering, media helpers, and the feedback payload (mirrors `zdx_engine::core::artifact_feedback::FeedbackSubmission`). No `$lib` imports, so `annotate.test.mjs` can load it under `bun test`
+- `src/lib/draftStore.ts`: unsent annotation drafts (media as Blobs) in IndexedDB, one record per Telegram user, thread, and artifact path, with the annotated SHA-256 and the submission id; in-memory when IndexedDB is unavailable, and `saveDraftRecord` returns `false` so the UI never claims the notes are saved. It resolves only when the transaction commits: `ArtifactAnnotator` shows `saving` until then (`data-storage` on the status text; browser tests wait for `saved` before reloading), and only the latest write sets the status
+- `annotate.test.mjs`: bridge injection and message-validation tests (`bun test apps/web/annotate.test.mjs`)
+- `src/lib/imageMarks.ts`: image artifact annotation view geometry (formats, limits, and orientation are the server's: the image is the engine's canonical copy, shown as is): `fitRect` (contain, letterboxed), an image-relative `ImageView` (zoom + image point at the stage centre) clamped by `viewRect`, `zoomAround`/`panBy`, stage↔image mapping, and stroke clamping/thinning, `revealBounds` (smallest pan that brings the edited mark back into view after the stage resizes; zoom unchanged), `badgePosition` (number clamped to the image box, not the stage, so it never sits away from its mark). Marks are fractions of the canonical copy, never stage pixels; that is what keeps them attached through zoom, resize, and rotation. No `$lib` imports
+- `image-marks.test.mjs`: letterbox, zoom/pan clamping, resize/rotation, stroke clipping, and image payload tests (`bun test apps/web/image-marks.test.mjs`)
 - `src/lib/types.ts`: response types mirroring `server.rs` — keep in sync when the Rust structs change
 - `src/lib/router.svelte.ts`: query-string router. Canonical: `?view=threads`, `?view=thread&id=…&tab=…`
   and `?view=monitor&section=…` (sections include `workspaces`). The bot's legacy `?view=threads&id=…`, `?view=git` and bare
@@ -38,12 +43,42 @@ has been removed.
   summary and the Workers pane. `failed` is always its own bucket — folding it into `settled` hides
   the one state the reader has to act on. Empty buckets are omitted, and a roll-up whose workers are
   all lineage-only reads `N workers · status unavailable` rather than `N unknown`.
-- `src/lib/demo.ts`: **DEV-only** fixtures behind `?demo=1`; dropped from prod builds
+- `src/lib/demo.ts`: **DEV-only** fixtures behind `?demo=1`; dropped from prod builds. Artifact bytes can be
+  replaced per path from a browser test with `window.__zdxDemoArtifacts = { [path]: Blob }`
 - `src/components/`: `Collapse`, `Markdown`, `DiffView`, `Drawer`, `TabStrip`, `Icon`,
   `WorkGroup` (the "Worked for 5m" turn divider), `GroupLine` (folded run), `ToolLine` (one call),
   `ArtifactAttachments` (inline image/audio/file-card rows under a message),
   `ArtifactPreview` (full-screen preview overlay; HTML goes through a sandboxed
-  iframe with an opaque origin, never the app's credentials)
+  iframe with an opaque origin, never the app's credentials; an image goes to the annotator as its
+  canonical copy from `api.artifactImage` (`/artifacts/image`; identity from `X-Zdx-*` headers); a `422`
+  (format, or over the 25 MiB / 40 MP limits on originals) shows the original as a passive `<img>` with the
+  server's reason, plus a line when unsent notes for it are kept in the draft store),
+  `ImageStage` (the image branch of the annotator: the `<img>` placed by `viewRect`, an SVG overlay that
+  redraws marks from image fractions on every view change, pans the `focus` mark (the one being edited, or unfinished strokes) back into view when the stage resizes, moves Fit to the other top corner when a mark or number is under it, pinch/pan/double-tap/wheel zoom, Tap → pin,
+  Draw → strokes; a second finger always turns the gesture into a pinch and drops the stroke in progress),
+  `ArtifactAnnotator` (HTML and image artifacts; the editor, notes list, drafts, stale handling, and Send
+  are shared, and for images the stage is `ImageStage`, with no bridge, pins instead of the element tree,
+  the server's source hash as the version (the copy is not hashed here), the copy's decode checked against
+  the named size, and the copy's hash and size sent as `image`. When the original is larger than the copy, a line says the
+  user annotates an optimized copy (sizes from `sourceWidth`/`sourceHeight`). Drafts store that frame (`DraftRecord.frame`);
+  reopening on another copy is stale. Snapshot `$state` objects before IndexedDB or the payload (a proxy
+  fails the structured clone and the draft silently stays in memory only). For HTML: Browse / Tap / Draw modes, the Tap selection
+  sheet (highlight + dimming drawn by the bridge, a local ancestor/child tree addressed by
+  bridge-local node ids that are only valid until the next answer, Select parent, and an explicit
+  Comment on this; the bridge walks the tree with prototype getters captured before page scripts
+  run, the parser drops repeated node ids, and tree lists are keyed by index), the note editor
+  with intent, comment, voice, and images, the notes list, stale-version and lost-bridge banners, and
+  Send). Keep `sandbox="allow-scripts"` without `allow-same-origin`: the app never reads the page
+  DOM, it talks to the injected bridge. In Tap and Draw the parent covers the frame and owns input,
+  so page handlers never fire; the frame only answers requests the parent is waiting for, so a page
+  script cannot create a draft or change a selection. Never use `scrollIntoView` for page or sheet
+  reveals: it also scrolls the app around the frame (seen in Chromium); scroll the specific box. Send the frame geometry, ids, and mode only — never comments, media,
+  or ids of the thread. Snapshot state before `postMessage` (`$state` proxies cannot be cloned, and
+  the throw takes down the whole view). Drafts hold Blobs, not object URLs, so they can be stored;
+  the component owns the URLs. Toolbar mode changes go through `requestMode`, which asks before leaving Draw with unfinished strokes; Send is disabled while they exist (never cleared silently). A send freezes the drafts (no edit, delete, new note, or mode change)
+  and success removes only the submitted ids, so the remembered `submission_id` always names exactly
+  what the server got. `ArtifactPreview` asks before closing over an open unsaved note (`unsaved`
+  binding, `confirmAction`).
 - `src/views/ThreadView.svelte`: thread shell — owns the thread fetch + tab strip, renders one pane.
   Shows a Telegram jump button when the response carries `telegram_link`; the link is built
   server-side from the *resolved* id, so it works for `?id=active` too.
@@ -164,7 +199,7 @@ design live in `.zdx/design-reference/` — local only, gitignored, not shipped.
 ## Conventions
 
 - Keep `src/lib/types.ts` matching `server.rs` exactly — field names are the JSON keys, no renames.
-- The API is read-only and every route is GET. Do not add write calls until the Rust side grows them.
+- The API is read-only except `POST /api/threads/{id}/artifacts/feedback` (`api.sendArtifactFeedback`). Do not add other write calls until the Rust side grows them. Write calls take the concrete thread id (`ThreadView` passes `artifactThreadId`: for a legacy `?id=active` link, the first concrete id the thread load resolved, never `active`).
 - Poll only when something is actually live (`tool_running`) and only when `document.visibilityState === "visible"`.
   The thread `cursor` counts source events, not visible `activity` rows: private meta and empty events create
   sequence gaps. Never derive the next cursor or a live tool's sequence from `activity.length`; a collision
