@@ -144,6 +144,8 @@ pub struct SupervisedChild {
     pub identity: TargetIdentity,
     lease: Option<StdUnixStream>,
     completion: Option<JoinHandle<io::Result<CompletionRecord>>>,
+    /// Values released only once the target has exited and been reaped.
+    keep_until_exit: Vec<Box<dyn Send>>,
 }
 
 impl std::fmt::Debug for SupervisedChild {
@@ -156,7 +158,35 @@ impl std::fmt::Debug for SupervisedChild {
     }
 }
 
+impl Drop for SupervisedChild {
+    /// A handle dropped while its target still runs closes the lease (the
+    /// supervisor then stops the group) and releases `keep_until_exit` only
+    /// after the target has been reaped, not at the drop.
+    fn drop(&mut self) {
+        let keep = std::mem::take(&mut self.keep_until_exit);
+        if keep.is_empty() {
+            return;
+        }
+        let Some(completion) = self.completion.take() else {
+            return;
+        };
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let _ = completion.await;
+                drop(keep);
+            });
+        }
+    }
+}
+
 impl SupervisedChild {
+    /// Keeps `value` alive until the target has exited and been reaped, even
+    /// when this handle is dropped earlier. Use it for anything the target's
+    /// run must own for its whole life, such as a lock on a file it writes.
+    pub fn keep_until_exit(&mut self, value: impl Send + 'static) {
+        self.keep_until_exit.push(Box::new(value));
+    }
+
     /// Closes the owner lease, asking the supervisor to terminate the group.
     pub fn cancel(&mut self) {
         self.lease.take();
@@ -463,6 +493,7 @@ async fn spawn(
         identity,
         lease: Some(lease_owner),
         completion: Some(completion),
+        keep_until_exit: Vec::new(),
     })
 }
 
@@ -1199,6 +1230,45 @@ mod tests {
 
         drop(child);
         wait_until_gone(pid).await;
+    }
+
+    /// A value kept until exit outlives a dropped handle while the target is
+    /// still being stopped, and is released once the target is gone.
+    #[tokio::test]
+    async fn kept_value_outlives_a_dropped_handle_until_exit() {
+        struct Signal(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for Signal {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+        let temp = TempDir::new().unwrap();
+        let pidfile = temp.path().join("target.pid");
+        // Ignores TERM, so the target lives through the shutdown grace.
+        let command = shell_command(
+            "trap '' TERM; echo $$ > \"$1\"; while :; do sleep 0.1; done",
+            &pidfile,
+        );
+        let mut child = command.spawn(Duration::from_millis(800)).await.unwrap();
+        let pid = wait_for_pid(&pidfile).await;
+        let (sender, mut released) = tokio::sync::oneshot::channel();
+        child.keep_until_exit(Signal(Some(sender)));
+
+        drop(child);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(process_exists(pid), "the target should still be stopping");
+        assert!(
+            released.try_recv().is_err(),
+            "released before the target exited"
+        );
+
+        tokio::time::timeout(Duration::from_secs(5), &mut released)
+            .await
+            .expect("never released")
+            .expect("signal dropped without sending");
+        assert!(!process_exists(pid), "released while the target was alive");
     }
 
     #[tokio::test]
