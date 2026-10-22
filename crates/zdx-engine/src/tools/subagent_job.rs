@@ -122,9 +122,106 @@ pub struct SubagentJob<'a> {
     pub options: ExecSubagentOptions,
     pub subagent: &'a str,
     pub child_thread_id: String,
-    /// The child thread's file, removed again if the call ends without the
-    /// child having written to it.
-    pub child_thread_path: std::path::PathBuf,
+    /// The file of a thread created for this call, removed again if the call
+    /// ends without the child having written to it. `None` when the call
+    /// continues an existing thread, which is never removed.
+    pub child_thread_path: Option<std::path::PathBuf>,
+    /// Held until the child exits (the exit callback keeps a reference), so
+    /// no second run can use its thread meanwhile.
+    pub thread_lock: Arc<ChildThreadLock>,
+}
+
+/// An exclusive advisory lock on a child thread's file, held for as long as
+/// a child runs against that thread.
+///
+/// `invoke_subagent` takes it for every child, new or continued, so two calls
+/// can never run the same thread at once, in this process or another one.
+#[derive(Debug)]
+pub struct ChildThreadLock {
+    _file: std::fs::File,
+}
+
+/// Locks the thread `id` for one child run.
+///
+/// # Errors
+/// Returns `thread_busy` when another run holds the thread, or `io_error`
+/// when the thread file cannot be opened or locked.
+pub(super) fn lock_child_thread(id: &str) -> Result<ChildThreadLock, ToolOutput> {
+    let path = crate::config::paths::threads_dir().join(format!("{id}.jsonl"));
+    let file = std::fs::File::open(&path).map_err(|err| {
+        ToolOutput::failure(
+            "io_error",
+            format!("Failed to open subagent thread {id}"),
+            Some(err.to_string()),
+        )
+    })?;
+    match file.try_lock() {
+        Ok(()) => Ok(ChildThreadLock { _file: file }),
+        Err(std::fs::TryLockError::WouldBlock) => Err(thread_busy(id)),
+        Err(std::fs::TryLockError::Error(err)) => Err(ToolOutput::failure(
+            "io_error",
+            format!("Failed to lock subagent thread {id}"),
+            Some(err.to_string()),
+        )),
+    }
+}
+
+/// The failure for a thread that another run is using right now.
+pub(super) fn thread_busy(id: &str) -> ToolOutput {
+    ToolOutput::failure(
+        "thread_busy",
+        format!(
+            "Subagent thread {id} is still running in another call. Wait until that run ends \
+             (follow it with background_output if it runs in the background), then continue it."
+        ),
+        None,
+    )
+}
+
+/// Turns the result of a finished child run into the `invoke_subagent`
+/// result.
+///
+/// An answer becomes `{ "result", "child_thread_id" }`, so the caller can
+/// continue the same child later. On failure or cancellation, a thread created
+/// for this call (`new_thread`) is removed when the child never wrote to it;
+/// a failure names the thread only when the thread still exists.
+pub(super) fn child_answer(
+    output: ToolOutput,
+    child_thread_id: &str,
+    new_thread: Option<&Path>,
+) -> ToolOutput {
+    match output {
+        ToolOutput::Success { data, image, .. } => ToolOutput::Success {
+            ok: true,
+            data: json!({ "result": data, "child_thread_id": child_thread_id }),
+            image,
+        },
+        ToolOutput::Failure { ok, mut error } => {
+            if let Some(path) = new_thread {
+                remove_unused_child_thread(path);
+            }
+            if crate::config::paths::threads_dir()
+                .join(format!("{child_thread_id}.jsonl"))
+                .exists()
+            {
+                let note = format!(
+                    "child_thread_id: {child_thread_id}. The thread keeps what the child did; \
+                     pass it as thread_id to continue it."
+                );
+                error.details = Some(match error.details.take() {
+                    Some(details) if !details.trim().is_empty() => format!("{details}\n{note}"),
+                    _ => note,
+                });
+            }
+            ToolOutput::Failure { ok, error }
+        }
+        canceled @ ToolOutput::Canceled { .. } => {
+            if let Some(path) = new_thread {
+                remove_unused_child_thread(path);
+            }
+            canceled
+        }
+    }
 }
 
 /// Why a background subagent cannot start in this context, checked before
@@ -201,7 +298,10 @@ struct LifecycleState {
 #[derive(Debug, Clone)]
 struct Leftovers {
     bg_id: String,
-    /// The child thread created for the call.
+    /// The thread the child runs against, new or continued.
+    child_thread_id: String,
+    /// The child thread created for the call; `None` for a continued thread,
+    /// which is never removed.
     child_thread: Option<std::path::PathBuf>,
 }
 
@@ -357,14 +457,18 @@ pub async fn run(
 ) -> ToolOutput {
     let started = std::time::Instant::now();
     let Some(tasks) = ctx.turn_tasks.clone() else {
-        remove_unused_child_thread(&job.child_thread_path);
+        if let Some(path) = &job.child_thread_path {
+            remove_unused_child_thread(path);
+        }
         return no_owner();
     };
     let mut managed = match spawn_managed(&job, live).await {
         Ok(managed) => managed,
         Err(output) => {
             // Nothing was started, so nothing can still write to the thread.
-            remove_unused_child_thread(&job.child_thread_path);
+            if let Some(path) = &job.child_thread_path {
+                remove_unused_child_thread(path);
+            }
             return output;
         }
     };
@@ -498,14 +602,19 @@ async fn spawn_managed(
     );
     let lifecycle = Arc::new(Lifecycle::new(Leftovers {
         bg_id: bg_id.clone(),
-        child_thread: Some(job.child_thread_path.clone()),
+        child_thread_id: job.child_thread_id.clone(),
+        child_thread: job.child_thread_path.clone(),
     }));
     zdx_tools::adopted::adopt(
         bg_id.clone(),
         child,
         label.clone(),
         readers,
-        exit_callback(Arc::clone(&lifecycle), events.clone(), prompt_files),
+        exit_callback(
+            Arc::clone(&lifecycle),
+            events.clone(),
+            (prompt_files, Arc::clone(&job.thread_lock)),
+        ),
     );
 
     Ok(ManagedChild {
@@ -561,20 +670,19 @@ fn hand_off(managed: &mut ManagedChild, rec: &BackgroundProcess) -> Result<(), T
 
 /// The blocking-call result of a managed child that exited before handoff.
 ///
-/// Same outcomes and texts as a blocking call: the answer, or an
-/// `execution_failed` error. The job was never registered, so its logs are
-/// removed, and so is its child thread on failure when the child never wrote
-/// to it.
+/// Same outcomes and texts as a blocking call: the answer with its
+/// `child_thread_id`, or an `execution_failed` error. The job was never
+/// registered, so its logs are removed, and so is a new child thread on
+/// failure when the child never wrote to it.
 #[cfg(unix)]
 fn finish_in_foreground(leftovers: &Leftovers, code: Option<i32>) -> ToolOutput {
     let output = foreground_output(&leftovers.bg_id, code);
     remove_logs(&leftovers.bg_id);
-    if !output.is_ok()
-        && let Some(path) = &leftovers.child_thread
-    {
-        remove_unused_child_thread(path);
-    }
-    output
+    child_answer(
+        output,
+        &leftovers.child_thread_id,
+        leftovers.child_thread.as_deref(),
+    )
 }
 
 #[cfg(unix)]
@@ -1358,6 +1466,7 @@ mod tests {
         let pid = child.identity.pid;
         let lifecycle = Arc::new(Lifecycle::new(Leftovers {
             bg_id: bg_id.clone(),
+            child_thread_id: bg_id.clone(),
             child_thread: Some(thread.clone()),
         }));
         zdx_tools::adopted::adopt(
@@ -1533,7 +1642,10 @@ mod tests {
         };
         let rec = record(&fixture.bg_id, true);
         let output = hand_off(&mut managed, &rec).expect_err("completed, not handed off");
-        assert_eq!(output.data(), Some(&json!("BOUNDARY")));
+        assert_eq!(
+            output.data(),
+            Some(&json!({ "result": "BOUNDARY", "child_thread_id": fixture.bg_id }))
+        );
         assert!(background_activity::get(&fixture.bg_id).is_none());
         assert!(!logs_exist(&fixture.bg_id));
         assert!(

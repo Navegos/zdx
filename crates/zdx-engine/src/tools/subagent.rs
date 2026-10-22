@@ -9,9 +9,7 @@ use serde_json::{Value, json};
 use super::{ToolContext, ToolDefinition, ToolSet, toolset_tool_names};
 use crate::core::context::PromptContextInclusion;
 use crate::core::events::ToolOutput;
-use crate::core::subagent::{
-    ExecSubagentOptions, SubagentStreamSink, run_exec_subagent_with_cancel,
-};
+use crate::core::subagent::{ExecSubagentOptions, SubagentStreamSink, run_exec_subagent_holding};
 use crate::providers::{ProviderKind, resolve_provider};
 use crate::subagents::{self, SubagentDefinition, SubagentSummary};
 
@@ -60,6 +58,10 @@ pub fn definition_with_subagents(
                 "model": {
                     "type": "string",
                     "description": "Optional model override for this invocation (`provider:model[@thinking][@fast]`, or `mode:<name>` for a configured model mode). Set only when the user explicitly requests it; otherwise omit it to preserve the named subagent profile. Must resolve to an available subagent model."
+                },
+                "thread_id": {
+                    "type": "string",
+                    "description": "Continue an earlier run of the same subagent instead of starting from zero: pass the `child_thread_id` an earlier invoke_subagent call returned. The child resumes that thread with its full history and the same artifact directory, so the prompt needs only the new request. The thread must belong to this subagent and this working directory, and must not be running. Omit it to start a new child."
                 }
             },
             "required": ["prompt", "subagent"],
@@ -118,6 +120,7 @@ struct SubagentInput {
     prompt: String,
     subagent: Option<String>,
     model: Option<String>,
+    thread_id: Option<String>,
 }
 
 /// Executes the `invoke_subagent` tool and returns a structured envelope.
@@ -147,6 +150,14 @@ pub async fn execute(input: &Value, ctx: &ToolContext) -> ToolOutput {
 
     let definition = &definition;
 
+    let resume = match normalize_optional(input.thread_id.clone()) {
+        Some(id) => match validate_resume_thread(&ctx.root, definition, &id) {
+            Ok(()) => Some(id),
+            Err(err) => return err,
+        },
+        None => None,
+    };
+
     let (model, thinking_level) =
         match resolve_execution_model(definition, &config, ctx, input.model.as_deref()) {
             Ok(resolved) => resolved,
@@ -166,7 +177,7 @@ pub async fn execute(input: &Value, ctx: &ToolContext) -> ToolOutput {
     let options = build_exec_options(definition, ctx, model, thinking_level, system_prompt);
 
     if super::wants_background(input_value) {
-        return start_background(definition, ctx, &prompt, options).await;
+        return start_background(definition, ctx, &prompt, options, resume.as_deref()).await;
     }
 
     // Relay the child's tool activity live to the parent's `invoke_subagent`
@@ -187,24 +198,64 @@ pub async fn execute(input: &Value, ctx: &ToolContext) -> ToolOutput {
             options,
             super::subagent_job::Launch::After(bound),
             stream,
+            resume.as_deref(),
         )
         .await;
     }
 
-    let result = run_exec_subagent_with_cancel(
+    run_blocking(ctx, &prompt, options, stream, resume.as_deref()).await
+}
+
+/// Runs the child and waits for it to exit.
+///
+/// The child's process owns its thread lock and the cleanup of a new thread
+/// it never wrote to: both are released when the child exits, also when this
+/// call is dropped first and its lease is still stopping the child.
+async fn run_blocking(
+    ctx: &ToolContext,
+    prompt: &str,
+    mut options: ExecSubagentOptions,
+    stream: Option<SubagentStreamSink>,
+    resume: Option<&str>,
+) -> ToolOutput {
+    let ChildThread {
+        id,
+        new_thread,
+        lock,
+    } = match ChildThread::open(&ctx.root, &options, resume) {
+        Ok(child) => child,
+        Err(err) => return err,
+    };
+    options.thread_id = Some(id.clone());
+    let hold = (lock, UnusedThreadCleanup(new_thread.clone()));
+    let result = run_exec_subagent_holding(
         &ctx.root,
-        &prompt,
+        prompt,
         &options,
         ctx.cancel_token.clone(),
         stream,
+        hold,
     )
     .await;
-    subagent_tool_output(
+    let output = subagent_tool_output(
         result,
         ctx.cancel_token
             .as_ref()
             .is_some_and(tokio_util::sync::CancellationToken::is_cancelled),
-    )
+    );
+    super::subagent_job::child_answer(output, &id, new_thread.as_deref())
+}
+
+/// Removes a thread created for a call when dropped, if the child never wrote
+/// to it.
+struct UnusedThreadCleanup(Option<std::path::PathBuf>);
+
+impl Drop for UnusedThreadCleanup {
+    fn drop(&mut self) {
+        if let Some(path) = &self.0 {
+            super::subagent_job::remove_unused_child_thread(path);
+        }
+    }
 }
 
 /// Starts `definition` as a background subagent owned by the current turn.
@@ -213,6 +264,7 @@ async fn start_background(
     ctx: &ToolContext,
     prompt: &str,
     options: ExecSubagentOptions,
+    resume: Option<&str>,
 ) -> ToolOutput {
     if !ctx.background_execution.is_enabled() {
         return ToolOutput::failure(
@@ -235,6 +287,7 @@ async fn start_background(
         options,
         super::subagent_job::Launch::Immediate,
         None,
+        resume,
     )
     .await
 }
@@ -252,8 +305,9 @@ fn automatic_handoff_bound(ctx: &ToolContext) -> Option<std::time::Duration> {
     }
 }
 
-/// Runs `definition` as a managed child owned by the current turn, against a
-/// child thread created up front so a handle can name it.
+/// Runs `definition` as a managed child owned by the current turn, against
+/// its thread: created up front so a handle can name it, or the continued
+/// thread `resume`.
 async fn run_managed(
     definition: &SubagentDefinition,
     ctx: &ToolContext,
@@ -261,20 +315,13 @@ async fn run_managed(
     mut options: ExecSubagentOptions,
     launch: super::subagent_job::Launch,
     live: Option<SubagentStreamSink>,
+    resume: Option<&str>,
 ) -> ToolOutput {
-    // Create the child's thread up front so the handle can name it before
-    // the child starts; the child then runs against it with `--thread`.
-    let child_thread = match create_child_thread(&ctx.root, &options) {
-        Ok(thread) => thread,
-        Err(err) => {
-            return ToolOutput::failure(
-                "thread_error",
-                "Failed to create the subagent's thread",
-                Some(format!("{err:#}")),
-            );
-        }
+    let child = match ChildThread::open(&ctx.root, &options, resume) {
+        Ok(child) => child,
+        Err(err) => return err,
     };
-    options.thread_id = Some(child_thread.id.clone());
+    options.thread_id = Some(child.id.clone());
 
     super::subagent_job::run(
         super::subagent_job::SubagentJob {
@@ -282,14 +329,140 @@ async fn run_managed(
             prompt,
             options,
             subagent: &definition.name,
-            child_thread_id: child_thread.id.clone(),
-            child_thread_path: child_thread.path().clone(),
+            child_thread_id: child.id,
+            child_thread_path: child.new_thread,
+            thread_lock: std::sync::Arc::new(child.lock),
         },
         ctx,
         launch,
         live,
     )
     .await
+}
+
+/// The thread one child run uses, locked for that run.
+struct ChildThread {
+    id: String,
+    /// The thread file when this call created it; `None` when continuing.
+    new_thread: Option<std::path::PathBuf>,
+    lock: super::subagent_job::ChildThreadLock,
+}
+
+impl ChildThread {
+    /// Creates and locks a new child thread, or locks the validated thread
+    /// `resume`. A thread that another run is using fails with `thread_busy`.
+    fn open(
+        root: &std::path::Path,
+        options: &ExecSubagentOptions,
+        resume: Option<&str>,
+    ) -> Result<Self, ToolOutput> {
+        if let Some(id) = resume {
+            let lock = super::subagent_job::lock_child_thread(id)?;
+            // Runs that are not invoke_subagent children (a TUI session, a
+            // manual `zdx exec --thread`) do not take the lock; their
+            // active-run marker shows them.
+            if crate::agent_activity::list_active()
+                .iter()
+                .any(|run| run.thread_id.as_deref() == Some(id))
+            {
+                return Err(super::subagent_job::thread_busy(id));
+            }
+            return Ok(Self {
+                id: id.to_string(),
+                new_thread: None,
+                lock,
+            });
+        }
+        let thread = create_child_thread(root, options).map_err(|err| {
+            ToolOutput::failure(
+                "thread_error",
+                "Failed to create the subagent's thread",
+                Some(format!("{err:#}")),
+            )
+        })?;
+        let path = thread.path().clone();
+        match super::subagent_job::lock_child_thread(&thread.id) {
+            Ok(lock) => Ok(Self {
+                id: thread.id.clone(),
+                new_thread: Some(path),
+                lock,
+            }),
+            Err(err) => {
+                super::subagent_job::remove_unused_child_thread(&path);
+                Err(err)
+            }
+        }
+    }
+}
+
+/// Checks that `id` names a thread an earlier call of `definition` created in
+/// this working directory, before anything runs against it.
+fn validate_resume_thread(
+    root: &std::path::Path,
+    definition: &SubagentDefinition,
+    id: &str,
+) -> Result<(), ToolOutput> {
+    let mismatch = |message: String| Err(ToolOutput::failure("thread_mismatch", message, None));
+    if !id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(ToolOutput::failure(
+            "invalid_input",
+            format!("thread_id '{id}' is not a thread id"),
+            Some("Pass the child_thread_id an earlier invoke_subagent call returned.".to_string()),
+        ));
+    }
+    let summary = match crate::core::thread_persistence::read_thread_summary(id) {
+        Ok(Some(summary)) => summary,
+        Ok(None) => {
+            return Err(ToolOutput::failure(
+                "thread_not_found",
+                format!("Subagent thread {id} does not exist"),
+                Some(
+                    "Pass a child_thread_id an earlier invoke_subagent call returned, or omit \
+                     thread_id to start a new child."
+                        .to_string(),
+                ),
+            ));
+        }
+        Err(err) => {
+            return Err(ToolOutput::failure(
+                "thread_error",
+                format!("Failed to read subagent thread {id}"),
+                Some(format!("{err:#}")),
+            ));
+        }
+    };
+    if summary.origin_kind.as_deref() != Some("subagent") {
+        return mismatch(format!(
+            "Thread {id} is not a subagent run; only a child_thread_id returned by \
+             invoke_subagent can be continued"
+        ));
+    }
+    let name = &definition.name;
+    if summary.subagent_name.as_deref() != Some(name.as_str()) {
+        return mismatch(format!(
+            "Thread {id} belongs to subagent '{}', not '{name}'",
+            summary.subagent_name.as_deref().unwrap_or("unknown")
+        ));
+    }
+    if let Some(thread_root) = summary.root_path.as_deref()
+        && !same_dir(std::path::Path::new(thread_root), root)
+    {
+        return mismatch(format!(
+            "Thread {id} runs in {thread_root}, not in this run's working directory {}",
+            root.display()
+        ));
+    }
+    Ok(())
+}
+
+fn same_dir(a: &std::path::Path, b: &std::path::Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
 }
 
 /// Creates the tagged child thread a background subagent runs against.
@@ -588,9 +761,9 @@ fn build_subagent_field_description(subagents: &[SubagentSummary]) -> String {
 
 fn build_description(subagents: &[SubagentSummary], allowed: Option<&[String]>) -> String {
     let mut description = if allowed.is_some() {
-        "Delegate a scoped read-only investigation to an isolated child agent run. This agent may only reach the subagents listed in the `subagent` field, which is required. Child runs are self-contained and do not share your full parent reasoning or implicit context, so every important decision, relevant detail, file path, constraint, non-goal, and acceptance criterion must be made explicit in the prompt. Provide a focused prompt with the goal, relevant context, constraints/non-goals, file paths, and expected output. When multiple subtasks are independent, call `invoke_subagent` multiple times in the same response to run them in parallel. Trust but verify: if a child reports claims you plan to rely on, inspect the key evidence before reporting success. The optional `model` spec is a user-controlled override for that invocation only; never change a named subagent's default autonomously. Returns the subagent's final answer as text, not its transcript.".to_string()
+        "Delegate a scoped task to an isolated child agent run. Each subagent works within the tools and rules of its own definition, as its description states. This agent may only reach the subagents listed in the `subagent` field, which is required. Child runs are self-contained and do not share your full parent reasoning or implicit context, so every important decision, relevant detail, file path, constraint, non-goal, and acceptance criterion must be made explicit in the prompt. Provide a focused prompt with the goal, relevant context, constraints/non-goals, file paths, and expected output. When multiple subtasks are independent, call `invoke_subagent` multiple times in the same response to run them in parallel. Trust but verify: if a child reports claims you plan to rely on, inspect the key evidence before reporting success. The optional `model` spec is a user-controlled override for that invocation only; never change a named subagent's default autonomously. Returns the subagent's final answer as `result` with its `child_thread_id`, not its transcript. To continue the same child later with its full history (for example to revise its work), pass that id as `thread_id`.".to_string()
     } else {
-        "Delegate a scoped read-only investigation to an isolated child agent run. Every subagent is read-only: they can research, read, and analyze, but they never edit files or change state, so all implementation stays in this run. `subagent` is required — use `explorer` for multi-round local exploration, repo understanding, or thread-history discovery, and `oracle` for deep diagnosis, debugging dead ends, architecture, or tradeoff analysis. Exact one-hop reads or exact string/symbol lookups are direct work and should not be delegated. When multiple investigations are independent, call `invoke_subagent` multiple times in the same response to run them in parallel; `explorer` is especially appropriate for fan-out across separate search areas. Child runs are self-contained and do not share your full parent reasoning or implicit context, so every important decision, relevant detail, file path, constraint, non-goal, and acceptance criterion must be made explicit in the prompt. Provide a focused prompt with the goal, relevant context, constraints/non-goals, file paths, and expected output. Trust but verify: if a child reports claims you plan to rely on, inspect the key evidence before relying on it. The optional `model` spec is a user-controlled override for that invocation only; never change a named subagent's default autonomously. Returns the subagent's final answer as text, not its transcript. Skill names are invalid unless they are also listed as supported subagents.".to_string()
+        "Delegate a scoped task to an isolated child agent run. Each subagent works within the tools and rules of its own definition, as its description states. `explorer` and `oracle` are read-only: they research, read, and analyze, but never edit files or change state, so their implementation work stays in this run. `subagent` is required — use `explorer` for multi-round local exploration, repo understanding, or thread-history discovery, and `oracle` for deep diagnosis, debugging dead ends, architecture, or tradeoff analysis. Exact one-hop reads or exact string/symbol lookups are direct work and should not be delegated. When multiple investigations are independent, call `invoke_subagent` multiple times in the same response to run them in parallel; `explorer` is especially appropriate for fan-out across separate search areas. Child runs are self-contained and do not share your full parent reasoning or implicit context, so every important decision, relevant detail, file path, constraint, non-goal, and acceptance criterion must be made explicit in the prompt. Provide a focused prompt with the goal, relevant context, constraints/non-goals, file paths, and expected output. Trust but verify: if a child reports claims you plan to rely on, inspect the key evidence before relying on it. The optional `model` spec is a user-controlled override for that invocation only; never change a named subagent's default autonomously. Returns the subagent's final answer as `result` with its `child_thread_id`, not its transcript. To continue the same child later with its full history (for example to revise its work), pass that id as `thread_id`. Skill names are invalid unless they are also listed as supported subagents.".to_string()
     };
 
     if !subagents.is_empty() {
@@ -1025,7 +1198,7 @@ mod tests {
             crate::config::ThinkingLevel::Low,
             "system".to_string(),
         );
-        start_background(&definition, ctx, "task", options).await
+        start_background(&definition, ctx, "task", options, None).await
     }
 
     /// A background call that cannot have an owner is refused before its
@@ -1198,7 +1371,7 @@ mod tests {
 
         assert!(desc.contains("coder (Coding helper)"));
         assert!(desc.contains("researcher (Research helper)"));
-        assert!(desc.contains("Every subagent is read-only"));
+        assert!(desc.contains("`explorer` and `oracle` are read-only"));
         assert!(desc.contains("use `explorer` for multi-round local exploration"));
         assert!(desc.contains("`oracle` for deep diagnosis"));
         assert!(!desc.contains("`task`"));
@@ -1298,6 +1471,210 @@ mod tests {
                 .as_array()
                 .expect("enum")
                 .is_empty()
+        );
+    }
+
+    fn named(name: &str) -> SubagentDefinition {
+        subagents::SubagentDefinition {
+            name: name.to_string(),
+            description: "desc".to_string(),
+            path: std::path::PathBuf::from(format!("{name}.md")),
+            source: subagents::SubagentSource::Project,
+            allowed_subagents: None,
+            model: None,
+            thinking_level: None,
+            tools: None,
+            skills: None,
+            auto_loaded_skills: None,
+            background_commands: false,
+            prompt_body: "body".to_string(),
+        }
+    }
+
+    /// A thread as a finished `invoke_subagent` call leaves it: tagged with
+    /// its subagent, with some history.
+    fn subagent_thread(root: &std::path::Path, origin: Option<&str>, subagent: &str) -> String {
+        let options = ExecSubagentOptions {
+            thread_origin_kind: origin.map(str::to_string),
+            thread_subagent_name: Some(subagent.to_string()),
+            ..Default::default()
+        };
+        let thread = create_child_thread(root, &options).unwrap();
+        let mut content = std::fs::read_to_string(thread.path()).unwrap();
+        content.push_str("{\"type\":\"message\",\"role\":\"user\",\"text\":\"task\"}\n");
+        std::fs::write(thread.path(), content).unwrap();
+        thread.id.clone()
+    }
+
+    fn error_code(result: Result<(), ToolOutput>) -> String {
+        let output = result.expect_err("refused");
+        let (code, _, _) = output.error_info().expect("failure");
+        code.to_string()
+    }
+
+    /// Continuing is allowed only for an existing thread that the same
+    /// subagent ran in the same working directory.
+    #[test]
+    fn resume_validates_the_thread_before_running() {
+        let _home = crate::test_support::temp_zdx_home();
+        let root = tempfile::tempdir().unwrap();
+        let other_root = tempfile::tempdir().unwrap();
+        let helper = named("helper");
+
+        let id = subagent_thread(root.path(), Some("subagent"), "helper");
+        assert!(validate_resume_thread(root.path(), &helper, &id).is_ok());
+
+        assert_eq!(
+            error_code(validate_resume_thread(
+                root.path(),
+                &helper,
+                "missing-thread"
+            )),
+            "thread_not_found"
+        );
+        assert_eq!(
+            error_code(validate_resume_thread(root.path(), &helper, "../escape")),
+            "invalid_input"
+        );
+        assert_eq!(
+            error_code(validate_resume_thread(root.path(), &named("other"), &id)),
+            "thread_mismatch"
+        );
+        assert_eq!(
+            error_code(validate_resume_thread(other_root.path(), &helper, &id)),
+            "thread_mismatch"
+        );
+        let helper_run = subagent_thread(root.path(), Some("helper:title"), "helper");
+        assert_eq!(
+            error_code(validate_resume_thread(root.path(), &helper, &helper_run)),
+            "thread_mismatch"
+        );
+    }
+
+    /// One child thread runs at most one child at a time: a second call is
+    /// refused while the first holds the thread, and allowed afterwards.
+    #[test]
+    fn a_running_thread_cannot_be_continued_twice() {
+        let _home = crate::test_support::temp_zdx_home();
+        let root = tempfile::tempdir().unwrap();
+        let id = subagent_thread(root.path(), Some("subagent"), "helper");
+        let options = ExecSubagentOptions::default();
+
+        let first = ChildThread::open(root.path(), &options, Some(&id)).expect("free");
+        assert!(
+            first.new_thread.is_none(),
+            "a continued thread is never removed"
+        );
+        let second = ChildThread::open(root.path(), &options, Some(&id))
+            .err()
+            .expect("busy");
+        assert_eq!(second.error_info().unwrap().0, "thread_busy");
+
+        drop(first);
+        assert!(ChildThread::open(root.path(), &options, Some(&id)).is_ok());
+    }
+
+    /// An answer names the thread that holds it; a failure names it only
+    /// while the thread exists, and a new thread the child never wrote to is
+    /// removed.
+    #[test]
+    fn child_answers_carry_their_thread() {
+        let home = crate::test_support::temp_zdx_home();
+        let root = tempfile::tempdir().unwrap();
+        let id = subagent_thread(root.path(), Some("subagent"), "helper");
+        let answer =
+            crate::tools::subagent_job::child_answer(ToolOutput::success(json!("done")), &id, None);
+        assert_eq!(
+            serde_json::to_value(&answer).unwrap()["data"],
+            json!({ "result": "done", "child_thread_id": id })
+        );
+
+        let failed = crate::tools::subagent_job::child_answer(
+            ToolOutput::failure("execution_failed", "Subagent execution failed", None),
+            &id,
+            None,
+        );
+        let (_, _, details) = failed.error_info().unwrap();
+        assert!(details.unwrap_or_default().contains(&id));
+
+        let empty = create_child_thread(root.path(), &ExecSubagentOptions::default()).unwrap();
+        let failed = crate::tools::subagent_job::child_answer(
+            ToolOutput::failure("execution_failed", "Subagent execution failed", None),
+            &empty.id,
+            Some(empty.path()),
+        );
+        let (_, _, details) = failed.error_info().unwrap();
+        assert!(details.is_none(), "{details:?}");
+        assert!(
+            !home
+                .path()
+                .join("threads")
+                .join(format!("{}.jsonl", empty.id))
+                .exists()
+        );
+    }
+
+    /// A dropped blocking call does not free its thread early: the lock stays
+    /// with the child until the lease has stopped it, so an immediate
+    /// continuation is refused, and the next one after the exit runs.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropped_call_keeps_the_thread_locked_until_the_child_exits() {
+        use zdx_tools::process_supervisor::SupervisedCommand;
+
+        let home = crate::test_support::temp_zdx_home();
+        let root = tempfile::tempdir().unwrap();
+        let id = subagent_thread(root.path(), Some("subagent"), "helper");
+        let options = ExecSubagentOptions::default();
+        let pidfile = home.path().join("child.pid");
+
+        let ChildThread { lock, .. } =
+            ChildThread::open(root.path(), &options, Some(&id)).expect("free");
+        // A child that ignores TERM, so stopping it takes the whole grace.
+        let mut command = SupervisedCommand::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                "trap '' TERM; echo $$ > \"$1\"; while :; do sleep 0.1; done",
+                "fixture",
+                pidfile.to_str().unwrap(),
+            ])
+            .stdin_null();
+        let mut child = command
+            .spawn(std::time::Duration::from_millis(800))
+            .await
+            .expect("spawn fixture");
+        child.keep_until_exit((lock, UnusedThreadCleanup(None)));
+        let pid = loop {
+            if let Ok(raw) = std::fs::read_to_string(&pidfile)
+                && let Ok(pid) = raw.trim().parse::<i32>()
+            {
+                break pid;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+
+        // The call is dropped: its lease starts stopping the child.
+        drop(child);
+        let busy = ChildThread::open(root.path(), &options, Some(&id))
+            .err()
+            .expect("the stopping child still holds the thread");
+        assert_eq!(busy.error_info().unwrap().0, "thread_busy");
+
+        let resumed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Ok(child) = ChildThread::open(root.path(), &options, Some(&id)) {
+                    break child;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the thread was never released");
+        drop(resumed);
+        assert!(
+            unsafe { libc::kill(pid, 0) } != 0,
+            "the thread was released while the child was alive"
         );
     }
 }

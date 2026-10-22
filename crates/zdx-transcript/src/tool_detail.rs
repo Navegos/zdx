@@ -105,6 +105,16 @@ fn tool_output_text(name: &str, data: &Value) -> String {
         return content.to_string();
     }
 
+    // A finished invoke_subagent: its answer, then the thread to continue.
+    if name.eq_ignore_ascii_case("invoke_subagent")
+        && data.get("bg_id").is_none()
+        && let Some(result) = data.get("result").and_then(Value::as_str)
+        && let Some(thread) = data.get("child_thread_id").and_then(Value::as_str)
+    {
+        let separator = if result.ends_with('\n') { "" } else { "\n" };
+        return format!("{result}{separator}───\nchild_thread_id: {thread}\n");
+    }
+
     if let Some(text) = data.as_str() {
         return text.to_string();
     }
@@ -295,5 +305,21 @@ pub fn tool_detail_body(cell: &HistoryCell) -> ToolDetailBody {
     ToolDetailBody {
         lines,
         output_start,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::tool_output_text;
+
+    #[test]
+    fn subagent_answer_shows_text_then_its_thread() {
+        let data = json!({ "result": "line one\nline two", "child_thread_id": "thread-1" });
+        assert_eq!(
+            tool_output_text("invoke_subagent", &data),
+            "line one\nline two\n───\nchild_thread_id: thread-1\n"
+        );
     }
 }

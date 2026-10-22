@@ -111,6 +111,25 @@ fn log_nonzero_exit(status: std::process::ExitStatus, stderr: &str) {
 /// # Errors
 /// Returns an error if the child process fails, times out, is canceled, or
 /// produces invalid/empty output.
+pub async fn run_exec_subagent_with_cancel(
+    root: &Path,
+    prompt: &str,
+    options: &ExecSubagentOptions,
+    cancel: Option<CancellationToken>,
+    stream: Option<SubagentStreamSink>,
+) -> Result<String> {
+    run_exec_subagent_holding(root, prompt, options, cancel, stream, ()).await
+}
+
+/// Like [`run_exec_subagent_with_cancel`], and keeps `hold` alive until the
+/// child has exited.
+///
+/// On Unix `hold` outlives this future: if the future is dropped while the
+/// child runs, the lease stops the child and `hold` is released only once the
+/// child has been reaped.
+///
+/// # Errors
+/// Same as [`run_exec_subagent_with_cancel`].
 #[tracing::instrument(
     name = "subagent",
     skip_all,
@@ -119,12 +138,13 @@ fn log_nonzero_exit(status: std::process::ExitStatus, stderr: &str) {
         model = options.model.as_deref().unwrap_or("-"),
     )
 )]
-pub async fn run_exec_subagent_with_cancel(
+pub async fn run_exec_subagent_holding(
     root: &Path,
     prompt: &str,
     options: &ExecSubagentOptions,
     cancel: Option<CancellationToken>,
     stream: Option<SubagentStreamSink>,
+    hold: impl Send + 'static,
 ) -> Result<String> {
     tracing::info!(
         prompt_bytes = prompt.trim().len(),
@@ -133,9 +153,14 @@ pub async fn run_exec_subagent_with_cancel(
         "Subagent started"
     );
     // Holds the prompt files until the child has exited.
-    let (child, _prompt_files) = spawn_exec_subagent(root, prompt, options)
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let (mut child, _prompt_files) = spawn_exec_subagent(root, prompt, options)
         .await?
         .into_parts();
+    #[cfg(unix)]
+    child.keep_until_exit(hold);
+    #[cfg(not(unix))]
+    let _hold = hold;
 
     if let Some(sink) = stream {
         return run_child_streaming(child, cancel, options.timeout, sink).await;

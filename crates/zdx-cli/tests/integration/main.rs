@@ -21,6 +21,7 @@ mod quota;
 mod responses_usage;
 mod service;
 mod stream_stall;
+mod subagent_continuation;
 mod thread_schema;
 mod threads_export;
 mod threads_list_show;

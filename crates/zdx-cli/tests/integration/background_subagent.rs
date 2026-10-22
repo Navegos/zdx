@@ -747,7 +747,7 @@ fn log_files(zdx_home: &TempDir) -> Vec<std::path::PathBuf> {
 }
 
 /// A normal call whose subagent finishes within the bound returns the answer
-/// as plain text, exactly like a blocking call, and leaves no job behind.
+/// and its thread, exactly like a blocking call, and leaves no job behind.
 #[tokio::test]
 async fn fast_normal_call_returns_the_answer_and_registers_nothing() {
     if !can_bind_localhost() {
@@ -766,7 +766,8 @@ async fn fast_normal_call_returns_the_answer_and_registers_nothing() {
 
     let answer = last_result(&bodies);
     assert_eq!(answer["ok"], true, "{answer}");
-    assert_eq!(answer["data"], "CHILD-FAST-ANSWER", "{answer}");
+    assert_eq!(answer["data"]["result"], "CHILD-FAST-ANSWER", "{answer}");
+    assert!(answer["data"]["child_thread_id"].is_string(), "{answer}");
     assert!(subagent_markers(&zdx_home).is_empty());
     assert!(
         log_files(&zdx_home).is_empty(),
@@ -985,7 +986,11 @@ async fn normal_call_without_background_execution_blocks() {
         "{invoke}"
     );
     let answer = last_result(&bodies);
-    assert_eq!(answer["data"], "CHILD-BLOCKING-ANSWER", "{answer}");
+    assert_eq!(
+        answer["data"]["result"], "CHILD-BLOCKING-ANSWER",
+        "{answer}"
+    );
+    assert!(answer["data"]["child_thread_id"].is_string(), "{answer}");
     assert!(subagent_markers(&zdx_home).is_empty());
 }
 
