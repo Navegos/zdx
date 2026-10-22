@@ -92,6 +92,11 @@ pub const EXPLORER_SUBAGENT: &str = include_str!("../subagents/explorer.md");
 /// Built-in `oracle` subagent definition.
 pub const ORACLE_SUBAGENT: &str = include_str!("../subagents/oracle.md");
 
+/// Built-in `html-artifact-specialist` subagent definition (writes one HTML
+/// artifact).
+pub const HTML_ARTIFACT_SPECIALIST_SUBAGENT: &str =
+    include_str!("../subagents/html-artifact-specialist.md");
+
 /// Built-in reserved `orchestrator` profile definition (persistent home base).
 pub const ORCHESTRATOR_SUBAGENT: &str = include_str!("../subagents/orchestrator.md");
 

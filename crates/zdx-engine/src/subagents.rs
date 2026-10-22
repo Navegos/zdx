@@ -481,6 +481,12 @@ fn built_in_definitions() -> Result<Vec<SubagentDefinition>> {
             zdx_assets::ORACLE_SUBAGENT,
         ),
         (
+            manifest_dir
+                .join("subagents")
+                .join("html-artifact-specialist.md"),
+            zdx_assets::HTML_ARTIFACT_SPECIALIST_SUBAGENT,
+        ),
+        (
             manifest_dir.join("subagents").join("orchestrator.md"),
             zdx_assets::ORCHESTRATOR_SUBAGENT,
         ),
@@ -838,7 +844,40 @@ mod tests {
         let all = discover(root.path()).unwrap();
         assert!(all.iter().any(|s| s.name == "explorer"));
         assert!(all.iter().any(|s| s.name == "oracle"));
+        assert!(all.iter().any(|s| s.name == "html-artifact-specialist"));
         assert!(all.iter().any(|s| s.name == "orchestrator"));
+    }
+
+    /// The built-in HTML specialist renders with its bundled skill already
+    /// in the prompt, plus the project and safety blocks.
+    #[test]
+    fn html_artifact_specialist_renders_with_its_bundled_skill() {
+        let _home = crate::test_support::temp_zdx_home();
+        let root = tempdir().unwrap();
+        let definition = load_by_name(root.path(), "html-artifact-specialist").unwrap();
+        assert_eq!(definition.source, SubagentSource::BuiltIn);
+        assert_eq!(
+            definition.auto_loaded_skills.as_deref(),
+            Some(&["html-artifacts".to_string()][..])
+        );
+        assert!(
+            definition
+                .tools
+                .as_ref()
+                .is_some_and(|tools| tools.iter().any(|tool| tool == "write"))
+        );
+
+        let prompt = render_prompt(
+            &crate::config::Config::default(),
+            root.path(),
+            &definition,
+            "anthropic:claude-sonnet-4-5",
+            PromptContextInclusion::default(),
+        )
+        .unwrap();
+        assert!(prompt.contains("# Skill: html-artifacts"), "{prompt}");
+        assert!(prompt.contains("## Where the page runs"), "{prompt}");
+        assert!(prompt.contains("## Safety"), "{prompt}");
     }
 
     #[test]
