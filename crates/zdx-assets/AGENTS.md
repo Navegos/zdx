@@ -17,6 +17,7 @@ Scope: embedded asset content (prompts, instruction layers, default TOMLs, bundl
 - `model_overrides.toml`: pinned post-fetch overrides applied by `zdx models update` (corrects stale/promo upstream pricing and limits)
 - `bundled_skills/*/`: built-in bundled skill fallbacks; `build.rs` embeds every file under this tree
 - `bundled_skills/model-dispatch/`: named-model dispatch, fan-out, and reasoning-level comparisons
+- `bundled_skills/frontend-design/`: product-UI design skill adapted from `anthropics/skills` (Apache-2.0; keep `LICENSE.txt` with its modification notice there, not in `SKILL.md`); also auto-loaded by `html-artifact-specialist` for visual craft
 - `bundled_skills/html-artifacts/`: the HTML artifact skill (one `SKILL.md`; its craft notes on page, SVG, charts, and prototypes are optional know-how); auto-loaded by the built-in `html-artifact-specialist`
 - `bundled_commands/*.md`: built-in bundled custom slash commands; `build.rs` embeds every file under this tree
 - `subagents/*.md`: built-in standalone subagent prompts (`explorer`, `oracle`, and the write-capable `html-artifact-specialist`, registered in `zdx-engine` `built_in_definitions`) plus the reserved persistent `orchestrator` profile (Telegram home base; cannot be overridden by user/project subagent files)

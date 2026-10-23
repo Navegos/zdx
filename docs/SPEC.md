@@ -556,7 +556,7 @@ Child `zdx exec` processes inherit all `ZDX_*` env vars from the parent automati
 - Built-in subagents currently include:
   - `explorer`: a read-only local exploration specialist for open-ended multi-step discovery across the current workspace, broader machine-local filesystem paths, and saved thread history.
   - `oracle`: a read-only deep reasoning advisor for code review, difficult debugging, planning, and architecture decisions. Its output is advisory and should be independently validated by the parent agent.
-  - `html-artifact-specialist`: builds one HTML artifact (explainer, comparison, review, or working mockup) from the sources it is given. It is not read-only: it writes the page under its artifact directory, or edits the page it is given, and returns the absolute path. It auto-loads the bundled `html-artifacts` skill; its model comes from `[subagents.overrides.html-artifact-specialist]` or the caller. A revision continues the same child with `thread_id`.
+  - `html-artifact-specialist`: builds one HTML artifact (explainer, comparison, review, or working mockup) from the sources it is given. It is not read-only: it writes the page under its artifact directory, or edits the page it is given, and returns the absolute path. It auto-loads the bundled `html-artifacts` and `frontend-design` skills; its model comes from `[subagents.overrides.html-artifact-specialist]` or the caller. A revision continues the same child with `thread_id`.
 
 ### Models registry
 

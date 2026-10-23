@@ -858,7 +858,7 @@ mod tests {
         assert_eq!(definition.source, SubagentSource::BuiltIn);
         assert_eq!(
             definition.auto_loaded_skills.as_deref(),
-            Some(&["html-artifacts".to_string()][..])
+            Some(&["html-artifacts".to_string(), "frontend-design".to_string()][..])
         );
         assert!(
             definition
@@ -876,6 +876,7 @@ mod tests {
         )
         .unwrap();
         assert!(prompt.contains("# Skill: html-artifacts"), "{prompt}");
+        assert!(prompt.contains("# Skill: frontend-design"), "{prompt}");
         assert!(prompt.contains("## Where the page runs"), "{prompt}");
         assert!(prompt.contains("## Safety"), "{prompt}");
     }
