@@ -5,12 +5,12 @@ description: Build one HTML page that helps the user understand, decide, or try 
 
 # HTML artifacts
 
-The user describes a problem: a PR to understand, options to weigh, a workflow to try. Your job is to find the visual way that makes it clear, and build it as one HTML page. You choose the form, the structure, and the interaction. The user iterates with annotations.
+The user describes a problem: a PR to understand, options to weigh, a workflow to try. HTML pages are how the user explores and thinks through a topic, so the page is often the main result and the chat reply stays short. Your job is to find the visual form that makes the problem clear or lets the user try it, and build it as one HTML page. You choose the form, the structure, and the interaction. The user iterates with annotations.
 
 ## What the user values
 
 - Visual over prose. The user learns by seeing and trying, so show it when it can be shown.
-- Little visible text. Lead with the answer. Keep evidence, method, and caveats available but out of the way.
+- Little prose. Short text at the point of use (on a control, beside a figure, in a status) helps; long paragraphs do not. A page that answers a question leads with the answer. A page to operate opens in a working state. Keep evidence, method, and caveats available but out of the way.
 - Plain language, per the global Writing Style rule, in the user's language.
 - A page that works well on a phone and on a desktop.
 - The user's explicit requests win over anything here. When they ask for a format, a library, a layout, or Mermaid, use it.
@@ -26,12 +26,12 @@ The user describes a problem: a PR to understand, options to weigh, a workflow t
 These are observations, not rules. Choose what fits the problem.
 
 - A visual earns its place when it shows a space, a structure, a flow, a quantity, or something to try. When a sentence is faster, write the sentence.
-- Let the question pick the form, not the topic. The same PR can need the new request path for "how does this work now" and a before/after for "what did this change".
+- Let what the user wants to do with the page pick its form and interaction, not the topic. A page can hold the right information and still miss if it does not support the way they asked to explore it. The same PR can need the new request path for "how does this work now" and a before/after for "what did this change".
 - Draw the mechanism, not its name. For options, draw what differs between them.
 - An answer that does not depend on the reader's input is often a diagram. A question about amounts is often a chart, a single number, or a table. "What happens if I do X" or "how does this feel" is often a working prototype.
-- When the real system has a control, the figure can have it too. Interaction is for exploring the content.
-- The main answer is visible when the page loads, not only on hover, after an animation, or behind a control.
-- A prototype proves the core interaction, fakes what sits behind it, and says on the page what is fake. A mockup of an existing product starts from that product's real source and values.
+- When the real system has a control, the figure can have it too. Interaction is for exploring the content. A control earns its place when each action shows a clear effect, ideally everywhere that effect matters (the result, the code or message it produces, the state it changes). An empty state says what to try next.
+- The page is useful when it loads: the main answer is visible, or the tool is already in a realistic working state with sample data. Nothing important appears only on hover or after an animation.
+- A prototype proves the core interaction. When the real mechanism is the point and cheap to run in the page (a browser boundary, a parser, a state rule), run it for real. Simulate the supporting parts (data, network, other screens) and say on the page what is simulated. A mockup of an existing product starts from that product's real source and values.
 - SVG is the default for diagrams. Use Mermaid when the user asks for it; a pinned Mermaid library from a CDN renders it in the page.
 
 ## Where the page runs
@@ -68,14 +68,17 @@ Know-how from earlier artifacts. Use what helps; none of it is required.
 
 ### Page
 
-- The page reads alone: a short title, the answer, and enough context that someone without the conversation understands it.
+- The page reads alone: a short title, the main point or the working tool, and enough context that someone without the conversation understands it.
 - One column on a phone; use the extra width on desktop, for example a figure next to its explanation.
 - The page should not scroll sideways on a phone. `minmax(0,1fr)`, `min-width: 0`, and `max-width: 100%` help. Wide tables, code, and diagrams can scroll inside their own box.
 - `<details>` keeps evidence, method, sources, and exact code close to the figure they support without filling the default view.
 - Repeated elements share edges and padding. Card styling marks a separate object; it does not need to wrap everything.
 - Touch has no hover, so every value and control should work by tap, with targets large enough for a finger.
+- Design the page on purpose. A clear order (the main idea, then the part to look at or use, then detail), a small type scale, and controls that show their state the same way everywhere make a page feel considered.
+- Ground the look in the subject. Its real names, identifiers, units, and realistic sample data read better than generic labels. A short, specific page name helps it stand out among many artifacts.
+- Let color carry meaning: an accent for state, focus, or the thing that matters, neutrals for the rest. Monospace suits code, identifiers, and raw data.
 - Choose a look that fits the task and the product it shows, and keep it legible: readable body size, enough contrast, a legend when color carries meaning. CSS variables keep a theme consistent; if the page supports light and dark mode, check contrast in both.
-- Common generic looks to avoid by default: purple-blue gradients, glow, emoji as bullets, everything in cards, oversized hero headings.
+- Some looks read as generic when they appear without a reason: purple-blue gradients, glow, emoji as bullets, the same card around every block, a large hero that pushes the content down. Use one when the content calls for it.
 
 ### SVG diagrams
 
