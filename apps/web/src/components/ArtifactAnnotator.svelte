@@ -1336,8 +1336,8 @@
 <style>
   .annot-root {
     display: flex;
+    flex: 1;
     flex-direction: column;
-    height: calc(100dvh - var(--tg-safe-top) - var(--tg-safe-bottom) - 4.75rem);
     min-height: 24rem;
   }
 

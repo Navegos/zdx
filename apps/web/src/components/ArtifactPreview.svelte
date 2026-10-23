@@ -25,6 +25,13 @@
   let passiveReason = $state<string | null>(null);
   let error = $state("");
   let loading = $state(true);
+  /** The annotator is shown: HTML, or an image with its canonical copy. */
+  const annotating = $derived(
+    artifact.exists &&
+      !loading &&
+      !error &&
+      ((artifact.kind === "html" && htmlBlob !== null) || (artifact.kind === "image" && imageCopy !== null)),
+  );
   /** The annotator has an open note, a recording, or a stroke closing would lose. */
   let unsaved = $state(false);
 
@@ -156,7 +163,7 @@
     if (e.target === e.currentTarget) void requestClose();
   }}
 >
-  <div class="preview-sheet" role="dialog" aria-label={artifact.name}>
+  <div class="preview-sheet" class:fill={annotating} role="dialog" aria-label={artifact.name}>
     <header class="flex shrink-0 items-center gap-2 border-b border-border px-3 py-2">
       <div class="min-w-0 flex-1">
         <p class="m-0 truncate text-sm font-semibold">{artifact.name}</p>
@@ -223,8 +230,7 @@
     display: flex;
     flex-direction: column;
     width: 100%;
-    max-width: 48rem;
-    max-height: calc(100dvh - var(--tg-safe-top) - 1rem);
+    max-height: calc(100dvh - var(--tg-safe-top) - var(--tg-safe-bottom) - 0.5rem);
     margin-bottom: var(--tg-safe-bottom);
     overflow: hidden;
     background: var(--color-surface);
@@ -236,6 +242,17 @@
     min-height: 0;
     flex: 1;
     overflow: auto;
+  }
+
+  /* The annotator fills the sheet, and the sheet fills the viewport below a
+     small top gap, so the page gets all the space the overlay has. */
+  .preview-sheet.fill {
+    height: calc(100dvh - var(--tg-safe-top) - var(--tg-safe-bottom) - 0.5rem);
+  }
+
+  .preview-sheet.fill .preview-body {
+    display: flex;
+    flex-direction: column;
   }
 
   .preview-media {
