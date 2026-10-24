@@ -817,6 +817,39 @@ mod tests {
         );
     }
 
+    /// Spellings of one file are sent once, in first-seen order; a `..` out
+    /// of a symlinked directory names another file and is kept.
+    #[cfg(unix)]
+    #[test]
+    fn parse_final_response_sends_equivalent_paths_once() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!("zdx-media-{}", uuid::Uuid::new_v4()));
+        let r = root.display();
+        for dir in ["real/sub", "deep/target"] {
+            std::fs::create_dir_all(root.join(dir)).expect("dirs");
+        }
+        for file in ["real/x.png", "x.png", "deep/x.png"] {
+            std::fs::write(root.join(file), file).expect("write");
+        }
+        // `link/..` reads as the root but opens `deep`.
+        symlink(root.join("deep/target"), root.join("link")).expect("symlink");
+        let parsed = parse_final_response(&format!(
+            "<media>{r}/real/x.png</media><media>{r}/real/./x.png</media>\
+             <media>{r}/real//x.png</media><media>{r}/real/sub/../x.png</media>\
+             <media>{r}/x.png</media><media>{r}/link/../x.png</media>"
+        ));
+        assert_eq!(
+            parsed.media_paths,
+            vec![
+                PathBuf::from(format!("{r}/real/x.png")),
+                PathBuf::from(format!("{r}/x.png")),
+                PathBuf::from(format!("{r}/link/../x.png")),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn parse_final_response_ignores_media_path_attribute_format() {
         let parsed = parse_final_response("<media path=\"/tmp/out.png\"/>");

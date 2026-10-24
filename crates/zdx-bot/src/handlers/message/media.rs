@@ -49,7 +49,7 @@ pub(super) fn parse_final_response(final_text: &str) -> ParsedFinalResponse {
 
     for raw in raw_media_values {
         if let Some(path) = parse_media_path(&raw)
-            && seen.insert(path.clone())
+            && seen.insert(media_identity(&path))
         {
             media_paths.push(path);
         }
@@ -127,6 +127,19 @@ fn extract_media_tags(input: &str) -> (String, Vec<String>) {
 /// the Mini App lists (and an `Open artifact` link names).
 fn parse_media_path(raw: &str) -> Option<PathBuf> {
     zdx_engine::core::artifacts::clean_media_path(raw).map(PathBuf::from)
+}
+
+/// What makes two `<media>` values the same file, so a reply sends it once.
+/// Spellings that resolve to the same place the artifact projection lists
+/// (`/a/x.png`, `/a/./x.png`, `/a/b/../x.png`) share its artifact key. A path
+/// whose lexical form is another file than the one it opens (a `..` out of a
+/// symlinked directory) keeps its own spelling and is never merged.
+fn media_identity(path: &Path) -> String {
+    if zdx_engine::core::artifacts::lexical_path_is_physical(path) {
+        format!("key:{}", zdx_engine::core::artifacts::artifact_key(path))
+    } else {
+        format!("path:{}", path.display())
+    }
 }
 
 pub(super) fn is_valid_media_path(path: &Path) -> bool {
