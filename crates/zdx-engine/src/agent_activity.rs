@@ -2,8 +2,11 @@
 //!
 //! Creates ephemeral JSON marker files under `~/.zdx/run/agents/` while an
 //! agent turn is executing. The marker is removed automatically on `Drop`
-//! (normal completion, error, or panic). Stale markers (dead PID) are
-//! filtered out when listing active runs.
+//! (normal completion, error, or panic). Stale markers are filtered out when
+//! listing active runs: the PID is gone, or it now belongs to another process
+//! (see [`owner_is_running`]). A marker left by a killed process would
+//! otherwise stay "active" for as long as its PID is reused, and block a
+//! queued restart or a subagent continuation the whole time.
 
 use std::fs;
 use std::io::Write;
@@ -15,7 +18,7 @@ use tempfile::NamedTempFile;
 use uuid::Uuid;
 
 use crate::config::paths;
-use crate::proc_liveness::is_alive;
+use crate::proc_liveness::{current_birth, is_alive};
 
 /// Maximum characters kept in an [`ActiveToolCall`] summary.
 const TOOL_SUMMARY_MAX_CHARS: usize = 200;
@@ -118,6 +121,11 @@ fn now_rfc3339() -> String {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunRecord {
     pub pid: u32,
+    /// OS start-time identity of `pid` when the marker was written
+    /// (`proc_liveness::current_birth`), so a reused PID is not taken for
+    /// this run. `None` for older markers or when it could not be read.
+    #[serde(default)]
+    pub birth_id: Option<u64>,
     pub started_at: String,
     pub thread_id: Option<String>,
     pub surface: Option<String>,
@@ -399,6 +407,7 @@ pub fn start(params: StartParams<'_>) -> Option<RunGuard> {
     let started_at = now_rfc3339();
     let record = RunRecord {
         pid,
+        birth_id: current_birth(pid),
         started_at: started_at.clone(),
         thread_id: params.thread_id.map(String::from),
         surface: params.surface.map(String::from),
@@ -459,7 +468,7 @@ pub fn list_active() -> Vec<RunRecord> {
             let _ = fs::remove_file(&path);
             continue;
         };
-        if is_alive(record.pid) {
+        if owner_is_running(&record) {
             runs.push(record);
         } else {
             // Stale marker — clean up
@@ -470,6 +479,53 @@ pub fn list_active() -> Vec<RunRecord> {
     // Sort by started_at ascending (oldest first)
     runs.sort_by(|a, b| a.started_at.cmp(&b.started_at));
     runs
+}
+
+/// Whether the process that wrote `record` is still running.
+///
+/// Process identity, not heartbeat age: a healthy run can be quiet for a long
+/// time, and a sleeping Mac writes no heartbeat at all, so neither activity nor
+/// heartbeat age says the owner is gone. A live PID whose OS start time differs
+/// from the recorded one is another process that reused the PID. Markers
+/// without `birth_id` (written before it existed) fall back to their
+/// `started_at` where the start time is wall-clock (macOS): a process that
+/// started after the marker was written cannot have written it. Where the
+/// start time cannot be read, a live PID is kept, as before.
+fn owner_is_running(record: &RunRecord) -> bool {
+    if !is_alive(record.pid) {
+        return false;
+    }
+    let Some(current) = current_birth(record.pid) else {
+        return true;
+    };
+    match record.birth_id {
+        Some(recorded) => recorded == current,
+        None => !started_after_marker(current, &record.started_at),
+    }
+}
+
+/// Slack for clock steps between a process start and its first marker write.
+#[cfg(target_os = "macos")]
+const LEGACY_BIRTH_SLACK_MICROS: i64 = 60_000_000;
+
+/// Whether a process with wall-clock start `birth_micros` started after the
+/// marker's `started_at` (plus slack), so it is not the marker's writer.
+#[cfg(target_os = "macos")]
+fn started_after_marker(birth_micros: u64, started_at: &str) -> bool {
+    let Ok(started) = chrono::DateTime::parse_from_rfc3339(started_at) else {
+        return false;
+    };
+    let Ok(birth) = i64::try_from(birth_micros) else {
+        return false;
+    };
+    birth > started.timestamp_micros() + LEGACY_BIRTH_SLACK_MICROS
+}
+
+/// Linux start times count clock ticks since boot, not wall time, so a legacy
+/// marker cannot be compared; it is kept while its PID lives, as before.
+#[cfg(not(target_os = "macos"))]
+fn started_after_marker(_birth: u64, _started_at: &str) -> bool {
+    false
 }
 
 /// The newest active run bound to `thread_id`, if any.
@@ -551,6 +607,7 @@ mod tests {
     fn test_record() -> RunRecord {
         RunRecord {
             pid: std::process::id(),
+            birth_id: current_birth(std::process::id()),
             started_at: chrono::Utc::now().to_rfc3339(),
             thread_id: Some("t1".to_string()),
             surface: None,
@@ -566,6 +623,80 @@ mod tests {
             last_activity_at: None,
             heartbeat_at: None,
         }
+    }
+
+    /// A marker whose PID now belongs to another process is stale: the
+    /// recorded start time does not match, or (older markers) the process
+    /// started after the marker was written. The real owner stays active,
+    /// however old its heartbeat, and a dead PID is stale as before.
+    #[test]
+    fn markers_of_a_reused_pid_are_stale_and_quiet_owners_stay_active() {
+        let me = std::process::id();
+        let Some(birth) = current_birth(me) else {
+            return;
+        };
+        let long_ago = (chrono::Utc::now() - chrono::Duration::hours(6)).to_rfc3339();
+
+        let mut own = test_record();
+        own.heartbeat_at = Some(long_ago.clone());
+        own.last_activity_at = Some(long_ago.clone());
+        assert!(
+            owner_is_running(&own),
+            "a quiet run with a stale heartbeat is alive"
+        );
+
+        let mut reused = test_record();
+        reused.birth_id = Some(birth.wrapping_add(1));
+        assert!(
+            !owner_is_running(&reused),
+            "another process now holds the PID"
+        );
+
+        let mut legacy = test_record();
+        legacy.birth_id = None;
+        assert!(
+            owner_is_running(&legacy),
+            "a legacy marker of the live owner is kept"
+        );
+        legacy.started_at = long_ago;
+        // This test process started well after a marker written 6 h ago.
+        assert_eq!(owner_is_running(&legacy), !cfg!(target_os = "macos"));
+
+        let mut child = std::process::Command::new("true").spawn().expect("spawn");
+        let dead = child.id();
+        child.wait().expect("reap");
+        let mut gone = test_record();
+        gone.pid = dead;
+        assert!(!owner_is_running(&gone));
+    }
+
+    /// Through the marker directory: a leftover marker of a killed run whose
+    /// PID was reused is removed and not listed; the live run is listed.
+    #[test]
+    fn list_active_drops_markers_of_a_reused_pid() {
+        let _home = crate::test_support::temp_zdx_home();
+        let Some(birth) = current_birth(std::process::id()) else {
+            return;
+        };
+        let live = start(StartParams {
+            thread_id: Some("live-thread"),
+            ..StartParams::default()
+        })
+        .expect("marker");
+        let dir = agents_run_dir();
+        let leftover = dir.join(format!("{}-leftover.json", std::process::id()));
+        let mut record = test_record();
+        record.thread_id = Some("killed-thread".to_string());
+        record.birth_id = Some(birth.wrapping_add(1));
+        write_record(&leftover, &record).expect("write");
+
+        let threads: Vec<_> = list_active()
+            .into_iter()
+            .filter_map(|run| run.thread_id)
+            .collect();
+        assert_eq!(threads, ["live-thread"]);
+        assert!(!leftover.exists(), "the stale marker is removed");
+        drop(live);
     }
 
     #[test]

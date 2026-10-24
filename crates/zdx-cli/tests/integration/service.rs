@@ -78,11 +78,14 @@ fn test_service_restart_blocks_active_agent_unless_forced() {
     let dir = tempdir().unwrap();
     let agents_dir = dir.path().join("run/agents");
     std::fs::create_dir_all(&agents_dir).unwrap();
+    // A marker this live test process could have written: it started before
+    // `started_at`. One dated before the process started would belong to an
+    // earlier owner of the PID and be ignored as stale.
     std::fs::write(
         agents_dir.join("active.json"),
         serde_json::to_vec(&serde_json::json!({
             "pid": std::process::id(),
-            "started_at": "2026-01-01T00:00:00Z",
+            "started_at": chrono::Utc::now().to_rfc3339(),
             "thread_id": "test-thread",
             "surface": "test",
             "model": "test-model"
