@@ -40,6 +40,9 @@ has been removed.
 - `src/lib/time.ts`: quota reset formatting — `resets in 2h 14m` countdown plus a local clock time
   (`today 14:30`, `tomorrow 09:00`, `Thu 14:30`). Both take `now` explicitly.
 - `src/lib/run.ts`: formatting for the shared live run status (`formatSecs`, `runAges`)
+- `src/lib/usage.ts`: model and context occupancy read from a thread's usage events (`lastUsage`, `contextOccupancy`), shared by the Agent tab and the menu's thread card
+- `src/lib/monitorSummary.ts`: Monitor figures shown in more than one place (`servicesLabel`, `peakQuota`, `jobFailed`); all cover all of zdx
+- `src/lib/currentThread.svelte.ts`: what the open `ThreadView` already fetched (title, live `run`, worker count and list, git, model, context %), published for the menu's thread card so opening the menu costs no request for it. Unfetched parts stay null and the card leaves them out
 - `src/lib/artifactList.ts`: Artifacts tab order (newest / oldest / name; rows without a time last) and local day groups and labels. No `$lib` imports; tested by `artifact-list.test.mjs` (`bun test apps/web/artifact-list.test.mjs`)
 - `src/lib/workers.ts`: worker roll-up shaping/formatting shared by the thread list, the Agent
   summary and the Workers pane. `failed` is always its own bucket — folding it into `settled` hides
@@ -160,7 +163,14 @@ in `<svelte:boundary>` so such a failure shows the error instead of a permanent 
 
 There is no bottom tab bar. Navigation is a left drawer (shadcn-style
 `data-sidebar="group|menu|menu-item"` structure) opened from the header, plus a horizontally
-scrollable `TabStrip` inside the thread view.
+scrollable `TabStrip` inside the thread view. The drawer does not list thread tabs (the strip has
+them). It shows, in order: a "This thread" card while a thread view is open (from
+`currentThread`: run state, model and context %, branch and changes when git was fetched, the live
+run label, and the first three workers, failed first), the three most recent other threads, and
+"All of zdx" (one full-width row per Monitor section: Overview, Active agents, Services, Quota,
+Jobs, Workspaces, Config; figures only from `/api/monitor`, none for Workspaces and Config). Keep the scope labels: Monitor figures are global, the card is the thread's own. Opening
+the drawer reads `/api/threads` and `/api/monitor` once (and the workers once when the view has not
+loaded them); it never polls.
 
 Thread tabs are data-driven in `ThreadView.svelte` — adding a pane is a one-line entry there plus a
 value in `ThreadTab`/`THREAD_TAB_LABELS` and an icon in `TAB_ICONS`. **Artifacts** sits right after

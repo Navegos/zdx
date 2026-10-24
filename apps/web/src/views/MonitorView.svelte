@@ -5,6 +5,7 @@
   import { haptic } from "$lib/telegram";
   import { resetClock, resetCountdown } from "$lib/time";
   import { runAges } from "$lib/run";
+  import { jobFailed, peakQuota as peakQuotaOf, servicesLabel } from "$lib/monitorSummary";
   import WorkspacesPane from "./WorkspacesPane.svelte";
 
   interface Props {
@@ -73,11 +74,6 @@
     return "manual";
   }
 
-  function jobFailed(job: MonitorJob): boolean {
-    const outcome = job.last_run?.outcome;
-    return outcome === "failed" || outcome === "missed" || outcome === "interrupted";
-  }
-
   function statusClass(job: MonitorJob): string {
     if (job.status === "invalid" || job.status === "expired" || job.status === "interrupted") {
       return "text-destructive";
@@ -86,12 +82,7 @@
     return jobFailed(job) ? "text-destructive" : "text-muted-foreground";
   }
 
-  // Quotas are fetched off the request path and land on a later poll, so an
-  // unfetched snapshot has to read as unknown rather than as a real 0%.
-  let peakQuota = $derived.by(() => {
-    const used = data?.subscriptions.flatMap((s) => s.windows.map((w) => w.used_percent)) ?? [];
-    return used.length ? `${Math.max(...used).toFixed(0)}%` : "—";
-  });
+  let peakQuota = $derived(peakQuotaOf(data));
 </script>
 
 <header
@@ -156,7 +147,7 @@
     <div class="mx-auto flex max-w-3xl flex-col gap-3 pb-6">
       {#if section === "overview"}
         <div class="grid grid-cols-3 gap-2">
-          {#each [{ label: "services", value: `${data.services.filter((s) => s.running).length}/${data.services.length}` }, { label: "agents", value: String(data.active_agents.length) }, { label: "quota", value: peakQuota }] as m (m.label)}
+          {#each [{ label: "services", value: servicesLabel(data) }, { label: "agents", value: String(data.active_agents.length) }, { label: "quota", value: peakQuota }] as m (m.label)}
             <div class="rounded-lg border border-border bg-card px-2.5 py-2">
               <p class="m-0 font-mono text-xxs uppercase text-muted-foreground">{m.label}</p>
               <p class="m-0 text-lg font-semibold tracking-tight tabular-nums">{m.value}</p>

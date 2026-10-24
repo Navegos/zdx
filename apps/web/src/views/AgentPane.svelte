@@ -9,6 +9,7 @@
   } from "$lib/types";
   import { formatRollup } from "$lib/workers";
   import { runAges } from "$lib/run";
+  import { contextOccupancy, lastUsage as lastUsageOf } from "$lib/usage";
 
   interface Props {
     thread: ThreadResponse | null;
@@ -46,33 +47,8 @@
       : null,
   );
 
-  /** Most recent usage event, for model/provider attribution. */
-  let lastUsage = $derived.by(() => {
-    if (!thread) return null;
-    for (let i = thread.activity.length - 1; i >= 0; i--) {
-      const item = thread.activity[i];
-      if (item.type === "usage") return item as UsageActivity;
-    }
-    return null;
-  });
-
-  // Providers emit two kinds of usage event: one carrying the prompt (input +
-  // cache) and one carrying only the completion. Only the former describes what
-  // occupies the window, so the plain "last event" is usually ~0 and useless.
-  let context = $derived.by(() => {
-    if (!thread) return null;
-    for (let i = thread.activity.length - 1; i >= 0; i--) {
-      const item = thread.activity[i];
-      if (item.type !== "usage") continue;
-      const u = item as UsageActivity;
-      const prompt = u.input_tokens + u.cache_read_tokens + u.cache_write_tokens;
-      if (prompt === 0) continue;
-      const used = prompt + u.output_tokens;
-      const limit = u.context_limit ?? null;
-      return { used, limit, pct: limit ? (used / limit) * 100 : null };
-    }
-    return null;
-  });
+  let lastUsage = $derived(thread ? lastUsageOf(thread.activity) : null);
+  let context = $derived(thread ? contextOccupancy(thread.activity) : null);
 
   // Roll every usage event into a per-thread total.
   let totals = $derived.by(() => {

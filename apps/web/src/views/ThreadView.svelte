@@ -9,6 +9,8 @@
   import { router, THREAD_TAB_LABELS, type ThreadTab } from "$lib/router.svelte";
   import { haptic, openTelegramLink, selectionChanged } from "$lib/telegram";
   import { isBusy, needsAttention, rollupFrom } from "$lib/workers";
+  import { currentThread } from "$lib/currentThread.svelte";
+  import { contextOccupancy, lastUsage } from "$lib/usage";
   import TabStrip from "../components/TabStrip.svelte";
   import RunStatusLine from "../components/RunStatusLine.svelte";
   import type { IconName } from "../components/Icon.svelte";
@@ -274,6 +276,26 @@
     return () => {
       if (reconcile) clearTimeout(reconcile);
     };
+  });
+
+  // Publish what this view knows for the menu's thread card.
+  $effect(() => {
+    if (!data) return;
+    const usage = lastUsage(data.activity);
+    currentThread.value = {
+      routeId: id,
+      id: data.id,
+      title: data.title,
+      run: data.run,
+      workerCount: Math.max(data.worker_count, currentWorkers.length),
+      workers: workersFor === id ? currentWorkers : null,
+      git: currentGit,
+      model: usage?.model ?? null,
+      contextPct: contextOccupancy(data.activity)?.pct ?? null,
+    };
+  });
+  $effect(() => () => {
+    if (currentThread.value?.routeId === id) currentThread.value = null;
   });
 
   function refresh() {
