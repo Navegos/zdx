@@ -15,6 +15,7 @@
     newNonce,
     parseHelperEvent,
     pickRecorderMime,
+    quotePreview,
     prepareImage,
     renderSketch,
     samplePoints,
@@ -29,6 +30,7 @@
     type PageViewport,
     type Point,
     type SelectionTree,
+    type TextSelection,
     type TreeNode,
   } from "$lib/annotate";
   import { draftKey, loadDraftRecord, saveDraftRecord } from "$lib/draftStore";
@@ -154,6 +156,16 @@
       updateTreeMore();
     });
   });
+
+  /** Browse: the page's text selection, asked for on a timer (the bridge only
+   *  answers). Shown in the docked bar; only Add note turns it into a draft. */
+  let textSel = $state<TextSelection | null>(null);
+  let pendingText: number | null = null;
+  /** A finger is on the docked bar: keep it while the tap lands, even if the
+   *  page drops its selection when focus leaves the frame. */
+  let textHold = false;
+  let textHoldTimer: ReturnType<typeof setTimeout> | null = null;
+  const TEXT_POLL_MS = 400;
 
   /** Scroll the answer into view: tree moves can jump outside the visible page. */
   let pendingReveal = false;
@@ -352,6 +364,10 @@
     } else if (parsed.type === "probed") {
       probes.get(parsed.id)?.(parsed);
       probes.delete(parsed.id);
+    } else if (parsed.type === "text-selected") {
+      if (parsed.id !== pendingText || textHold || !textPolling) return;
+      pendingText = null;
+      textSel = parsed.selection;
     }
   }
 
@@ -369,6 +385,42 @@
         if (mode !== "browse") setMode("browse");
       }
     }, 2000);
+  }
+
+  const textPolling = $derived(!isImage && mode === "browse" && canAnnotate && panel !== "editor");
+
+  $effect(() => {
+    if (!textPolling) {
+      untrack(() => {
+        textSel = null;
+        pendingText = null;
+        textHold = false;
+      });
+      return;
+    }
+    const timer = setInterval(() => {
+      if (document.visibilityState !== "visible") return;
+      pendingText = ++requestSeq;
+      toFrame({ type: "text-selection", id: pendingText });
+    }, TEXT_POLL_MS);
+    return () => clearInterval(timer);
+  });
+
+  function holdText() {
+    textHold = true;
+    if (textHoldTimer) clearTimeout(textHoldTimer);
+    textHoldTimer = setTimeout(() => (textHold = false), 1500);
+  }
+
+  function addTextNote() {
+    const sel = textSel;
+    textHold = false;
+    if (!sel || !canAnnotate) return;
+    textSel = null;
+    pendingText = null;
+    toFrame({ type: "clear-text" });
+    const target = { kind: "text" as const, ...($state.snapshot(sel) as TextSelection) };
+    openEditor({ id: newId(), intent: "change", comment: "", target, voice: [], images: [] }, true);
   }
 
   function syncMarks() {
@@ -913,6 +965,7 @@
     window.removeEventListener("resize", resizeCanvas);
     if (readyTimer) clearTimeout(readyTimer);
     if (hintTimer) clearTimeout(hintTimer);
+    if (textHoldTimer) clearTimeout(textHoldTimer);
     stopRecording();
     setClosingConfirmation(false);
     if (frameUrl) URL.revokeObjectURL(frameUrl);
@@ -1031,6 +1084,23 @@
         onload={onFrameLoad}
       ></iframe>
     {/if}
+    {#if !isImage && mode === "browse" && textSel}
+      <div
+        class="text-dock"
+        role="group"
+        aria-label="Selected text"
+        onpointerdown={holdText}
+        data-text-dock
+      >
+        <div class="min-w-0 flex-1">
+          <small>Selected text</small>
+          <span class="dock-quote">“{quotePreview(textSel.quote, 140)}”</span>
+        </div>
+        <button type="button" class="stage-btn primary" onclick={addTextNote}>
+          <Icon name="message-square" /><span>Add note</span>
+        </button>
+      </div>
+    {/if}
     {#if !isImage && mode === "select"}
       <div
         class="annot-overlay"
@@ -1084,10 +1154,14 @@
   {#if panel === "editor" && editing}
     <section class="panel" aria-label="Edit note">
       <div class="panel-head">
-        <p class="m-0 min-w-0 flex-1 truncate text-xs font-semibold">{targetSummary(editing.target, surface)}</p>
+        <p class="m-0 min-w-0 flex-1 truncate text-xs font-semibold">
+          {editing.target.kind === "text" ? "Selected text" : targetSummary(editing.target, surface)}
+        </p>
         <button type="button" class="icon-btn" aria-label="Cancel note" onclick={closeEditor}><Icon name="x" /></button>
       </div>
-      {#if editing.target.kind === "drawing"}
+      {#if editing.target.kind === "text"}
+        <blockquote class="quote-block">{quotePreview(editing.target.quote, 400)}</blockquote>
+      {:else if editing.target.kind === "drawing"}
         <img class="sketch" src={urlFor(editing.target.sketch)} alt="Your drawing over outlines of the page" />
       {:else if editing.target.kind === "image_pin"}
         <p class="m-0 text-xxs text-muted-foreground">
@@ -1254,7 +1328,7 @@
         <p class="m-0 text-xs text-muted-foreground">
           {isImage
             ? "No notes yet. Use Tap to pin a spot or Draw to mark an area."
-            : "No notes yet. Use Tap to pick an element or Draw to mark an area."}
+            : "No notes yet. Select text in Browse, use Tap to pick an element, or Draw to mark an area."}
         </p>
       {:else}
         <ol class="note-list">
@@ -1265,7 +1339,11 @@
                 <span class="min-w-0 flex-1">
                   <span class="block truncate text-xs">
                     <span class="intent intent-{draft.intent}">{intentLabel(draft.intent)}</span>
-                    {targetSummary(draft.target, surface)}
+                    {#if draft.target.kind === "text"}
+                      <mark class="quote-mark">{targetSummary(draft.target, surface)}</mark>
+                    {:else}
+                      {targetSummary(draft.target, surface)}
+                    {/if}
                   </span>
                   <span class="block truncate text-xxs text-muted-foreground">
                     {#if !stale && unresolved.includes(index + 1)}<span class="text-warning">Not found on the page now · </span>{/if}
@@ -1484,6 +1562,54 @@
 
   .stage-btn.primary {
     background: var(--color-brand);
+  }
+
+  .text-dock {
+    position: absolute;
+    left: 0.5rem;
+    right: 0.5rem;
+    bottom: 0.5rem;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    border-radius: 10px;
+    background: rgb(0 0 0 / 0.8);
+    padding: 0.45rem 0.45rem 0.45rem 0.7rem;
+    color: white;
+    box-shadow: 0 6px 18px rgb(0 0 0 / 0.25);
+  }
+
+  .text-dock small {
+    display: block;
+    font-size: var(--text-xxs);
+    opacity: 0.7;
+  }
+
+  .dock-quote {
+    display: -webkit-box;
+    overflow: hidden;
+    font-size: 0.75rem;
+    line-height: 1.3;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
+  }
+
+  .quote-block {
+    margin: 0;
+    border-left: 3px solid var(--color-brand);
+    padding: 0.25rem 0.6rem;
+    background: color-mix(in srgb, var(--color-brand) 8%, transparent);
+    font-size: 0.75rem;
+    line-height: 1.4;
+    overflow-wrap: anywhere;
+  }
+
+  .quote-mark {
+    border-radius: 3px;
+    background: color-mix(in srgb, var(--color-brand) 16%, transparent);
+    padding: 0 0.15rem;
+    color: inherit;
   }
 
   .panel {

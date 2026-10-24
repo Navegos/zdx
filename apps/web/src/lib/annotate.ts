@@ -17,7 +17,10 @@
  *   nonce out of easy reach, nothing more.
  * - The frame never starts anything. It only answers requests the parent made
  *   (with an id the parent is waiting for). A pick becomes a draft the user
- *   sees and edits; nothing reaches the agent without the Send tap.
+ *   sees and edits; nothing reaches the agent without the Send tap. Text
+ *   selection follows the same rule: while Browse is open the parent asks for
+ *   the current selection on a timer, and only the user's Add note tap turns
+ *   an answer into a draft.
  * - The parent sends the frame geometry, ids, and mode only — never comments,
  *   media, thread ids, or credentials: page scripts can read anything sent in.
  *
@@ -95,8 +98,23 @@ export interface ImageFrame {
   height: number;
 }
 
+/** Text the user selected in Browse. The quote is exact; `prefix` and
+ *  `suffix` are a little of the element's text around it, so the agent can
+ *  find it again. `rect` is the selection's box in page coordinates. */
+export interface TextTarget {
+  kind: "text";
+  quote: string;
+  prefix: string;
+  suffix: string;
+  element: PageElement;
+  rect: Rect;
+}
+
+export type TextSelection = Omit<TextTarget, "kind">;
+
 export type DraftTarget =
   | { kind: "element"; element: PageElement }
+  | TextTarget
   | DrawingTarget
   | ImagePinTarget
   | ImageAreaTarget
@@ -135,6 +153,8 @@ export const LIMITS = {
   imageBytes: 8 * 1024 * 1024,
   audioBytes: 10 * 1024 * 1024,
   drawingElements: 12,
+  quoteChars: 2000,
+  quoteContextChars: 64,
   voiceMs: 3 * 60 * 1000,
 };
 
@@ -176,6 +196,10 @@ const HELPER_SOURCE = String.raw`(() => {
   const nextOf = getter(Element.prototype, "nextElementSibling");
   const childCountOf = getter(Element.prototype, "childElementCount");
   const connected = getter(Node.prototype, "isConnected");
+  const getSelection = Document.prototype.getSelection;
+  const rangeRect = Range.prototype.getBoundingClientRect;
+  const rangeText = Range.prototype.toString;
+  const createRange = Document.prototype.createRange;
   // Object spread, not Object.assign: a page script could replace the latter
   // and read every message, nonce included. This narrows the easy leaks; it
   // does not make the nonce a secret the page provably cannot reach.
@@ -187,6 +211,20 @@ const HELPER_SOURCE = String.raw`(() => {
       page_width: s ? s.scrollWidth : win.innerWidth, page_height: s ? s.scrollHeight : win.innerHeight };
   };
   const esc = (v) => (win.CSS && CSS.escape ? CSS.escape(v) : String(v).replace(/[^a-zA-Z0-9_-]/g, "\\$&"));
+  // Cuts by UTF-16 length without splitting a surrogate pair: half an emoji
+  // serializes as a lone surrogate, which the server's JSON parser refuses.
+  const head = (v, n) => {
+    const t = String(v);
+    if (t.length <= n) return t;
+    const c = t.charCodeAt(n - 1);
+    return t.slice(0, c >= 0xd800 && c <= 0xdbff ? n - 1 : n);
+  };
+  const tail = (v, n) => {
+    const t = String(v);
+    if (t.length <= n) return t;
+    const c = t.charCodeAt(t.length - n);
+    return t.slice(c >= 0xdc00 && c <= 0xdfff ? t.length - n + 1 : t.length - n);
+  };
   let host = null, root = null, boxes = [], marks = [], lastUnresolved = "", running = false;
   // Elements the parent can refer to by number (selection tree). Rebuilt
   // before it grows large; the parent only uses ids from the latest answer.
@@ -220,16 +258,16 @@ const HELPER_SOURCE = String.raw`(() => {
       if (h.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING) found = h.textContent || "";
       else break;
     }
-    return found.replace(/\s+/g, " ").trim().slice(0, 200);
+    return head(found.replace(/\s+/g, " ").trim(), 200);
   }
   function describe(el) {
     const r = rectOf.call(el);
-    const text = (el.innerText || el.textContent || "").replace(/\s+/g, " ").trim().slice(0, 600);
+    const text = head((el.innerText || el.textContent || "").replace(/\s+/g, " ").trim(), 600);
     let html = "";
-    try { html = el.outerHTML.slice(0, 2000); } catch (_) {}
+    try { html = head(el.outerHTML, 2000); } catch (_) {}
     const attr = (n) => (el.getAttribute && el.getAttribute(n)) || "";
-    return { selector: selectorFor(el).slice(0, 512), tag: el.tagName.toLowerCase().slice(0, 32), text, html,
-      role: attr("role").slice(0, 200), label: (attr("aria-label") || attr("title") || attr("alt")).slice(0, 200),
+    return { selector: head(selectorFor(el), 512), tag: head(el.tagName.toLowerCase(), 32), text, html,
+      role: head(attr("role"), 200), label: head(attr("aria-label") || attr("title") || attr("alt"), 200),
       heading: headingFor(el), rect: { x: r.left + win.scrollX, y: r.top + win.scrollY, width: r.width, height: r.height } };
   }
   function nodeId(el) {
@@ -249,8 +287,8 @@ const HELPER_SOURCE = String.raw`(() => {
       const part = (t.nodeValue || "").replace(/\s+/g, " ").trim();
       if (part && !/^(script|style)$/i.test(t.parentNode ? t.parentNode.nodeName : "")) text += (text ? " " : "") + part;
     }
-    text = text.slice(0, 48);
-    return { node: nodeId(el), tag: el.tagName.toLowerCase().slice(0, 32), label: label.slice(0, 48), text,
+    text = head(text, 48);
+    return { node: nodeId(el), tag: head(el.tagName.toLowerCase(), 32), label: head(label, 48), text,
       children: childCountOf.call(el) };
   }
   // A local tree: the ancestors up to <body> (nearest 8) and the first 12
@@ -312,6 +350,43 @@ const HELPER_SOURCE = String.raw`(() => {
     while (anchor && !found.every((el) => contains.call(anchor, el))) anchor = anchor.parentElement;
     if (anchor && /^(html|body)$/i.test(anchor.tagName)) anchor = null;
     return { anchor: anchor ? describe(anchor) : null, elements: leaves.slice(0, 12).map(describe) };
+  }
+  // The selection the user made in Browse, with a little of the element's
+  // text around it. Answered only when the parent asks; the context costs a
+  // walk of the element's text, so an unchanged selection reuses it.
+  let lastText = null, lastTextKey = null;
+  function textSelection() {
+    let sel = null;
+    try { sel = getSelection.call(doc); } catch (_) {}
+    if (!sel || sel.isCollapsed || sel.rangeCount === 0) { lastText = null; lastTextKey = null; return null; }
+    const range = sel.getRangeAt(0);
+    const sc = range.startContainer, so = range.startOffset, ec = range.endContainer, eo = range.endOffset;
+    if (lastTextKey && lastTextKey[0] === sc && lastTextKey[1] === so && lastTextKey[2] === ec && lastTextKey[3] === eo) {
+      if (lastText) {
+        const r = rangeRect.call(range);
+        lastText.rect = { x: r.left + win.scrollX, y: r.top + win.scrollY, width: r.width, height: r.height };
+      }
+      return lastText;
+    }
+    lastTextKey = [sc, so, ec, eo];
+    lastText = null;
+    const quote = head(rangeText.call(range), 2000);
+    if (!quote.trim()) return null;
+    let el = range.commonAncestorContainer;
+    if (el && el.nodeType !== 1) el = parentOf.call(el);
+    if (!el || el.nodeType !== 1 || own(el) || /^(head|script|style)$/i.test(el.tagName)) return null;
+    const around = (before) => {
+      const rr = createRange.call(doc);
+      try {
+        if (before) { rr.setStart(el, 0); rr.setEnd(sc, so); }
+        else { rr.setStart(ec, eo); rr.setEnd(el, el.childNodes.length); }
+      } catch (_) { return ""; }
+      return rangeText.call(rr).replace(/\s+/g, " ");
+    };
+    const r = rangeRect.call(range);
+    lastText = { quote, prefix: tail(around(true), 64), suffix: head(around(false), 64), element: describe(el),
+      rect: { x: r.left + win.scrollX, y: r.top + win.scrollY, width: r.width, height: r.height } };
+    return lastText;
   }
   function scrollAt(x, y, dx, dy) {
     let el = at(x, y);
@@ -473,6 +548,11 @@ const HELPER_SOURCE = String.raw`(() => {
       lastState = null;
       if (selected && d.reveal === true) { try { reveal(selected); } catch (_) {} }
       if (!running) { running = true; raf(frame); }
+    } else if (d.type === "text-selection") {
+      post({ type: "text-selected", id: d.id, viewport: viewport(), selection: textSelection() });
+    } else if (d.type === "clear-text") {
+      try { const sel = getSelection.call(doc); if (sel) sel.removeAllRanges(); } catch (_) {}
+      lastText = null; lastTextKey = null;
     } else if (d.type === "probe" && Array.isArray(d.points)) {
       post({ type: "probed", id: d.id, viewport: viewport(), ...probe(d.points) });
     } else if (d.type === "scroll" && num(d.x) && num(d.y) && num(d.dx) && num(d.dy)) {
@@ -519,8 +599,60 @@ function num(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) && Math.abs(value) <= 1e7 ? value : null;
 }
 
+/** First `max` UTF-16 units of `text`, never ending inside a surrogate pair. */
+export function headUnits(text: string, max: number): string {
+  if (text.length <= max) return text;
+  const c = text.charCodeAt(max - 1);
+  return text.slice(0, c >= 0xd800 && c <= 0xdbff ? max - 1 : max);
+}
+
+/** Last `max` UTF-16 units of `text`, never starting inside a surrogate pair. */
+export function tailUnits(text: string, max: number): string {
+  if (text.length <= max) return text;
+  const start = text.length - max;
+  const c = text.charCodeAt(start);
+  return text.slice(c >= 0xdc00 && c <= 0xdfff ? start + 1 : start);
+}
+
+/**
+ * `text` with every lone surrogate replaced by U+FFFD. `JSON.stringify` keeps
+ * a lone surrogate as a `\uD83D`-style escape, and the server's JSON parser
+ * refuses the whole submission for it. Page strings can carry one (a page can
+ * put any code unit in its text), so every string from the page goes through
+ * this. A loop, not a lookbehind regex: older iOS WebViews lack lookbehind.
+ */
+export function wellFormed(text: string): string {
+  let out = "";
+  let from = 0;
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charCodeAt(i);
+    if (c >= 0xd800 && c <= 0xdbff) {
+      const next = text.charCodeAt(i + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        i++;
+        continue;
+      }
+    } else if (!(c >= 0xdc00 && c <= 0xdfff)) {
+      continue;
+    }
+    out += text.slice(from, i) + "\ufffd";
+    from = i + 1;
+  }
+  return from === 0 ? text : out + text.slice(from);
+}
+
+/** Every string in a plain JSON value made well-formed (see `wellFormed`). */
+function wellFormedDeep<T>(value: T): T {
+  if (typeof value === "string") return wellFormed(value) as T;
+  if (Array.isArray(value)) return value.map(wellFormedDeep) as T;
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, wellFormedDeep(v)])) as T;
+  }
+  return value;
+}
+
 function str(value: unknown, max: number): string {
-  return typeof value === "string" ? value.slice(0, max) : "";
+  return typeof value === "string" ? wellFormed(headUnits(value, max)) : "";
 }
 
 export function parseRect(value: unknown): Rect | null {
@@ -661,7 +793,9 @@ export type HelperEvent =
       elements: PageElement[];
       viewport: PageViewport | null;
     }
-  | { type: "marks-status"; unresolved: number[] };
+  | { type: "marks-status"; unresolved: number[] }
+  /** The page's text selection now, or null when nothing is selected. */
+  | { type: "text-selected"; id: number; selection: TextSelection | null; viewport: PageViewport | null };
 
 /** `null` for anything that is not a well-formed message from this load's bridge. */
 export function parseHelperEvent(data: unknown, nonce: string): HelperEvent | null {
@@ -693,6 +827,10 @@ export function parseHelperEvent(data: unknown, nonce: string): HelperEvent | nu
         : [];
       return { type: "probed", id: d.id, anchor: parseElement(d.anchor), elements, viewport };
     }
+    case "text-selected": {
+      if (typeof d.id !== "number") return null;
+      return { type: "text-selected", id: d.id, selection: parseTextSelection(d.selection), viewport };
+    }
     case "marks-status": {
       const unresolved = Array.isArray(d.unresolved)
         ? d.unresolved.filter((n): n is number => Number.isInteger(n) && n > 0 && n <= LIMITS.annotations)
@@ -704,11 +842,34 @@ export function parseHelperEvent(data: unknown, nonce: string): HelperEvent | nu
   }
 }
 
+/** A selection report, bounded. Untrusted: the quote and its context are page
+ *  strings like any element text. */
+export function parseTextSelection(value: unknown): TextSelection | null {
+  if (!value || typeof value !== "object") return null;
+  const v = value as Record<string, unknown>;
+  const element = parseElement(v.element);
+  const rect = parseRect(v.rect);
+  const quote = str(v.quote, LIMITS.quoteChars);
+  if (!element || !rect || !quote.trim()) return null;
+  return {
+    quote,
+    prefix: typeof v.prefix === "string" ? wellFormed(tailUnits(v.prefix, LIMITS.quoteContextChars)) : "",
+    suffix: str(v.suffix, LIMITS.quoteContextChars),
+    element,
+    rect,
+  };
+}
+
 /** Mark positions for the bridge: geometry only, nothing the user wrote. */
 export function marksFor(drafts: DraftAnnotation[]) {
   return drafts.flatMap((draft, index): { n: number; selector?: string; offset?: Rect; rect?: Rect }[] => {
     const n = index + 1;
     if (draft.target.kind === "element") return [{ n, selector: draft.target.element.selector }];
+    if (draft.target.kind === "text") {
+      const { element, rect } = draft.target;
+      const offset = { x: rect.x - element.rect.x, y: rect.y - element.rect.y, width: rect.width, height: rect.height };
+      return [{ n, selector: element.selector, offset }];
+    }
     if (draft.target.kind === "drawing") {
       const { anchor, offset, bounds } = draft.target;
       return anchor && offset ? [{ n, selector: anchor.selector, offset }] : [{ n, rect: bounds }];
@@ -879,6 +1040,7 @@ export interface FeedbackSubmissionPayload {
     comment: string;
     target:
       | { kind: "element"; element: PageElement }
+      | TextTarget
       | {
           kind: "drawing";
           bounds: Rect;
@@ -921,7 +1083,14 @@ export async function buildPayload(input: {
     const items: FeedbackMediaPayload[] = [];
     for (const clip of draft.voice) items.push(await media("audio", clip.blob));
     for (const image of draft.images) items.push(await media("image", image.blob));
-    annotations.push({ intent: draft.intent, comment: draft.comment.trim(), target, media: items });
+    // Drafts saved before page strings were made well-formed can still hold a
+    // lone surrogate; repair them here so they can be sent.
+    annotations.push({
+      intent: draft.intent,
+      comment: wellFormed(draft.comment.trim()),
+      target: wellFormedDeep(target),
+      media: items,
+    });
   }
   const payload: FeedbackSubmissionPayload = {
     submission_id: input.submissionId,
@@ -951,6 +1120,7 @@ export function targetSummary(target: DraftTarget, pageWord = "page"): string {
     const n = target.strokes.length;
     return `Marked area · ${n === 1 ? "1 stroke" : `${n} strokes`}`;
   }
+  if (target.kind === "text") return `“${quotePreview(target.quote)}”`;
   if (target.kind === "element") {
     const text = target.element.text.trim();
     return `<${target.element.tag}>${text ? ` ${text.slice(0, 60)}` : ""}`;
@@ -958,6 +1128,12 @@ export function targetSummary(target: DraftTarget, pageWord = "page"): string {
   const n = target.elements.length;
   const where = target.anchor ? ` in <${target.anchor.tag}>` : "";
   return `Drawing${where} · ${n === 0 ? "no elements found" : n === 1 ? "1 element" : `${n} elements`}`;
+}
+
+/** One line of a quote for lists and bars: whitespace collapsed, cut at `max`. */
+export function quotePreview(quote: string, max = 80): string {
+  const line = quote.replace(/\s+/g, " ").trim();
+  return line.length > max ? `${line.slice(0, max - 1)}…` : line;
 }
 
 /** Whether a draft says anything: a Keep mark may stand alone. */

@@ -1,5 +1,17 @@
 import { expect, test } from "bun:test";
-import { HELPER_NS, TREE_LIMITS, injectHelper, marksFor, parseHelperEvent } from "./src/lib/annotate.ts";
+import {
+  HELPER_NS,
+  LIMITS,
+  TREE_LIMITS,
+  buildPayload,
+  injectHelper,
+  marksFor,
+  headUnits,
+  parseHelperEvent,
+  tailUnits,
+  targetSummary,
+  wellFormed,
+} from "./src/lib/annotate.ts";
 
 const NONCE = "0123456789abcdef0123456789abcdef";
 const msg = (extra) => ({ [HELPER_NS]: 1, nonce: NONCE, ...extra });
@@ -126,4 +138,115 @@ test("repeated or looping tree ids are reduced to unique nodes", () => {
   expect(ids(picked.tree.children)).toEqual([7, 8]);
   const all = [...ids(picked.tree.ancestors), picked.tree.self.node, ...ids(picked.tree.children)];
   expect(new Set(all).size).toBe(all.length);
+});
+
+test("a text selection report is bounded and needs an element, a box, and words", () => {
+  const selection = {
+    quote: "x".repeat(10_000),
+    prefix: "p".repeat(500),
+    suffix: "s".repeat(500),
+    element,
+    rect: { x: 10, y: 20, width: 30, height: 12 },
+  };
+  const ok = parseHelperEvent(msg({ type: "text-selected", id: 4, selection }), NONCE);
+  expect(ok.type).toBe("text-selected");
+  expect(ok.selection.quote.length).toBe(LIMITS.quoteChars);
+  expect(ok.selection.prefix.length).toBe(LIMITS.quoteContextChars);
+  expect(ok.selection.suffix.length).toBe(LIMITS.quoteContextChars);
+  // Nothing selected, blank words, or broken geometry: no selection, not an error.
+  expect(parseHelperEvent(msg({ type: "text-selected", id: 4, selection: null }), NONCE).selection).toBeNull();
+  expect(parseHelperEvent(msg({ type: "text-selected", id: 4, selection: { ...selection, quote: "  " } }), NONCE).selection).toBeNull();
+  expect(
+    parseHelperEvent(msg({ type: "text-selected", id: 4, selection: { ...selection, rect: { x: 0 } } }), NONCE).selection,
+  ).toBeNull();
+  expect(parseHelperEvent(msg({ type: "text-selected", selection }), NONCE)).toBeNull();
+});
+
+test("a text note follows its element, sends its quote, and never sends the comment into the page", async () => {
+  const target = {
+    kind: "text",
+    quote: "exact words",
+    prefix: "before ",
+    suffix: " after",
+    element,
+    rect: { x: 11, y: 22, width: 30, height: 12 },
+  };
+  const drafts = [{ id: "t", intent: "question", comment: "secret comment", target, voice: [], images: [] }];
+  const marks = marksFor(drafts);
+  expect(marks).toEqual([{ n: 1, selector: "#a", offset: { x: 10, y: 20, width: 30, height: 12 } }]);
+  expect(JSON.stringify(marks)).not.toContain("secret");
+  expect(JSON.stringify(marks)).not.toContain("exact words");
+  expect(targetSummary(target)).toBe("“exact words”");
+
+  const payload = await buildPayload({
+    submissionId: "sub-12345678",
+    artifactPath: "/a/report.html",
+    sha256: "a".repeat(64),
+    allowStale: false,
+    viewport: { width: 390, height: 700, scroll_x: 0, scroll_y: 0 },
+    drafts,
+  });
+  expect(payload.annotations[0].target).toEqual(target);
+});
+
+/** True when every string in a value has no lone surrogate: what the
+ *  server's JSON parser (serde_json) requires of the submission. */
+function noLoneSurrogate(json) {
+  return !/\\ud[89ab][0-9a-f]{2}(?!\\ud[c-f][0-9a-f]{2})|(?<!\\ud[89ab][0-9a-f]{2})\\ud[c-f][0-9a-f]{2}/i.test(json);
+}
+
+test("cuts never split an emoji, and page strings with a lone surrogate are repaired", () => {
+  const rockets = "x🚀".repeat(40);
+  // A plain UTF-16 cut leaves half an emoji at the edge.
+  expect(noLoneSurrogate(JSON.stringify(rockets.slice(-64)))).toBe(false);
+  expect(noLoneSurrogate(JSON.stringify(rockets.slice(0, 2)))).toBe(false);
+  for (let n = 1; n <= 12; n++) {
+    expect(noLoneSurrogate(JSON.stringify(headUnits(rockets, n)))).toBe(true);
+    expect(noLoneSurrogate(JSON.stringify(tailUnits(rockets, n)))).toBe(true);
+    expect(headUnits(rockets, n).length).toBeLessThanOrEqual(n);
+    expect(tailUnits(rockets, n).length).toBeLessThanOrEqual(n);
+  }
+  expect(wellFormed("a\ud83db\ude80c🚀")).toBe("a\ufffdb\ufffdc🚀");
+  expect(wellFormed("plain 🚀")).toBe("plain 🚀");
+});
+
+test("an emoji at every selection boundary still makes a sendable payload", async () => {
+  const rockets = "x🚀".repeat(1200);
+  const selection = {
+    // Each one ends or starts inside an emoji at the client's limits.
+    quote: rockets.slice(0, LIMITS.quoteChars + 1),
+    prefix: rockets.slice(-(LIMITS.quoteContextChars + 1)),
+    suffix: rockets.slice(0, LIMITS.quoteContextChars + 1),
+    element: { ...element, text: rockets.slice(0, 601), html: "\ud83d<p>", label: "\ude80" },
+    rect: { x: 1, y: 2, width: 3, height: 4 },
+  };
+  const parsed = parseHelperEvent(msg({ type: "text-selected", id: 9, selection }), NONCE).selection;
+  expect(parsed.quote.length).toBeLessThanOrEqual(LIMITS.quoteChars);
+  expect(parsed.prefix.length).toBeLessThanOrEqual(LIMITS.quoteContextChars);
+  expect(parsed.suffix.length).toBeLessThanOrEqual(LIMITS.quoteContextChars);
+  expect(parsed.prefix.endsWith("🚀")).toBe(true);
+  expect(parsed.element.html).toBe("\ufffd<p>");
+
+  const payload = await buildPayload({
+    submissionId: "sub-12345678",
+    artifactPath: "/a/report.html",
+    sha256: "a".repeat(64),
+    allowStale: false,
+    viewport: { width: 390, height: 700, scroll_x: 0, scroll_y: 0 },
+    drafts: [
+      { id: "t", intent: "change", comment: "ok", target: { kind: "text", ...parsed }, voice: [], images: [] },
+      // A draft saved before the fix still holds a lone surrogate.
+      {
+        id: "e",
+        intent: "change",
+        comment: "old",
+        target: { kind: "element", element: { ...element, text: "half \ud83d" } },
+        voice: [],
+        images: [],
+      },
+    ],
+  });
+  const body = JSON.stringify(payload);
+  expect(noLoneSurrogate(body)).toBe(true);
+  expect(payload.annotations[1].target.element.text).toBe("half \ufffd");
 });

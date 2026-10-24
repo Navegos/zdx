@@ -70,6 +70,11 @@ pub const MAX_AREA_POINTS: usize = 4000;
 /// Request body cap a transport should enforce: every media item at its limit,
 /// base64-encoded, plus JSON overhead. Surfaces use this, not their own number.
 pub const MAX_SUBMISSION_BYTES: usize = 48 * 1024 * 1024;
+/// Longest selected-text quote a text note may carry.
+pub const MAX_QUOTE_CHARS: usize = 2000;
+/// Longest text before or after a quote (its context on the page). The Mini
+/// App cuts to this length (`LIMITS.quoteContextChars`).
+pub const MAX_QUOTE_CONTEXT_CHARS: usize = 64;
 
 const MAX_SELECTOR_CHARS: usize = 512;
 const MAX_ELEMENT_TEXT_CHARS: usize = 600;
@@ -183,6 +188,19 @@ pub struct FeedbackMedia {
 pub enum FeedbackTarget {
     /// A tapped element.
     Element { element: FeedbackElement },
+    /// Text the user selected on the page: the exact `quote`, a little of the
+    /// text before and after it (to find it again, like a W3C text quote
+    /// selector), the smallest element holding the whole selection, and the
+    /// selection's box in page coordinates.
+    Text {
+        quote: String,
+        #[serde(default)]
+        prefix: String,
+        #[serde(default)]
+        suffix: String,
+        element: FeedbackElement,
+        rect: FeedbackRect,
+    },
     /// A finger drawing. `sketch` is a schematic of the stroke over the
     /// outlines of `elements` (numbered in list order), so the stroke is never
     /// sent without the page parts it covers. `anchor` is the smallest element
@@ -700,6 +718,20 @@ fn bundle_record(input: &BundleInput<'_>) -> serde_json::Value {
                     "kind": "element",
                     "element": clean_element(element),
                 }),
+                FeedbackTarget::Text {
+                    quote,
+                    prefix,
+                    suffix,
+                    element,
+                    rect,
+                } => serde_json::json!({
+                    "kind": "text",
+                    "quote": clean_text(quote, MAX_QUOTE_CHARS),
+                    "prefix": clean_text(prefix, MAX_QUOTE_CONTEXT_CHARS),
+                    "suffix": clean_text(suffix, MAX_QUOTE_CONTEXT_CHARS),
+                    "element": clean_element(element),
+                    "rect": rect,
+                }),
                 FeedbackTarget::Drawing {
                     bounds,
                     anchor,
@@ -836,6 +868,29 @@ fn validate_annotation(annotation: &FeedbackAnnotation, n: usize) -> Result<(), 
     }
     match &annotation.target {
         FeedbackTarget::Element { element } => validate_element(element, n)?,
+        FeedbackTarget::Text {
+            quote,
+            prefix,
+            suffix,
+            element,
+            rect,
+        } => {
+            if quote.trim().is_empty() {
+                return Err(invalid(format!("Note {n} has no selected text")));
+            }
+            if quote.chars().count() > MAX_QUOTE_CHARS {
+                return Err(invalid(format!(
+                    "The text selected for note {n} is longer than {MAX_QUOTE_CHARS} characters"
+                )));
+            }
+            if prefix.chars().count() > MAX_QUOTE_CONTEXT_CHARS
+                || suffix.chars().count() > MAX_QUOTE_CONTEXT_CHARS
+            {
+                return Err(invalid(format!("Note {n} has too much surrounding text")));
+            }
+            validate_element(element, n)?;
+            validate_rect(rect, n)?;
+        }
         FeedbackTarget::Drawing {
             bounds,
             anchor,
@@ -906,7 +961,9 @@ fn validate_targets_for(
     for (index, annotation) in submission.annotations.iter().enumerate() {
         let image_target = match annotation.target {
             FeedbackTarget::ImagePin { .. } | FeedbackTarget::ImageArea { .. } => true,
-            FeedbackTarget::Element { .. } | FeedbackTarget::Drawing { .. } => false,
+            FeedbackTarget::Element { .. }
+            | FeedbackTarget::Text { .. }
+            | FeedbackTarget::Drawing { .. } => false,
             FeedbackTarget::Page => continue,
         };
         if image_target != is_image {
@@ -1362,7 +1419,9 @@ fn render_image_target(
         FeedbackTarget::Page => {
             let _ = writeln!(out, "Note {n}. {intent}: the whole image");
         }
-        FeedbackTarget::Element { .. } | FeedbackTarget::Drawing { .. } => return false,
+        FeedbackTarget::Element { .. }
+        | FeedbackTarget::Text { .. }
+        | FeedbackTarget::Drawing { .. } => return false,
     }
     true
 }
@@ -1385,6 +1444,36 @@ fn render_html_target<'a>(
                 quote(&element.selector)
             );
             write_element_details(out, &element, "   ");
+        }
+        FeedbackTarget::Text {
+            quote: text,
+            prefix,
+            suffix,
+            element,
+            rect,
+        } => {
+            let element = clean_element(element);
+            let _ = writeln!(
+                out,
+                "Note {n}. {intent}: selected text {} (page px {})",
+                quote(clean_text(text, MAX_QUOTE_CHARS).trim()),
+                format_rect(rect)
+            );
+            let prefix = clean_text(prefix, MAX_QUOTE_CONTEXT_CHARS);
+            let suffix = clean_text(suffix, MAX_QUOTE_CONTEXT_CHARS);
+            if !prefix.trim().is_empty() {
+                let _ = writeln!(out, "   Text just before it: {}", quote(&prefix));
+            }
+            if !suffix.trim().is_empty() {
+                let _ = writeln!(out, "   Text just after it: {}", quote(&suffix));
+            }
+            let _ = writeln!(
+                out,
+                "   Inside element <{}> {}",
+                element.tag,
+                quote(&element.selector)
+            );
+            write_element_details(out, &element, "       ");
         }
         FeedbackTarget::Drawing {
             bounds,
@@ -2958,6 +3047,76 @@ mod tests {
             ]),
         );
         saved(save_feedback(&thread_id, BINDING, &generous).unwrap());
+    }
+
+    /// A text note carries the exact quote, its context, and the element
+    /// holding it into the prompt and the bundle, as quoted page data.
+    #[test]
+    fn text_notes_quote_the_selection_with_its_context() {
+        let _home = crate::test_support::temp_zdx_home();
+        let (thread_id, _file) = setup_thread();
+        let sub = submission(serde_json::json!([
+            {
+                "intent": "question",
+                "comment": "Why this word?",
+                "target": {
+                    "kind": "text",
+                    "quote": "ample rep",
+                    "prefix": "Ex",
+                    "suffix": "ort",
+                    "element": element("body > h1"),
+                    "rect": { "x": 30.0, "y": 22.0, "width": 90.0, "height": 20.0 },
+                },
+            },
+        ]));
+        let saved = saved(save_feedback(&thread_id, BINDING, &sub).unwrap());
+        let prompt = &saved.prompt;
+        assert!(
+            prompt.contains(
+                "Note 1. Question: selected text \"ample rep\" (page px x 30, y 22, 90×20)"
+            ),
+            "{prompt}"
+        );
+        assert!(prompt.contains("Text just before it: \"Ex\""), "{prompt}");
+        assert!(prompt.contains("Text just after it: \"ort\""), "{prompt}");
+        assert!(
+            prompt.contains("Inside element <h1> \"body > h1\""),
+            "{prompt}"
+        );
+        let record: serde_json::Value =
+            serde_json::from_slice(&fs::read(saved.dir.join("feedback.json")).unwrap()).unwrap();
+        let target = &record["annotations"][0]["target"];
+        assert_eq!(target["kind"], "text");
+        assert_eq!(target["quote"], "ample rep");
+        assert_eq!(target["element"]["selector"], "body > h1");
+
+        for (quote, prefix, expected) in [
+            ("   ", "", "no selected text"),
+            (&*"q".repeat(MAX_QUOTE_CHARS + 1), "", "longer than"),
+            (
+                "ok",
+                &*"p".repeat(MAX_QUOTE_CONTEXT_CHARS + 1),
+                "surrounding text",
+            ),
+        ] {
+            let bad = submission(serde_json::json!([
+                {
+                    "intent": "change",
+                    "comment": "x",
+                    "target": {
+                        "kind": "text",
+                        "quote": quote,
+                        "prefix": prefix,
+                        "element": element("body > h1"),
+                        "rect": { "x": 0.0, "y": 0.0, "width": 1.0, "height": 1.0 },
+                    },
+                },
+            ]));
+            assert!(matches!(
+                save_feedback(&thread_id, BINDING, &bad),
+                Err(FeedbackError::Invalid(message)) if message.contains(expected)
+            ));
+        }
     }
 
     /// Image targets on an HTML artifact are refused.

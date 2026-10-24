@@ -3854,6 +3854,93 @@ mod tests {
         drop(home);
     }
 
+    /// A text note whose quote and context run to the client's limits with
+    /// an emoji at each edge is queued. The same note with half an emoji (a
+    /// lone surrogate escape, what a plain UTF-16 cut produced) is refused by
+    /// the JSON extractor before anything is saved, which is why the Mini App
+    /// cuts on code points and repairs page strings (`lib/annotate.ts`).
+    #[tokio::test]
+    async fn text_notes_with_emoji_edges_are_queued_and_lone_surrogates_refused() {
+        let home = zdx_engine::test_support::temp_zdx_home();
+        let topic_thread = "telegram--100777-topic-11";
+        write_feedback_thread(topic_thread);
+        let sha = sha_of(FEEDBACK_PAGE);
+        let sink = RecordingSink::new(true);
+        let (addr, server) = spawn_feedback_app(Arc::clone(&sink)).await;
+        let api = FeedbackClient {
+            client: reqwest::Client::new(),
+            addr,
+            auth: format!("tma {}", fresh_init_data(279_058_397)),
+        };
+        let rockets = "x🚀".repeat(1000);
+        let units = |text: &str| text.encode_utf16().count();
+        // What the Mini App sends at its limits: whole emoji only.
+        let quote: String = rockets.chars().take(1332).collect();
+        let prefix: String = rockets.chars().skip(rockets.chars().count() - 42).collect();
+        let suffix: String = rockets.chars().take(42).collect();
+        assert!(units(&quote) <= 2000 && units(&prefix) <= 64 && units(&suffix) <= 64);
+        assert!(prefix.ends_with('🚀') && suffix.ends_with('🚀'));
+        let body = |id: &str, prefix: &str| {
+            serde_json::json!({
+                "submission_id": id,
+                "artifact_path": "report.html",
+                "artifact_sha256": sha,
+                "annotations": [{
+                    "intent": "question",
+                    "comment": "Why 🚀?",
+                    "target": {
+                        "kind": "text",
+                        "quote": quote,
+                        "prefix": prefix,
+                        "suffix": suffix,
+                        "element": {
+                            "selector": "body > h1",
+                            "tag": "h1",
+                            "text": rockets.chars().take(600).collect::<String>(),
+                            "rect": { "x": 8.0, "y": 21.0, "width": 300.0, "height": 37.0 },
+                        },
+                        "rect": { "x": 9.0, "y": 22.0, "width": 30.0, "height": 12.0 },
+                    },
+                }],
+            })
+        };
+
+        let (status, response) = api.post(topic_thread, &body(&new_id(), &prefix)).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{response}");
+        assert_eq!(sink.count(), 1);
+        assert!(
+            sink.deliveries.lock().unwrap()[0]
+                .prompt
+                .contains("Text just before it")
+        );
+
+        let lone_id = new_id();
+        let lone = serde_json::to_string(&body(&lone_id, "LONE"))
+            .expect("json")
+            .replace("\"LONE\"", "\"\\ude80x🚀\"");
+        let refused = api
+            .client
+            .post(format!(
+                "http://{addr}/api/threads/{topic_thread}/artifacts/feedback"
+            ))
+            .header(AUTHORIZATION, &api.auth)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(lone)
+            .send()
+            .await
+            .expect("post lone surrogate");
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(sink.count(), 1);
+        assert!(
+            !artifact_feedback::feedback_dir_for_thread(topic_thread)
+                .join(&lone_id)
+                .exists()
+        );
+
+        server.abort();
+        drop(home);
+    }
+
     /// Holds every save inside `allows` (which runs in the blocking save
     /// task) until the test releases it.
     struct GatedSink {
