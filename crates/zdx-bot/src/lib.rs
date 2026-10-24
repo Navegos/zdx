@@ -26,6 +26,7 @@ mod bot;
 mod command_picker;
 mod commands;
 mod delivery_tracker;
+mod file_card;
 mod followups;
 mod handlers;
 mod ingest;
@@ -373,6 +374,7 @@ fn spawn_media_group_flush(
 /// - `cancel_q:{chat_id}:{message_id}` — cancel a queued (not-yet-processing) item
 /// - `retry:{go|x}` — re-run a failed turn / dismiss the retry button
 /// - `wk:c` — cancel the worker behind a mirror topic
+/// - `sf:{key}` — upload a file card's file as a reply to the card
 async fn handle_callback_query(
     context: &Arc<BotContext>,
     client: &TelegramClient,
@@ -423,6 +425,9 @@ async fn handle_callback_query(
         handle_queue_cancel(context, client, &callback, key).await;
     } else if let Some(rest) = data.strip_prefix("fu:") {
         followups::handle_callback(context, chat_queues, client, &callback, rest).await;
+    } else if let Some(rest) = data.strip_prefix(file_card::CALLBACK_PREFIX) {
+        // The upload runs on its own task; the polling loop does not wait.
+        let _ = file_card::handle_callback(context, client, &callback, rest).await;
     } else if let Some(rest) = data.strip_prefix("retry:") {
         retry::handle_callback(context, chat_queues, client, &callback, rest).await;
     } else if let Some(rest) = data.strip_prefix("wk:") {

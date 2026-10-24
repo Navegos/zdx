@@ -89,6 +89,8 @@ pub(crate) struct BotContext {
     thread_headers: RwLock<HashMap<String, ThreadHeader>>,
     /// Reply deliveries running now; shared with the Mini App server.
     active_deliveries: ActiveDeliveries,
+    /// `⬇ Send file` uploads running and recent stale-tap notices.
+    send_files: crate::file_card::SendFileState,
 }
 
 #[derive(Debug, Clone)]
@@ -157,11 +159,16 @@ impl BotContext {
             orchestrator_routes: RwLock::new(HashMap::new()),
             thread_headers: RwLock::new(HashMap::new()),
             active_deliveries: ActiveDeliveries::default(),
+            send_files: crate::file_card::SendFileState::default(),
         }
     }
 
     pub(crate) fn active_deliveries(&self) -> &ActiveDeliveries {
         &self.active_deliveries
+    }
+
+    pub(crate) fn send_files(&self) -> &crate::file_card::SendFileState {
+        &self.send_files
     }
 
     pub(crate) fn worker_manager(&self) -> &Arc<WorkerManager> {

@@ -692,24 +692,27 @@ mod reply_target_tests {
         .await
         .expect("send final response");
 
+        // HTML with a configured Mini App goes out as file cards, not uploads.
         let seen = fake.seen();
         let methods: Vec<&str> = seen.iter().map(|s| s.method.as_str()).collect();
-        assert_eq!(methods, ["sendMessage", "sendDocument", "sendDocument"]);
+        assert_eq!(methods, ["sendMessage", "sendMessage", "sendMessage"]);
         let listed = list_thread_artifacts(&super::resolve_effective_thread_id(&topic_thread))
             .expect("artifacts");
-        for (request, (expected, body)) in
-            seen[1..].iter().zip([(&own, "own"), (&theirs, "worker")])
-        {
-            assert!(request.body.contains(body));
-            let marker = "startapp=a_";
-            let at = request.body.find(marker).expect("open artifact link") + marker.len();
-            let rest = &request.body[at..];
-            let end = rest.find('"').expect("url end");
-            let (key, thread) = rest[..end].split_once('_').expect("key and thread");
+        for (request, expected) in seen[1..].iter().zip([&own, &theirs]) {
+            let body: serde_json::Value = serde_json::from_str(&request.body).expect("json");
+            let row = &body["reply_markup"]["inline_keyboard"][0];
+            let url = row[0]["url"].as_str().expect("open artifact link");
+            let (_, param) = url.split_once("startapp=a_").expect("artifact link");
+            let (key, thread) = param.split_once('_').expect("key and thread");
             assert_eq!(thread, topic_thread, "the receiving topic, not the source");
-            let row = listed.iter().find(|row| row.key == key).expect("listed");
-            assert_eq!(row.path, expected.to_string_lossy());
-            assert!(!rest[..end].contains('/'), "no path in the link");
+            let listed_row = listed.iter().find(|row| row.key == key).expect("listed");
+            assert_eq!(listed_row.path, expected.to_string_lossy());
+            assert!(!param.contains('/'), "no path in the link");
+            assert_eq!(
+                row[1]["callback_data"].as_str(),
+                Some(format!("sf:{key}").as_str()),
+                "Send file names the same listed file"
+            );
         }
         // The link's thread maps back to the receiving topic, which is where
         // Mini App feedback for it is routed.

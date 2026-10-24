@@ -1018,8 +1018,9 @@ impl TelegramClient {
         Ok(())
     }
 
-    /// Delete a message. Bot can delete its own messages anytime, and other
-    /// users' messages if it has `can_delete_messages` admin right.
+    /// Delete a message. Telegram allows it only for messages sent less than
+    /// 48 hours ago: the bot's own, and other users' when it has the
+    /// `can_delete_messages` admin right.
     ///
     /// # Errors
     /// Returns an error if the operation fails.

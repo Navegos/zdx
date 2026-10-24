@@ -31,6 +31,7 @@ When the answer is longer than about 1200 characters, has tables or several sect
 - Send a short summary that leads with the key findings and ends with `*Full details attached.*`. Do not point up or down at the file: Telegram may show a document above its caption.
 - Attach one HTML file from `$ZDX_ARTIFACT_DIR/<name>.html` after the followups block. Keep local images and styles inside it, because the viewer cannot load sibling files. Draw diagrams as SVG unless the user asks for another format.
 - Do not paste the file's markup into the message.
+- When the Mini App is set up, an HTML file is not uploaded: the chat gets a file card with **Open artifact** and **Send file**, and both read the file at its path when tapped. A new version at the same path replaces what every earlier card opens; save it under a new name when the earlier version must stay available.
 
 Attach local files after the followups block, with valid absolute paths only:
 - One file: `<media>/absolute/path/file.ext</media>`

@@ -13,6 +13,7 @@ use super::media::{
     send_media_file,
 };
 use crate::bot::context::BotContext;
+use crate::file_card;
 use crate::telegram::markdown::{split_telegram_html, visible_utf16_len};
 use crate::telegram::{
     InlineKeyboardButton, InlineKeyboardMarkup, MediaSend, Message, ReplyParameters,
@@ -304,7 +305,11 @@ pub(super) struct ReplyFile {
 ///
 /// Follow-ups (what the agent can do next) ride on the reply text; every file
 /// is its own message, carrying its own `Open artifact` button (file
-/// actions). Documents are never merged into one message and never get the
+/// actions). An HTML file with that link is not uploaded: it goes out as a
+/// file card (`file_card`), a text message with `Open artifact` and
+/// `Send file`. Every delivery posts new messages; earlier cards and files
+/// are never edited or deleted. Documents are never merged into one message
+/// and never get the
 /// reply as a caption: a single photo, voice note, or audio file whose
 /// complete caption fits Telegram's limit is sent with the text as its caption
 /// (one message instead of two), and that message carries both the file's
@@ -392,12 +397,27 @@ pub(super) async fn deliver_reply(
             item.mark_failed(&format!("not attempted after a flood refusal: {reason}"));
             continue;
         }
-        let keyboard = file.open_url.as_deref().map(open_artifact_keyboard);
-        let options = target.media_options(None, keyboard.as_ref());
-        let sent = send_media_file(client, target.chat_id, &file.path, &options)
-            .await
-            .map(|message| message.id);
-        if let Err(FailureClass::FloodWait(_)) = settle(item, sent.map(Some)) {
+        let sent = match file.open_url.as_deref() {
+            Some(url) if file_card::is_card_file(&file.path, Some(url)) => {
+                item.link_only = true;
+                let card = file_card::card_keyboard(url, &file.path);
+                send_reply_text(
+                    client,
+                    target,
+                    &file_card::card_text(&file.path),
+                    Some(&card),
+                )
+                .await
+            }
+            url => {
+                let keyboard = url.map(open_artifact_keyboard);
+                let options = target.media_options(None, keyboard.as_ref());
+                send_media_file(client, target.chat_id, &file.path, &options)
+                    .await
+                    .map(|message| Some(message.id))
+            }
+        };
+        if let Err(FailureClass::FloodWait(_)) = settle(item, sent) {
             flood_stopped = item.error.clone();
         }
     }
@@ -410,7 +430,7 @@ fn takes_reply_caption(path: &Path) -> bool {
     is_image_path(path) || is_voice_note_path(path) || is_audio_path(path)
 }
 
-const OPEN_ARTIFACT_LABEL: &str = "↗ Open artifact";
+const OPEN_ARTIFACT_LABEL: &str = file_card::OPEN_ARTIFACT_LABEL;
 
 /// The file action on one file message: open this exact file in the Mini App.
 fn open_artifact_keyboard(url: &str) -> InlineKeyboardMarkup {
@@ -808,7 +828,7 @@ mod tests {
     #[tokio::test]
     async fn one_document_follows_the_text_with_its_own_file_action() {
         let fake = FakeTelegram::start().await;
-        let file = TempFile::new("html");
+        let file = TempFile::new("pdf");
         let (id, record) =
             deliver(&fake, Some("<b>Ready</b>"), std::slice::from_ref(&file.0)).await;
 
@@ -836,12 +856,90 @@ mod tests {
         assert_ne!(record.items[0].message_id, record.items[1].message_id);
     }
 
+    /// An HTML file with a link is a file card, whatever its size: one text
+    /// message with `Open artifact` and `Send file`, no upload. A second
+    /// delivery of the same file posts a second card; the first is never
+    /// edited, deleted, or marked.
+    #[tokio::test]
+    async fn html_goes_out_as_a_new_file_card_every_time() {
+        let fake = FakeTelegram::start().await;
+        let file = TempFile::new("html");
+        std::fs::File::options()
+            .write(true)
+            .open(&file.0)
+            .and_then(|handle| handle.set_len(50 * 1024 * 1024 + 1))
+            .expect("grow file");
+        let (_, first) = deliver(&fake, Some("v1"), std::slice::from_ref(&file.0)).await;
+        let (_, second) = deliver(&fake, Some("v2"), std::slice::from_ref(&file.0)).await;
+
+        assert_eq!(fake.methods(), ["sendMessage"; 4], "no upload, no edit");
+        let seen = fake.seen();
+        for card in [&seen[1], &seen[3]] {
+            let body: serde_json::Value = serde_json::from_str(&card.body).expect("json");
+            let text = body["text"].as_str().expect("text");
+            assert!(
+                text.contains("not uploaded") && text.contains("as it is now"),
+                "{text}"
+            );
+            let row = &body["reply_markup"]["inline_keyboard"][0];
+            assert_eq!(
+                row[0]["url"].as_str().map(str::to_string),
+                artifact_link(MINI_APP, TOPIC_THREAD, &file.0)
+            );
+            assert_eq!(
+                row[1]["callback_data"].as_str(),
+                Some(crate::file_card::callback_data(&file.0).as_str())
+            );
+            assert_eq!(body["reply_to_message_id"], 42);
+            assert_eq!(body["message_thread_id"], 7);
+            assert!(!card.body.contains("fu:0"), "follow-ups stay on the text");
+        }
+        for record in [&first, &second] {
+            assert_eq!(statuses(record), [DeliveryStatus::Sent; 2]);
+            assert!(record.items[1].link_only);
+            assert!(!record.items[0].link_only);
+        }
+        assert_ne!(first.items[1].message_id, second.items[1].message_id);
+    }
+
+    /// Images, voice notes, audio, and other files keep uploading next to an
+    /// HTML card.
+    #[tokio::test]
+    async fn only_html_becomes_a_card() {
+        let fake = FakeTelegram::start().await;
+        let files: Vec<TempFile> = ["png", "ogg", "mp3", "pdf", "zip", "csv", "html"]
+            .into_iter()
+            .map(TempFile::new)
+            .collect();
+        let paths: Vec<PathBuf> = files.iter().map(|file| file.0.clone()).collect();
+        let (_, record) = deliver(&fake, Some("**done**"), &paths).await;
+
+        assert_eq!(
+            fake.methods(),
+            [
+                "sendMessage",
+                "sendPhoto",
+                "sendVoice",
+                "sendAudio",
+                "sendDocument",
+                "sendDocument",
+                "sendDocument",
+                "sendMessage"
+            ]
+        );
+        let link_only: Vec<bool> = record.items.iter().map(|item| item.link_only).collect();
+        assert_eq!(
+            link_only,
+            [false, false, false, false, false, false, false, true]
+        );
+    }
+
     /// The reported defect: several documents must each open their own file.
     /// Each is a separate message whose button names that file, in order.
     #[tokio::test]
     async fn each_document_is_its_own_message_with_its_own_link() {
         let fake = FakeTelegram::start().await;
-        let files: Vec<TempFile> = ["html", "pdf", "md"]
+        let files: Vec<TempFile> = ["txt", "pdf", "md"]
             .into_iter()
             .map(|ext| {
                 let file = TempFile::new(ext);
@@ -863,7 +961,7 @@ mod tests {
         );
         let seen = fake.seen();
         let mut urls = Vec::new();
-        for (index, (path, ext)) in paths.iter().zip(["html", "pdf", "md"]).enumerate() {
+        for (index, (path, ext)) in paths.iter().zip(["txt", "pdf", "md"]).enumerate() {
             let body = &seen[index + 1].body;
             assert!(
                 body.contains(&format!("synthetic {ext} body")),
@@ -1002,7 +1100,7 @@ mod tests {
     async fn photos_and_mixed_media_keep_their_own_methods() {
         let fake = FakeTelegram::start().await;
         let photo = TempFile::new("png");
-        let doc = TempFile::new("html");
+        let doc = TempFile::new("pdf");
         let files = [photo.0.clone(), doc.0.clone()];
         let (_, record) = deliver(&fake, Some("done"), &files).await;
         assert_eq!(fake.methods(), ["sendMessage", "sendPhoto", "sendDocument"]);
@@ -1021,7 +1119,7 @@ mod tests {
     #[tokio::test]
     async fn an_oversized_document_fails_and_the_text_still_goes_out() {
         let fake = FakeTelegram::start().await;
-        let big = TempFile::new("html");
+        let big = TempFile::new("pdf");
         std::fs::File::options()
             .write(true)
             .open(&big.0)
@@ -1226,7 +1324,7 @@ mod tests {
     #[tokio::test]
     async fn a_5000_character_plain_explanation_and_a_document() {
         let fake = FakeTelegram::start().await;
-        let file = TempFile::new("html");
+        let file = TempFile::new("pdf");
         let text = "Plain words, nothing else. ".repeat(186);
         assert!(text.chars().count() > 5000);
         let (id, record) = deliver(&fake, Some(&text), std::slice::from_ref(&file.0)).await;

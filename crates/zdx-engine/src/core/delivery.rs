@@ -59,6 +59,11 @@ pub struct DeliveryItem {
     /// part this item is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub part: Option<TextPart>,
+    /// For `File` items: the surface posted a message that links to the file
+    /// (a Telegram file card) instead of uploading it. `Sent` then means the
+    /// card arrived, not the file's bytes.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub link_only: bool,
 }
 
 /// Position of one message of reply text that was split.
@@ -79,6 +84,7 @@ impl DeliveryItem {
             message_id: None,
             error: None,
             part: None,
+            link_only: false,
         }
     }
 
@@ -100,6 +106,7 @@ impl DeliveryItem {
             message_id: None,
             error: None,
             part: None,
+            link_only: false,
         }
     }
 
@@ -139,7 +146,11 @@ impl DeliveryItem {
                         .and_then(|name| name.to_str())
                         .unwrap_or(path)
                 };
-                format!("file {shown}")
+                if self.link_only {
+                    format!("file card for {shown}")
+                } else {
+                    format!("file {shown}")
+                }
             }
         }
     }
@@ -355,6 +366,29 @@ mod tests {
         assert!(json.contains("\"part\":{\"index\":2,\"total\":2}"));
         let single = serde_json::to_string(&DeliveryItem::text()).expect("json");
         assert!(!single.contains("part"), "unchanged for one-message text");
+    }
+
+    /// A file card is recorded as link-only, and a missing card says so.
+    /// Older records without the field read as uploads.
+    #[test]
+    fn link_only_items_are_marked_and_named() {
+        let mut card = DeliveryItem::file("/tmp/out/report.html");
+        card.link_only = true;
+        card.mark_failed("Bad Request: chat not found");
+        let record = record(vec![card]);
+        let summary = user_summary(&record).expect("summary");
+        assert!(
+            summary.contains("• file card for report.html: not delivered"),
+            "{summary}"
+        );
+        let json = serde_json::to_string(&record).expect("json");
+        assert!(json.contains("\"link_only\":true"));
+        let upload = serde_json::to_string(&DeliveryItem::file("/tmp/a.pdf")).expect("json");
+        assert!(!upload.contains("link_only"));
+        let old: DeliveryItem =
+            serde_json::from_str(r#"{"kind":"file","path":"/tmp/a.html","status":"sent"}"#)
+                .expect("old record");
+        assert!(!old.link_only);
     }
 
     #[test]
