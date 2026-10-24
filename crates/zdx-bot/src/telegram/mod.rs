@@ -88,6 +88,21 @@ const TELEGRAM_PHOTO_MAX_ASPECT_RATIO: f64 = 20.0;
 const TELEGRAM_PHOTO_MAX_ASPECT_RATIO_INT: u32 = 20;
 const TELEGRAM_RESIZE_JPEG_QUALITIES: [u8; 3] = [85, 75, 65];
 
+/// Reads a file that is uploaded as is. Its size is checked from the file's
+/// metadata first, against the same limit `send_file` applies to the bytes,
+/// so an oversized file is refused without being read into memory. Photos do
+/// not come through here: they are re-encoded, so a large original can still
+/// fit after `prepare_photo_for_telegram`.
+fn read_upload(path: &Path, field: &str) -> Result<Vec<u8>> {
+    let len = std::fs::metadata(path)
+        .with_context(|| format!("read {field} file {}", path.display()))?
+        .len();
+    if len > TELEGRAM_DOCUMENT_MAX_BYTES as u64 {
+        bail!("{field} exceeds Telegram limit ({len} bytes > {TELEGRAM_DOCUMENT_MAX_BYTES} bytes)");
+    }
+    std::fs::read(path).with_context(|| format!("read {field} file {}", path.display()))
+}
+
 struct PreparedPhoto {
     bytes: Vec<u8>,
     file_name: String,
@@ -559,8 +574,7 @@ impl TelegramClient {
         document_path: &Path,
         options: &MediaSend<'_>,
     ) -> Result<Message> {
-        let document_data = std::fs::read(document_path)
-            .with_context(|| format!("read document file {}", document_path.display()))?;
+        let document_data = read_upload(document_path, "document")?;
         let file_name = document_path
             .file_name()
             .and_then(|name| name.to_str())
@@ -594,8 +608,7 @@ impl TelegramClient {
         voice_path: &Path,
         options: &MediaSend<'_>,
     ) -> Result<Message> {
-        let voice_data = std::fs::read(voice_path)
-            .with_context(|| format!("read voice file {}", voice_path.display()))?;
+        let voice_data = read_upload(voice_path, "voice")?;
         let file_name = voice_path
             .file_name()
             .and_then(|name| name.to_str())
@@ -625,8 +638,7 @@ impl TelegramClient {
         audio_path: &Path,
         options: &MediaSend<'_>,
     ) -> Result<Message> {
-        let audio_data = std::fs::read(audio_path)
-            .with_context(|| format!("read audio file {}", audio_path.display()))?;
+        let audio_data = read_upload(audio_path, "audio")?;
         let file_name = audio_path
             .file_name()
             .and_then(|name| name.to_str())
@@ -1686,6 +1698,57 @@ mod tests {
             reply_markup: None,
             disable_preview: true,
         }
+    }
+
+    /// A document, voice note, or audio file over the upload limit is refused
+    /// from its size alone: the file here cannot be read at all (mode 000),
+    /// so the size error proves the bytes were never loaded, and no request
+    /// is made. A file within the limit still uploads.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn oversized_uploads_are_refused_before_the_file_is_read() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fake = FakeTelegram::start().await;
+        let dir = std::env::temp_dir().join(format!("zdx-upload-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let client = client(&fake);
+        let options = MediaSend::default();
+        for (name, field) in [
+            ("big.pdf", "document"),
+            ("big.ogg", "voice"),
+            ("big.mp3", "audio"),
+        ] {
+            let path = dir.join(name);
+            let file = std::fs::File::create(&path).expect("create");
+            file.set_len(super::TELEGRAM_DOCUMENT_MAX_BYTES as u64 + 1)
+                .expect("sparse size");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+            let err = match field {
+                "document" => client.send_document_from_path(CHAT, &path, &options).await,
+                "voice" => client.send_voice_from_path(CHAT, &path, &options).await,
+                _ => client.send_audio_from_path(CHAT, &path, &options).await,
+            }
+            .expect_err("over the limit");
+            assert_eq!(
+                format!("{err:#}"),
+                format!(
+                    "{field} exceeds Telegram limit ({} bytes > {} bytes)",
+                    super::TELEGRAM_DOCUMENT_MAX_BYTES + 1,
+                    super::TELEGRAM_DOCUMENT_MAX_BYTES
+                )
+            );
+        }
+        assert!(fake.methods().is_empty(), "no upload was attempted");
+
+        let small = dir.join("small.pdf");
+        std::fs::write(&small, b"%PDF-1.4 synthetic").expect("write");
+        client
+            .send_document_from_path(CHAT, &small, &options)
+            .await
+            .expect("within the limit");
+        assert_eq!(fake.methods(), ["sendDocument"]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

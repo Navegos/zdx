@@ -33,6 +33,9 @@ const HTTP_TIMEOUT_SECS: u64 = 60;
 pub const MAX_MESSAGE_CHARS: usize = 4096;
 /// Telegram's hard limit on a document caption.
 pub const MAX_CAPTION_CHARS: usize = 1024;
+/// Telegram's upload limit for a document sent by a bot through
+/// `api.telegram.org` (the only Bot API server this client talks to).
+pub const MAX_DOCUMENT_BYTES: u64 = 50 * 1024 * 1024;
 
 /// Message formatting mode accepted by the CLI and the tool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -225,8 +228,11 @@ impl TelegramOutbound {
     /// Sends a local file as a document and returns Telegram's receipt for it.
     ///
     /// # Errors
-    /// Returns an error if the file is missing, the caption is too long, or the
-    /// request fails.
+    /// Returns an error if the file is missing, the caption is too long, the
+    /// file is over [`MAX_DOCUMENT_BYTES`], or the request fails. The size is
+    /// checked from the file's metadata before it is read, and again on the
+    /// bytes read, in case the file grew in between; either refusal means
+    /// nothing was sent.
     pub async fn send_document(
         &self,
         chat_id: i64,
@@ -246,8 +252,13 @@ impl TelegramOutbound {
             }
         }
 
+        let len = std::fs::metadata(path)
+            .with_context(|| format!("read document {}", path.display()))?
+            .len();
+        check_document_size(len)?;
         let bytes =
             std::fs::read(path).with_context(|| format!("read document {}", path.display()))?;
+        check_document_size(bytes.len() as u64)?;
         let file_name = path
             .file_name()
             .and_then(|name| name.to_str())
@@ -388,6 +399,15 @@ pub fn resolve_bot_token(config: &Config, override_token: Option<&str>) -> Resul
     )
 }
 
+fn check_document_size(len: u64) -> Result<()> {
+    if len > MAX_DOCUMENT_BYTES {
+        bail!(
+            "document is {len} bytes; Telegram's limit for bots is {MAX_DOCUMENT_BYTES} bytes (50 MB). Send a smaller file or share it another way"
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -526,6 +546,37 @@ mod tests {
         let request = server.join().expect("server");
         assert!(request.starts_with("POST /bot123:test-token/sendDocument "));
         assert!(request.contains("report body"));
+    }
+
+    /// Over the limit: refused from the file size alone, before the file is
+    /// read (it is unreadable, mode 000) and before any request, as not sent.
+    /// The same check runs on the bytes read; exactly the limit is allowed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn oversized_documents_are_refused_before_reading_or_sending() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("big.bin");
+        let file = std::fs::File::create(&path).expect("create");
+        file.set_len(MAX_DOCUMENT_BYTES + 1).expect("sparse size");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        // Nothing listens here: any request would fail as a transport error.
+        let err = client_for("http://127.0.0.1:9".to_string())
+            .send_document(-1_001_234_567_890, &path, None, None)
+            .await
+            .expect_err("over the limit");
+        assert_eq!(
+            format!("{err:#}"),
+            format!(
+                "document is {} bytes; Telegram's limit for bots is {MAX_DOCUMENT_BYTES} bytes (50 MB). Send a smaller file or share it another way",
+                MAX_DOCUMENT_BYTES + 1
+            )
+        );
+        assert!(matches!(flood::classify(&err), FailureClass::NotSent));
+
+        assert!(check_document_size(MAX_DOCUMENT_BYTES).is_ok());
+        assert!(check_document_size(MAX_DOCUMENT_BYTES + 1).is_err());
     }
 
     #[tokio::test]
