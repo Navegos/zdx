@@ -40,6 +40,7 @@ has been removed.
 - `src/lib/time.ts`: quota reset formatting — `resets in 2h 14m` countdown plus a local clock time
   (`today 14:30`, `tomorrow 09:00`, `Thu 14:30`). Both take `now` explicitly.
 - `src/lib/run.ts`: formatting for the shared live run status (`formatSecs`, `runAges`)
+- `src/lib/artifactList.ts`: Artifacts tab order (newest / oldest / name; rows without a time last) and local day groups and labels. No `$lib` imports; tested by `artifact-list.test.mjs` (`bun test apps/web/artifact-list.test.mjs`)
 - `src/lib/workers.ts`: worker roll-up shaping/formatting shared by the thread list, the Agent
   summary and the Workers pane. `failed` is always its own bucket — folding it into `settled` hides
   the one state the reader has to act on. Empty buckets are omitted, and a roll-up whose workers are
@@ -88,7 +89,8 @@ has been removed.
   Shows a Telegram jump button when the response carries `telegram_link`; the link is built
   server-side from the *resolved* id, so it works for `?id=active` too.
 - `src/views/TranscriptPane.svelte` / `TrajectoryPane.svelte` / `AgentPane.svelte` / `ChangesPane.svelte` / `WorkersPane.svelte` / `ArtifactsPane.svelte`: the thread tabs.
-  `ArtifactsPane` lists the shared `zdx-engine::core::artifacts` projection (`/api/threads/{id}/artifacts`)
+  `ArtifactsPane` lists the shared `zdx-engine::core::artifacts` projection (`/api/threads/{id}/artifacts`),
+  newest first as sent, under day headers with the time on each row and an optional sort chip (`lib/artifactList.ts`),
   with preview/open, download, and Go to message; `TranscriptPane` renders the same rows inline
   (images, audio players, compact file cards) from the message `artifacts`.
   Artifact bytes come from `/api/threads/{id}/artifacts/file?path=…` as authenticated
