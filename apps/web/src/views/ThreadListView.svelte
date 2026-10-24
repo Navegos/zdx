@@ -155,6 +155,13 @@
             <p class="m-0 truncate font-mono text-xxs text-muted-foreground">
               {thread.project ?? thread.root_path ?? "—"}
             </p>
+            {#if thread.run}
+              <p class="m-0 mt-0.5 truncate font-mono text-xxs text-muted-foreground">
+                <span
+                  class="mr-1 inline-block size-1.5 animate-pulse rounded-full bg-warning align-middle"
+                ></span>{thread.run.label}
+              </p>
+            {/if}
             {#if thread.workers}
               <p class="m-0 mt-0.5 font-mono text-xxs leading-relaxed text-muted-foreground">
                 {#if thread.workers.running > 0}

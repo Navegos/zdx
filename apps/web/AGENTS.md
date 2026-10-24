@@ -39,6 +39,7 @@ has been removed.
 - `src/lib/markdown.ts`: `marked` + allowlist sanitizer (model output is untrusted)
 - `src/lib/time.ts`: quota reset formatting — `resets in 2h 14m` countdown plus a local clock time
   (`today 14:30`, `tomorrow 09:00`, `Thu 14:30`). Both take `now` explicitly.
+- `src/lib/run.ts`: formatting for the shared live run status (`formatSecs`, `runAges`)
 - `src/lib/workers.ts`: worker roll-up shaping/formatting shared by the thread list, the Agent
   summary and the Workers pane. `failed` is always its own bucket — folding it into `settled` hides
   the one state the reader has to act on. Empty buckets are omitted, and a roll-up whose workers are
@@ -46,6 +47,7 @@ has been removed.
 - `src/lib/demo.ts`: **DEV-only** fixtures behind `?demo=1`; dropped from prod builds. Artifact bytes can be
   replaced per path from a browser test with `window.__zdxDemoArtifacts = { [path]: Blob }`
 - `src/components/`: `Collapse`, `Markdown`, `DiffView`, `Drawer`, `TabStrip`, `Icon`,
+  `RunStatusLine` (the running turn's label, turn age, last-event and heartbeat ages under the thread header),
   `WorkGroup` (the "Worked for 5m" turn divider), `GroupLine` (folded run), `ToolLine` (one call),
   `ArtifactAttachments` (inline image/audio/file-card rows under a message),
   `ArtifactPreview` (full-screen preview overlay; HTML goes through a sandboxed
@@ -129,6 +131,8 @@ Agent activity is hidden by default and expands on demand, in three levels:
 2. **`GroupLine`** — consecutive related calls fold into one line: read-only tools become
    `Explored 8 files, 3 searches`, repeated shell calls become `Ran 7 commands`.
 3. **`ToolLine`** — a single call, expanding to full arguments and output.
+   A `tool_running` row with `completed_at` is a call that finished while its round is still running;
+   `ToolLine` shows its outcome and duration until the persisted `tool_use`/`tool_result` replace it.
 
 Summaries are derived from real tool payloads in `summarize()`. `edit` carries `old_string`/
 `new_string`, so `+N -M` line deltas are computed client-side; `bash` failure is detected from
@@ -200,7 +204,8 @@ design live in `.zdx/design-reference/` — local only, gitignored, not shipped.
 
 - Keep `src/lib/types.ts` matching `server.rs` exactly — field names are the JSON keys, no renames.
 - The API is read-only except `POST /api/threads/{id}/artifacts/feedback` (`api.sendArtifactFeedback`). Do not add other write calls until the Rust side grows them. Write calls take the concrete thread id (`ThreadView` passes `artifactThreadId`: for a legacy `?id=active` link, the first concrete id the thread load resolved, never `active`).
-- Poll only when something is actually live (`tool_running`) and only when `document.visibilityState === "visible"`.
+- Poll only when something is actually live (`run` set, a `tool_running` row, or a pending delivery) and only when `document.visibilityState === "visible"`. Gate on `run`, not on `tool_running` alone: between tools the model thinks or waits, and a view that stops polling then misses the next tool.
+- Live run status (`RunStatus`: state, label, ages) is derived on the server by `zdx_engine::agent_activity`; `src/lib/run.ts` only formats it. Never label a run stuck from its ages: a quiet build is healthy, and a fresh heartbeat shows only that the process is alive.
   The thread `cursor` counts source events, not visible `activity` rows: private meta and empty events create
   sequence gaps. Never derive the next cursor or a live tool's sequence from `activity.length`; a collision
   makes the delta merge drop the live row.

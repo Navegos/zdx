@@ -358,8 +358,7 @@ fn open_thread_overlay(app: &mut MonitorApp) {
         file_len: 0,
         file_mtime: None,
         running_sig: Vec::new(),
-        run_phase: None,
-        running_tool: None,
+        run: None,
         width: app.terminal_width.saturating_sub(2) as usize,
     };
     load_transcript_into(&mut state);

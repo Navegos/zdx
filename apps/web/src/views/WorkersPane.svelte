@@ -3,6 +3,7 @@
   import { router } from "$lib/router.svelte";
   import { haptic, openTelegramLink, selectionChanged } from "$lib/telegram";
   import { formatRollup } from "$lib/workers";
+  import { formatSecs, runAges } from "$lib/run";
 
   interface Props {
     workers: WorkerItem[];
@@ -26,18 +27,11 @@
     unknown: "bg-muted-foreground/30",
   };
 
-  function elapsed(seconds: number): string {
-    if (seconds < 60) return `${seconds}s`;
-    const m = Math.floor(seconds / 60);
-    if (m < 60) return `${m}m${String(seconds % 60).padStart(2, "0")}s`;
-    return `${Math.floor(m / 60)}h${String(m % 60).padStart(2, "0")}m`;
-  }
-
   /** Right-hand status column: elapsed while running, else the state word. */
   function trailing(worker: WorkerItem): string {
     if (!worker.live) return worker.age ?? "unknown";
-    if (worker.status === "running" && worker.turn_elapsed_seconds !== null) {
-      return elapsed(worker.turn_elapsed_seconds);
+    if (worker.status === "running" && worker.run?.turn_elapsed_secs != null) {
+      return formatSecs(worker.run.turn_elapsed_secs);
     }
     return worker.status;
   }
@@ -94,11 +88,9 @@
                 status unavailable — restarted since this ran
               </p>
             {:else}
-              {#if worker.current_tool}
+              {#if worker.run}
                 <p class="m-0 truncate font-mono text-xxs text-muted-foreground">
-                  ▸ {worker.current_tool}{worker.current_tool_input
-                    ? ` · ${worker.current_tool_input}`
-                    : ""}
+                  ▸ {worker.run.label}
                 </p>
               {/if}
               {#if worker.queue_depth > 0}
@@ -109,14 +101,11 @@
               {#if worker.last_error}
                 <p class="m-0 truncate font-mono text-xxs text-destructive">{worker.last_error}</p>
               {/if}
-              {#if worker.project || worker.seconds_since_last_activity !== null}
+              {#if worker.project || worker.run}
                 <p class="m-0 truncate font-mono text-xxs text-muted-foreground opacity-70">
-                  {worker.project ?? ""}{worker.project &&
-                  worker.seconds_since_last_activity !== null
-                    ? " · "
-                    : ""}{worker.seconds_since_last_activity !== null
-                    ? `idle ${elapsed(worker.seconds_since_last_activity)}`
-                    : ""}
+                  {[worker.project, worker.run ? runAges(worker.run) : ""]
+                    .filter(Boolean)
+                    .join(" · ")}
                 </p>
               {/if}
             {/if}

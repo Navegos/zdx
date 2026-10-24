@@ -8,6 +8,7 @@
     WorkerRollup,
   } from "$lib/types";
   import { formatRollup } from "$lib/workers";
+  import { runAges } from "$lib/run";
 
   interface Props {
     thread: ThreadResponse | null;
@@ -137,8 +138,13 @@
       </div>
       {#if agent}
         <p class="m-0 mt-1 truncate font-mono text-xxs text-muted-foreground">
-          {agent.current_tool ?? agent.phase ?? "working"} · pid {agent.pid}
+          {agent.run.label} · pid {agent.pid}
         </p>
+        {#if runAges(agent.run)}
+          <p class="m-0 truncate font-mono text-xxs text-muted-foreground opacity-70">
+            {runAges(agent.run)}
+          </p>
+        {/if}
       {/if}
     </div>
 

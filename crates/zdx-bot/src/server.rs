@@ -22,6 +22,7 @@ use tokio::io::AsyncReadExt as _;
 use tokio::process::Command;
 use tokio::sync::{Mutex, RwLock};
 use tower_http::compression::CompressionLayer;
+use zdx_engine::agent_activity::RunStatus;
 use zdx_engine::config::{Config, paths};
 use zdx_engine::core::artifact_feedback::{
     self, FeedbackError, FeedbackSubmission, SaveOutcome, SavedFeedback,
@@ -93,6 +94,10 @@ pub struct ThreadResponse {
     /// outcome without a reload. A pending record left by a crash is never
     /// reported as running.
     pub delivering: bool,
+    /// Shared live status of a turn running on this thread in any process
+    /// (`agent_activity::RunStatus`), or `None` when no turn runs. Clients
+    /// keep polling while it is set.
+    pub run: Option<RunStatus>,
     pub activity: Vec<ThreadActivity>,
 }
 
@@ -141,10 +146,8 @@ pub struct WorkerItem {
     pub root_path: Option<String>,
     /// Trailing component of `root_path`, for a compact project label.
     pub project: Option<String>,
-    pub current_tool: Option<String>,
-    pub current_tool_input: Option<String>,
-    pub turn_elapsed_seconds: Option<u64>,
-    pub seconds_since_last_activity: Option<u64>,
+    /// Shared live status of the worker's running turn, from its run marker.
+    pub run: Option<RunStatus>,
     pub last_error: Option<String>,
     /// Time since the worker thread's last write (`12m`, `3h`), when known.
     pub age: Option<String>,
@@ -189,6 +192,8 @@ pub struct ThreadListItem {
     /// Whether this thread is an orchestrator worker (the canonical
     /// `ThreadSummary::is_worker` rule). Drives the `worker` badge.
     pub is_worker: bool,
+    /// Shared live status when a turn is running on this thread.
+    pub run: Option<RunStatus>,
 }
 
 #[derive(Serialize)]
@@ -224,8 +229,10 @@ pub enum ThreadActivity {
         name: String,
         input: Value,
     },
-    /// A tool call currently executing (from the run's activity marker), not
-    /// yet persisted to the thread. Always the tail of `activity`.
+    /// A tool call of the running round (from the run's activity marker), not
+    /// yet persisted to the thread. Always the tail of `activity`. A call that
+    /// already finished carries `completed_at`/`ok` until its round lands in
+    /// the thread file.
     ToolRunning {
         sequence: usize,
         time: String,
@@ -239,8 +246,15 @@ pub enum ThreadActivity {
         input: Value,
         /// Tail of the tool's streaming output so far (bounded).
         output_tail: String,
-        /// Human elapsed time since the tool started, e.g. `42s`.
+        /// Human elapsed time since the tool started, e.g. `42s`; for a
+        /// finished call, its duration.
         running_for: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        completed_at: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        ok: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
     },
     ToolResult {
         sequence: usize,
@@ -488,11 +502,8 @@ struct MonitorAgent {
     account: Option<String>,
     thinking: Option<String>,
     uptime: String,
-    /// Currently executing tool call (`"bash: cargo build …"`), when the run
-    /// is inside a tool round.
-    current_tool: Option<String>,
-    /// Coarse run phase (`waiting`/`thinking`/`answering`/`retrying`).
-    phase: Option<String>,
+    /// Shared live status (state, label, activity and heartbeat ages).
+    run: RunStatus,
 }
 
 #[derive(Clone, Serialize)]
@@ -852,10 +863,14 @@ async fn get_threads(
                 HashMap::new()
             });
         let live_statuses = manager.statuses_by_owner();
+        let runs = agent_activity::list_active();
+        let run_now = chrono::Utc::now();
 
         let threads = summaries
             .into_iter()
             .map(|summary| ThreadListItem {
+                run: agent_activity::run_for_thread(&runs, &summary.id)
+                    .map(|run| run.status(run_now)),
                 is_worker: summary.is_worker(),
                 workers: worker_rollup(
                     live_statuses.get(&summary.id).map(Vec::as_slice),
@@ -954,7 +969,7 @@ async fn get_thread(
         let events_for_cursor = delivery_ids(&events);
         let mut response = project_thread(target_id, events, telegram_link, lineage);
         response.delivering = delivering;
-        append_running_tools(&mut response);
+        attach_live_run(&mut response, &source_id);
 
         // Live polling asks only for what it has not seen. Dropping delivered
         // items keeps a steady-state poll small on a thread whose transcript is
@@ -1042,15 +1057,15 @@ async fn get_thread_trajectory(
 }
 
 fn active_trajectory_tools(thread_id: &str, first_sequence: usize) -> Vec<LiveToolSpan> {
-    let Some(record) = agent_activity::list_active()
-        .into_iter()
-        .find(|record| record.thread_id.as_deref() == Some(thread_id))
-    else {
+    let Some(record) = agent_activity::active_run_for_thread(thread_id) else {
         return Vec::new();
     };
+    // Trajectory spans of finished calls come from the thread file; only
+    // calls still running are live spans.
     record
         .current_tools
         .into_iter()
+        .filter(agent_activity::ActiveToolCall::is_running)
         .enumerate()
         .map(|(index, tool)| LiveToolSpan {
             sequence: first_sequence + index,
@@ -1146,7 +1161,11 @@ fn collect_workers(workers: &WorkerManager, owner_thread_id: &str) -> Vec<Worker
     let live = workers.list_for_owner(owner_thread_id);
     let live_ids: HashSet<String> = live.iter().map(|w| w.thread_id.clone()).collect();
 
-    let mut items: Vec<WorkerItem> = live.into_iter().map(live_worker_item).collect();
+    let runs = agent_activity::list_active();
+    let mut items: Vec<WorkerItem> = live
+        .into_iter()
+        .map(|worker| live_worker_item(worker, &runs))
+        .collect();
 
     let persisted = thread_index::child_runs_cached(owner_thread_id).unwrap_or_else(|error| {
         tracing::warn!(
@@ -1174,10 +1193,7 @@ fn collect_workers(workers: &WorkerManager, owner_thread_id: &str) -> Vec<Worker
                     .map(|name| name.to_string_lossy().into_owned())
             }),
             root_path: summary.root_path,
-            current_tool: None,
-            current_tool_input: None,
-            turn_elapsed_seconds: None,
-            seconds_since_last_activity: None,
+            run: None,
             last_error: None,
             age: summary
                 .modified
@@ -1196,8 +1212,10 @@ fn collect_workers(workers: &WorkerManager, owner_thread_id: &str) -> Vec<Worker
     items
 }
 
-fn live_worker_item(worker: WorkerSnapshot) -> WorkerItem {
+fn live_worker_item(worker: WorkerSnapshot, runs: &[agent_activity::RunRecord]) -> WorkerItem {
     let root_path = worker.root.to_string_lossy().into_owned();
+    let run = agent_activity::run_for_thread(runs, &worker.thread_id)
+        .map(|run| run.status(chrono::Utc::now()));
     WorkerItem {
         title: thread_display_title(&worker.thread_id),
         status: match worker.status {
@@ -1214,10 +1232,7 @@ fn live_worker_item(worker: WorkerSnapshot) -> WorkerItem {
             .file_name()
             .map(|name| name.to_string_lossy().into_owned()),
         root_path: Some(root_path),
-        current_tool: worker.current_tool,
-        current_tool_input: worker.current_tool_input,
-        turn_elapsed_seconds: worker.turn_elapsed_seconds,
-        seconds_since_last_activity: worker.seconds_since_last_activity,
+        run,
         last_error: worker.last_error,
         age: None,
         telegram_link: worker
@@ -1691,16 +1706,16 @@ pub(crate) fn feedback_attachments(saved: &SavedFeedback) -> Vec<LocalAttachment
         .collect()
 }
 
-/// Appends a `ToolRunning` record for each in-flight tool from the active-run
-/// marker bound to this thread. Skips ids already persisted as `tool_use`
-/// (a finished round lands in the JSONL just before the marker entry clears).
-fn append_running_tools(response: &mut ThreadResponse) {
-    let Some(record) = agent_activity::list_active()
-        .into_iter()
-        .find(|r| r.thread_id.as_deref() == Some(response.id.as_str()))
-    else {
+/// Attaches the shared live status of the turn running on `source_id` (the
+/// alias-resolved thread the marker is bound to), and appends a `ToolRunning`
+/// record for each call of its current tool round. Skips ids already persisted
+/// as `tool_use`: a finished round lands in the JSONL while its calls are still
+/// in the marker.
+fn attach_live_run(response: &mut ThreadResponse, source_id: &str) {
+    let Some(record) = agent_activity::active_run_for_thread(source_id) else {
         return;
     };
+    response.run = Some(record.status(chrono::Utc::now()));
     let persisted: HashSet<String> = response
         .activity
         .iter()
@@ -1715,17 +1730,25 @@ fn append_running_tools(response: &mut ThreadResponse) {
             continue;
         }
         let started_at = tool.started_at;
+        let running_for = match (&tool.completed_at, tool.duration_ms) {
+            (None, _) => agent_activity::uptime_since(&started_at),
+            (Some(_), Some(ms)) => agent_activity::format_secs(ms / 1000),
+            (Some(_), None) => String::new(),
+        };
         response.activity.push(ThreadActivity::ToolRunning {
             sequence,
             time: event_time(&started_at),
             ts: started_at.clone(),
-            started_at: started_at.clone(),
-            running_for: agent_activity::uptime_since(&started_at),
+            started_at,
+            running_for,
             id: tool.id,
             name: tool.name.to_ascii_lowercase(),
             summary: tool.summary,
             input: tool.input,
             output_tail: tool.output_tail,
+            completed_at: tool.completed_at,
+            ok: tool.ok,
+            duration_ms: tool.duration_ms,
         });
         sequence += 1;
     }
@@ -1907,6 +1930,7 @@ fn project_thread(
         parent_title: lineage.parent_title,
         worker_count: lineage.worker_count,
         delivering: false,
+        run: None,
         activity,
     }
 }
@@ -2864,12 +2888,43 @@ async fn get_monitor(
     State(state): State<Arc<ServerState>>,
 ) -> Result<Json<MonitorResponse>, ApiError> {
     let mut response = monitor_snapshot(&state).await?;
+    response.active_agents = tokio::task::spawn_blocking(active_monitor_agents)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, "Mini App active agents task failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Active agents unavailable",
+            )
+        })?;
     attach_subscriptions(&state, &mut response).await;
     Ok(Json(response))
 }
 
-/// Builds (or reuses) the local part of the dashboard: services, agents,
-/// jobs, config and usage. Everything here is local state, so it is
+/// Active runs from their markers, read fresh on every request (a directory
+/// of a few small files), so the dashboard cache never delays them.
+fn active_monitor_agents() -> Vec<MonitorAgent> {
+    let now = chrono::Utc::now();
+    agent_activity::list_active()
+        .into_iter()
+        .map(|record| MonitorAgent {
+            run: record.status(now),
+            pid: record.pid,
+            uptime: agent_activity::uptime_since(&record.started_at),
+            thread_id: record.thread_id,
+            parent_thread_id: record.parent_thread_id,
+            surface: record.surface,
+            role: record.subagent_name.or(record.kind),
+            model: record.model,
+            provider: record.provider,
+            account: record.account,
+            thinking: record.thinking,
+        })
+        .collect()
+}
+
+/// Builds (or reuses) the local part of the dashboard: services, jobs,
+/// config and usage. Everything here is local state, so it is
 /// cached for [`MONITOR_CACHE_TTL`] and never waits on the network.
 ///
 /// Quotas are deliberately *not* cached with it — they are overlaid per request
@@ -2945,38 +3000,6 @@ fn build_monitor_response(root: &FilePath) -> anyhow::Result<MonitorResponse> {
         })
         .collect();
 
-    let active_agents = agent_activity::list_active()
-        .into_iter()
-        .map(|record| {
-            let current_tool = record.current_tools.first().map(|tool| {
-                let mut label = if tool.summary.is_empty() {
-                    tool.name.clone()
-                } else {
-                    format!("{}: {}", tool.name, tool.summary)
-                };
-                if record.current_tools.len() > 1 {
-                    use std::fmt::Write as _;
-                    let _ = write!(label, " (+{} more)", record.current_tools.len() - 1);
-                }
-                label
-            });
-            MonitorAgent {
-                pid: record.pid,
-                thread_id: record.thread_id,
-                parent_thread_id: record.parent_thread_id,
-                surface: record.surface,
-                role: record.subagent_name.or(record.kind),
-                model: record.model,
-                provider: record.provider,
-                account: record.account,
-                thinking: record.thinking,
-                uptime: agent_activity::uptime_since(&record.started_at),
-                current_tool,
-                phase: record.phase,
-            }
-        })
-        .collect();
-
     let background_processes = background_activity::list_background()
         .into_iter()
         .filter(background_activity::BackgroundProcess::is_running)
@@ -3011,7 +3034,9 @@ fn build_monitor_response(root: &FilePath) -> anyhow::Result<MonitorResponse> {
     Ok(MonitorResponse {
         generated_at: chrono::Utc::now().to_rfc3339(),
         services,
-        active_agents,
+        // Overlaid per request by `get_monitor`: run markers are cheap to read
+        // and go stale long before the rest of the snapshot.
+        active_agents: Vec::new(),
         background_processes,
         jobs,
         jobs_error,
@@ -4862,6 +4887,114 @@ mod tests {
         assert!(json.contains("third"));
         assert!(!json.contains("first"), "delivered items are not resent");
         assert!(!json.contains("second"));
+    }
+
+    /// A concurrent round: the finished call must stay visible next to the
+    /// running one until the checkpoint writes both, and must not be listed
+    /// twice once it is in the thread file. The run status stays set across
+    /// the handoff so clients keep polling.
+    #[test]
+    fn live_run_keeps_finished_calls_until_the_checkpoint_lands() {
+        let _home = zdx_engine::test_support::temp_zdx_home();
+        let thread_id = format!("telegram-live-{}", uuid::Uuid::new_v4());
+        let mut thread = thread_persistence::Thread::with_id(thread_id.clone()).expect("thread");
+        thread
+            .append(&ThreadEvent::user_message("run checks"))
+            .expect("append user message");
+
+        let guard = agent_activity::start(agent_activity::StartParams {
+            thread_id: Some(&thread_id),
+            ..Default::default()
+        })
+        .expect("start run marker");
+        guard.set_tools_started(vec![
+            agent_activity::ActiveToolCall::new(
+                "read-1",
+                "read",
+                &serde_json::json!({ "path": "src/lib.rs" }),
+            ),
+            agent_activity::ActiveToolCall::new(
+                "bash-1",
+                "bash",
+                &serde_json::json!({ "command": "cargo test" }),
+            ),
+        ]);
+        guard.set_tool_finished("read-1", true, Some(2400));
+
+        let project = || {
+            let events = load_thread_events(&thread_id).expect("load thread");
+            let mut response =
+                project_thread(thread_id.clone(), events, None, ThreadLineage::default());
+            attach_live_run(&mut response, &thread_id);
+            response
+        };
+        let live_tools = |response: &ThreadResponse| -> Vec<(String, Option<bool>)> {
+            response
+                .activity
+                .iter()
+                .filter_map(|item| match item {
+                    ThreadActivity::ToolRunning { id, ok, .. } => Some((id.clone(), *ok)),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        let before = project();
+        let run = before.run.as_ref().expect("run status while the turn runs");
+        assert_eq!(run.state, "tool");
+        assert_eq!(run.label, "bash: cargo test");
+        assert_eq!((run.running_tools, run.finished_tools), (1, 1));
+        assert_eq!(
+            live_tools(&before),
+            vec![
+                ("read-1".to_string(), Some(true)),
+                ("bash-1".to_string(), None)
+            ]
+        );
+        assert!(
+            before
+                .activity
+                .iter()
+                .filter(|item| matches!(item, ThreadActivity::ToolRunning { .. }))
+                .all(|item| item.sequence() >= before.cursor),
+            "live rows sit at or after the cursor, so a delta poll keeps them"
+        );
+
+        // The round ends: the checkpoint persists both calls while the
+        // marker still lists them until the next round.
+        guard.set_tool_finished("bash-1", true, Some(9000));
+        guard.set_phase("waiting");
+        for (id, name, input) in [
+            (
+                "read-1",
+                "read",
+                serde_json::json!({ "path": "src/lib.rs" }),
+            ),
+            (
+                "bash-1",
+                "bash",
+                serde_json::json!({ "command": "cargo test" }),
+            ),
+        ] {
+            thread
+                .append(&ThreadEvent::tool_use(id, name, input))
+                .expect("append tool use");
+            thread
+                .append(&ThreadEvent::tool_result(id, serde_json::json!({}), true))
+                .expect("append tool result");
+        }
+
+        let after = project();
+        assert!(
+            live_tools(&after).is_empty(),
+            "persisted calls are not listed twice"
+        );
+        let run = after.run.as_ref().expect("still running between rounds");
+        assert_eq!(run.state, "waiting");
+        assert_eq!(run.label, "waiting for model");
+
+        drop(guard);
+        assert!(project().run.is_none(), "no run once the marker is gone");
     }
 
     #[test]

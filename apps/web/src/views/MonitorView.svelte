@@ -4,6 +4,7 @@
   import { router, MONITOR_SECTION_LABELS, type MonitorSection } from "$lib/router.svelte";
   import { haptic } from "$lib/telegram";
   import { resetClock, resetCountdown } from "$lib/time";
+  import { runAges } from "$lib/run";
   import WorkspacesPane from "./WorkspacesPane.svelte";
 
   interface Props {
@@ -40,13 +41,17 @@
     load();
   });
 
-  // The server caches this for 30s, so polling faster only burns battery.
+  // The server caches most of the snapshot for 30s, so polling faster only
+  // burns battery. Active agents are read fresh on every request, so while
+  // any runs the view polls every 5s to keep their status current.
   // Workspace settings change only on edits, so they refresh manually.
+  let agentsActive = $derived((data?.active_agents.length ?? 0) > 0);
   $effect(() => {
+    const period = agentsActive ? 5_000 : 30_000;
     const timer = setInterval(() => {
       now = Date.now();
       if (document.visibilityState === "visible" && section !== "workspaces") load(false);
-    }, 30_000);
+    }, period);
     return () => clearInterval(timer);
   });
 
@@ -185,12 +190,13 @@
                     >
                   </div>
                   <p class="m-0 truncate font-mono text-xxs text-muted-foreground">
-                    {agent.model ?? "—"}{agent.current_tool
-                      ? ` · ${agent.current_tool}`
-                      : agent.phase
-                        ? ` · ${agent.phase}`
-                        : ""}
+                    {agent.model ?? "—"} · {agent.run.label}
                   </p>
+                  {#if runAges(agent.run)}
+                    <p class="m-0 truncate font-mono text-xxs text-muted-foreground opacity-70">
+                      {runAges(agent.run)}
+                    </p>
+                  {/if}
                 </button>
               {/each}
             </div>

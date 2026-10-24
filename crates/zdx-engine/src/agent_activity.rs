@@ -31,7 +31,16 @@ const TOOL_OUTPUT_TAIL_MAX_BYTES: usize = 8 * 1024;
 /// chatty `bash` cannot turn every chunk into a disk write.
 const OUTPUT_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// A tool call currently executing within an active run.
+/// How often a running turn rewrites its marker with a fresh `heartbeat_at`.
+/// The same write carries the latest `last_activity_at`, so activity is at
+/// most this stale on disk.
+pub const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// A tool call of the current tool round within an active run.
+///
+/// A finished call stays in the marker (with `completed_at` set) until the
+/// next round replaces the list, so readers can show it until the thread file
+/// holds its result. Readers drop entries whose id is already persisted.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActiveToolCall {
     /// Tool-use id (matches the `ToolStarted`/`ToolCompleted` event id).
@@ -50,9 +59,24 @@ pub struct ActiveToolCall {
     #[serde(default)]
     pub output_tail: String,
     pub started_at: String,
+    /// When the call finished. `None` while it is still running.
+    #[serde(default)]
+    pub completed_at: Option<String>,
+    /// Whether the finished call succeeded. `None` while running.
+    #[serde(default)]
+    pub ok: Option<bool>,
+    /// Measured duration of the finished call, when recorded.
+    #[serde(default)]
+    pub duration_ms: Option<u64>,
 }
 
 impl ActiveToolCall {
+    /// True until the call finishes.
+    #[must_use]
+    pub fn is_running(&self) -> bool {
+        self.completed_at.is_none()
+    }
+
     /// Builds an entry from a tool call's name and input, summarizing the
     /// primary command/target on one bounded line.
     #[must_use]
@@ -78,9 +102,16 @@ impl ActiveToolCall {
             summary,
             input: stored_input,
             output_tail: String::new(),
-            started_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            started_at: now_rfc3339(),
+            completed_at: None,
+            ok: None,
+            duration_ms: None,
         }
     }
+}
+
+fn now_rfc3339() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
 /// Record stored in each marker file.
@@ -114,7 +145,9 @@ pub struct RunRecord {
     /// (e.g. `"explorer"`, `"oracle"`, `"task"`).
     #[serde(default)]
     pub subagent_name: Option<String>,
-    /// Tool calls currently executing (empty between tool rounds).
+    /// Tool calls of the current tool round: running ones, plus finished ones
+    /// (`completed_at` set) until the next round starts. Empty before the
+    /// first round.
     #[serde(default)]
     pub current_tools: Vec<ActiveToolCall>,
     /// What the run is doing right now: `waiting` (request sent, no tokens
@@ -122,6 +155,107 @@ pub struct RunRecord {
     /// only. A tool round is reported through `current_tools` instead.
     #[serde(default)]
     pub phase: Option<String>,
+    /// When the run last emitted any agent event (stream delta, tool event,
+    /// tool output). Written with the next marker rewrite, so it can lag by
+    /// up to [`HEARTBEAT_INTERVAL`].
+    #[serde(default)]
+    pub last_activity_at: Option<String>,
+    /// When the run's process last rewrote this marker on its heartbeat
+    /// timer. A fresh heartbeat shows the process loop is alive; it does not
+    /// show that the run makes progress.
+    #[serde(default)]
+    pub heartbeat_at: Option<String>,
+}
+
+/// Shared live view of one active run, derived from its marker. Every surface
+/// (Mini App, Monitor, orchestrator tools) reads this instead of interpreting
+/// marker fields itself.
+///
+/// The ages are observations, not verdicts: a quiet tool or a long model
+/// stream can leave `seconds_since_activity` high while the run is healthy,
+/// so nothing here declares a run stuck.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RunStatus {
+    /// `tool` while a tool call runs, else the marker phase (`waiting`,
+    /// `thinking`, `answering`, `retrying`), or `working` when unknown.
+    pub state: String,
+    /// One line for display, e.g. `bash: cargo test (+1 more)` or
+    /// `waiting for model`.
+    pub label: String,
+    /// When the current turn started (RFC 3339).
+    pub started_at: String,
+    pub turn_elapsed_secs: Option<u64>,
+    /// Seconds since the run last emitted any agent event. `None` for markers
+    /// written before this field existed.
+    pub seconds_since_activity: Option<u64>,
+    /// Seconds since the run's process last rewrote its marker on its
+    /// heartbeat timer. `None` for markers written before this field existed.
+    pub seconds_since_heartbeat: Option<u64>,
+    /// Tool calls still running in the current round.
+    pub running_tools: usize,
+    /// Tool calls of the current round that finished but may not be in the
+    /// thread file yet.
+    pub finished_tools: usize,
+}
+
+impl RunRecord {
+    /// Tool calls of the current round that are still running.
+    pub fn running_tools(&self) -> impl Iterator<Item = &ActiveToolCall> {
+        self.current_tools.iter().filter(|tool| tool.is_running())
+    }
+
+    /// Derives the shared live status at `now`.
+    #[must_use]
+    pub fn status(&self, now: chrono::DateTime<chrono::Utc>) -> RunStatus {
+        let running: Vec<&ActiveToolCall> = self.running_tools().collect();
+        let (state, label) = if let Some(newest) = running.last() {
+            let name = newest.name.to_ascii_lowercase();
+            let mut label = if newest.summary.is_empty() {
+                name
+            } else {
+                format!("{name}: {}", newest.summary)
+            };
+            if running.len() > 1 {
+                use std::fmt::Write as _;
+                let _ = write!(label, " (+{} more)", running.len() - 1);
+            }
+            ("tool".to_string(), label)
+        } else {
+            let phase = self.phase.as_deref().unwrap_or("working");
+            let label = match phase {
+                "waiting" => "waiting for model",
+                other => other,
+            };
+            (phase.to_string(), label.to_string())
+        };
+        RunStatus {
+            state,
+            label,
+            started_at: self.started_at.clone(),
+            turn_elapsed_secs: secs_since(&self.started_at, now),
+            seconds_since_activity: self
+                .last_activity_at
+                .as_deref()
+                .and_then(|at| secs_since(at, now)),
+            seconds_since_heartbeat: self
+                .heartbeat_at
+                .as_deref()
+                .and_then(|at| secs_since(at, now)),
+            running_tools: running.len(),
+            finished_tools: self.current_tools.len() - running.len(),
+        }
+    }
+}
+
+/// Whole seconds from an RFC 3339 timestamp to `now`, clamped at zero.
+fn secs_since(at: &str, now: chrono::DateTime<chrono::Utc>) -> Option<u64> {
+    let at = chrono::DateTime::parse_from_rfc3339(at).ok()?;
+    Some(
+        now.signed_duration_since(at)
+            .num_seconds()
+            .max(0)
+            .unsigned_abs(),
+    )
 }
 
 /// Parameters for [`start`].
@@ -153,22 +287,52 @@ impl Drop for RunGuard {
 }
 
 impl RunGuard {
-    /// Replaces the current-tool list for a new tool round and rewrites the
-    /// marker. Best-effort: write failures are ignored.
+    /// Replaces the tool list for a new tool round (dropping the previous
+    /// round's finished calls) and rewrites the marker. Best-effort: write
+    /// failures are ignored.
     pub fn set_tools_started(&self, tools: Vec<ActiveToolCall>) {
         let Ok(mut record) = self.record.lock() else {
             return;
         };
         record.current_tools = tools;
+        record.last_activity_at = Some(now_rfc3339());
         write_record(&self.path, &record);
     }
 
-    /// Removes one finished tool call from the marker.
-    pub fn set_tool_finished(&self, id: &str) {
+    /// Marks one tool call finished. It stays in the marker until the next
+    /// round, so readers can show it until the thread file holds its result.
+    pub fn set_tool_finished(&self, id: &str, ok: bool, duration_ms: Option<u64>) {
         let Ok(mut record) = self.record.lock() else {
             return;
         };
-        record.current_tools.retain(|tool| tool.id != id);
+        let now = now_rfc3339();
+        if let Some(tool) = record
+            .current_tools
+            .iter_mut()
+            .find(|tool| tool.id == id && tool.is_running())
+        {
+            tool.completed_at = Some(now.clone());
+            tool.ok = Some(ok);
+            tool.duration_ms = duration_ms;
+        }
+        record.last_activity_at = Some(now);
+        write_record(&self.path, &record);
+    }
+
+    /// Records that the run emitted an agent event. In memory only: the next
+    /// marker rewrite (at the latest the next heartbeat) carries it.
+    pub fn touch_activity(&self) {
+        if let Ok(mut record) = self.record.lock() {
+            record.last_activity_at = Some(now_rfc3339());
+        }
+    }
+
+    /// Stamps `heartbeat_at` and rewrites the marker.
+    pub fn heartbeat(&self) {
+        let Ok(mut record) = self.record.lock() else {
+            return;
+        };
+        record.heartbeat_at = Some(now_rfc3339());
         write_record(&self.path, &record);
     }
 
@@ -192,7 +356,11 @@ impl RunGuard {
         let Ok(mut record) = self.record.lock() else {
             return;
         };
-        let Some(tool) = record.current_tools.iter_mut().find(|tool| tool.id == id) else {
+        let Some(tool) = record
+            .current_tools
+            .iter_mut()
+            .find(|tool| tool.id == id && tool.is_running())
+        else {
             return;
         };
         tool.output_tail.push_str(chunk);
@@ -228,10 +396,10 @@ pub fn start(params: StartParams<'_>) -> Option<RunGuard> {
     fs::create_dir_all(&dir).ok()?;
 
     let pid = std::process::id();
-    let started_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let started_at = now_rfc3339();
     let record = RunRecord {
         pid,
-        started_at,
+        started_at: started_at.clone(),
         thread_id: params.thread_id.map(String::from),
         surface: params.surface.map(String::from),
         model: params.model.map(String::from),
@@ -243,6 +411,8 @@ pub fn start(params: StartParams<'_>) -> Option<RunGuard> {
         subagent_name: params.subagent_name.map(String::from),
         current_tools: Vec::new(),
         phase: Some("waiting".to_string()),
+        last_activity_at: Some(started_at.clone()),
+        heartbeat_at: Some(started_at),
     };
 
     let filename = format!("{pid}-{}.json", Uuid::new_v4());
@@ -302,6 +472,51 @@ pub fn list_active() -> Vec<RunRecord> {
     runs
 }
 
+/// The newest active run bound to `thread_id`, if any.
+#[must_use]
+pub fn active_run_for_thread(thread_id: &str) -> Option<RunRecord> {
+    run_for_thread(&list_active(), thread_id).cloned()
+}
+
+/// The newest run in `runs` bound to `thread_id`. Lets callers that need
+/// several threads read the marker directory once.
+#[must_use]
+pub fn run_for_thread<'a>(runs: &'a [RunRecord], thread_id: &str) -> Option<&'a RunRecord> {
+    if thread_id.is_empty() {
+        return None;
+    }
+    runs.iter()
+        .rev()
+        .find(|run| run.thread_id.as_deref() == Some(thread_id))
+}
+
+/// Spawns the heartbeat for a running turn: every [`HEARTBEAT_INTERVAL`] it
+/// rewrites the marker with a fresh `heartbeat_at` (and the latest activity
+/// time). Holds only a weak reference, so it stops on the first tick after
+/// the guard drops, and never delays the marker removal.
+pub fn spawn_heartbeat(guard: &std::sync::Arc<RunGuard>) -> tokio::task::JoinHandle<()> {
+    let guard = std::sync::Arc::downgrade(guard);
+    tokio::spawn(async move {
+        let mut ticks = tokio::time::interval(HEARTBEAT_INTERVAL);
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // The first tick fires at once; `start` already wrote a heartbeat.
+        ticks.tick().await;
+        loop {
+            ticks.tick().await;
+            let Some(guard) = guard.upgrade() else {
+                break;
+            };
+            guard.heartbeat();
+        }
+    })
+}
+
+/// Formats whole seconds as a short age, e.g. `42s`, `3m 5s`, `1h 2m`.
+#[must_use]
+pub fn format_secs(secs: u64) -> String {
+    format_duration(std::time::Duration::from_secs(secs))
+}
+
 /// Computes uptime string from an RFC 3339 timestamp.
 pub fn uptime_since(started_at: &str) -> String {
     let Ok(started) = chrono::DateTime::parse_from_rfc3339(started_at) else {
@@ -348,6 +563,8 @@ mod tests {
             subagent_name: None,
             current_tools: Vec::new(),
             phase: None,
+            last_activity_at: None,
+            heartbeat_at: None,
         }
     }
 
@@ -403,7 +620,19 @@ mod tests {
         assert_eq!(on_disk.current_tools[0].name, "bash");
         assert_eq!(on_disk.current_tools[0].summary, "sleep 30");
 
-        guard.set_tool_finished("tool1");
+        guard.set_tool_finished("tool1", true, Some(1200));
+        let on_disk: RunRecord = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            on_disk.current_tools.len(),
+            1,
+            "finished call stays until the next round"
+        );
+        assert!(!on_disk.current_tools[0].is_running());
+        assert_eq!(on_disk.current_tools[0].ok, Some(true));
+        assert_eq!(on_disk.current_tools[0].duration_ms, Some(1200));
+        assert_eq!(on_disk.running_tools().count(), 0);
+
+        guard.set_tools_started(Vec::new());
         let on_disk: RunRecord = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert!(on_disk.current_tools.is_empty());
 
@@ -475,5 +704,113 @@ mod tests {
         guard.set_phase("answering");
         let on_disk: RunRecord = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(on_disk.phase.as_deref(), Some("answering"));
+    }
+
+    #[test]
+    fn status_reports_newest_running_tool_and_counts_finished_ones() {
+        let now = chrono::Utc::now();
+        let ago = |secs: i64| {
+            (now - chrono::Duration::seconds(secs))
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+        };
+        let mut record = test_record();
+        record.started_at = ago(90);
+        record.phase = Some("answering".to_string());
+        record.last_activity_at = Some(ago(40));
+        record.heartbeat_at = Some(ago(3));
+        let mut finished =
+            ActiveToolCall::new("a", "Read", &serde_json::json!({ "path": "src/lib.rs" }));
+        finished.completed_at = Some(ago(50));
+        finished.ok = Some(true);
+        record.current_tools = vec![
+            finished,
+            ActiveToolCall::new("b", "Bash", &serde_json::json!({ "command": "cargo test" })),
+            ActiveToolCall::new("c", "Bash", &serde_json::json!({ "command": "sleep 30" })),
+        ];
+
+        let status = record.status(now);
+        assert_eq!(status.state, "tool");
+        assert_eq!(status.label, "bash: sleep 30 (+1 more)");
+        assert_eq!(status.running_tools, 2);
+        assert_eq!(status.finished_tools, 1);
+        assert_eq!(status.turn_elapsed_secs, Some(90));
+        assert_eq!(status.seconds_since_activity, Some(40));
+        assert_eq!(status.seconds_since_heartbeat, Some(3));
+
+        // Once every call finished, the phase describes the run again.
+        for tool in &mut record.current_tools {
+            tool.completed_at.get_or_insert_with(|| ago(1));
+        }
+        record.phase = Some("waiting".to_string());
+        let status = record.status(now);
+        assert_eq!(status.state, "waiting");
+        assert_eq!(status.label, "waiting for model");
+        assert_eq!(status.running_tools, 0);
+        assert_eq!(status.finished_tools, 3);
+    }
+
+    #[test]
+    fn markers_without_activity_fields_report_unknown_ages() {
+        let json = r#"{"pid":123,"started_at":"2026-08-26T00:00:00Z","thread_id":"t","surface":null,"model":null,"current_tools":[{"id":"x","name":"bash","summary":"ls","started_at":"2026-08-26T00:00:01Z"}]}"#;
+        let record: RunRecord = serde_json::from_str(json).unwrap();
+        let status = record.status(chrono::Utc::now());
+        assert_eq!(status.state, "tool");
+        assert_eq!(status.seconds_since_activity, None);
+        assert_eq!(status.seconds_since_heartbeat, None);
+    }
+
+    #[test]
+    fn activity_is_kept_in_memory_until_the_next_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("marker.json");
+        let record = test_record();
+        write_record(&path, &record).unwrap();
+        let guard = RunGuard {
+            path: path.clone(),
+            record: Mutex::new(record),
+            last_output_flush: Mutex::new(None),
+        };
+
+        guard.touch_activity();
+        let on_disk: RunRecord = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(
+            on_disk.last_activity_at.is_none(),
+            "touch alone must not write"
+        );
+
+        guard.heartbeat();
+        let on_disk: RunRecord = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(on_disk.heartbeat_at.is_some());
+        assert!(
+            on_disk.last_activity_at.is_some(),
+            "heartbeat write carries the latest activity"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_task_stops_after_the_guard_drops() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("marker.json");
+        let record = test_record();
+        write_record(&path, &record).unwrap();
+        let guard = std::sync::Arc::new(RunGuard {
+            path: path.clone(),
+            record: Mutex::new(record),
+            last_output_flush: Mutex::new(None),
+        });
+
+        let task = spawn_heartbeat(&guard);
+        tokio::time::sleep(HEARTBEAT_INTERVAL + std::time::Duration::from_millis(10)).await;
+        let on_disk: RunRecord = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(on_disk.heartbeat_at.is_some());
+
+        drop(guard);
+        assert!(
+            !path.exists(),
+            "the weak heartbeat must not keep the marker"
+        );
+        tokio::time::sleep(HEARTBEAT_INTERVAL * 2).await;
+        assert!(task.is_finished());
+        assert!(!path.exists());
     }
 }

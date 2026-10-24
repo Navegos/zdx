@@ -170,6 +170,7 @@ impl EventSender {
     /// Sends an event. Never blocks; ignored silently if the receiver has dropped.
     pub fn send(&self, ev: AgentEvent) {
         if let Some(guard) = &self.activity {
+            guard.touch_activity();
             match &ev {
                 AgentEvent::ReasoningDelta { .. } => guard.set_phase("thinking"),
                 AgentEvent::AssistantDelta { .. } => guard.set_phase("answering"),
@@ -1248,6 +1249,10 @@ async fn run_turn_inner(
         subagent_name: options.activity_subagent_name.as_deref(),
     })
     .map(Arc::new);
+    // Stops on its own once the guard drops at the end of the turn.
+    if let Some(guard) = &run_guard {
+        crate::agent_activity::spawn_heartbeat(guard);
+    }
     // Every event this turn emits flows through the activity-bound sender so
     // the run marker tracks phase transitions without per-site hooks.
     let sender = &sender.clone().with_activity(run_guard.clone());
@@ -3203,7 +3208,7 @@ fn record_tool_completion(
 ) {
     completed.insert(tool.idx);
     if let Some(guard) = run_guard {
-        guard.set_tool_finished(&tool.id);
+        guard.set_tool_finished(&tool.id, tool.output.is_ok(), tool.duration_ms);
     }
     sender.send(AgentEvent::ToolCompleted {
         id: tool.id,

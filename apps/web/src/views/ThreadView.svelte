@@ -10,6 +10,7 @@
   import { haptic, openTelegramLink, selectionChanged } from "$lib/telegram";
   import { isBusy, needsAttention, rollupFrom } from "$lib/workers";
   import TabStrip from "../components/TabStrip.svelte";
+  import RunStatusLine from "../components/RunStatusLine.svelte";
   import type { IconName } from "../components/Icon.svelte";
   import TranscriptPane from "./TranscriptPane.svelte";
   import ArtifactsPane from "./ArtifactsPane.svelte";
@@ -79,10 +80,16 @@
   let workersBusy = $derived(isBusy(workerRollup));
   let workersAttention = $derived(needsAttention(workerRollup));
 
-  // A pending reply delivery also counts: its warning must be replaced by the
-  // outcome without a reload.
+  // A running turn is live for its whole length, not only while a tool runs:
+  // between tools the model thinks or waits, and the next tool must appear
+  // without a manual refresh. A pending reply delivery also counts: its
+  // warning must be replaced by the outcome without a reload.
   let live = $derived(
-    data ? data.delivering === true || data.activity.some((a) => a.type === "tool_running") : false,
+    data
+      ? data.delivering === true ||
+          !!data.run ||
+          data.activity.some((a) => a.type === "tool_running")
+      : false,
   );
 
   let dirty = $derived(
@@ -238,8 +245,9 @@
     return () => clearInterval(timer);
   });
 
-  // Poll only while a tool is actually executing, and only when visible. The
-  // in-flight guard in `poll` keeps a slow response from stacking up ticks.
+  // Poll only while a turn runs (or a delivery is pending), and only when
+  // visible. The in-flight guard in `poll` keeps a slow response from
+  // stacking up ticks.
   $effect(() => {
     if (!live) return;
     const timer = setInterval(() => {
@@ -255,9 +263,9 @@
     let reconcile: ReturnType<typeof setTimeout> | undefined;
     if (wasLive && !live) {
       if (gitFor === id) loadGit();
-      // Tool markers clear just before checkpoint persistence lands. One
-      // trailing delta closes that handoff even though the regular live timer
-      // has stopped.
+      // The run marker clears when the turn ends, possibly just before its
+      // final persistence lands. One trailing delta closes that handoff even
+      // though the regular live timer has stopped.
       reconcile = setTimeout(() => {
         if (document.visibilityState === "visible") poll();
       }, 1000);
@@ -402,6 +410,10 @@
     </svg>
   </button>
 </header>
+
+{#if data?.run}
+  <RunStatusLine run={data.run} />
+{/if}
 
 {#if data?.parent_thread_id}
   <!-- A worker is a normal thread, so without this it is a dead end: nothing

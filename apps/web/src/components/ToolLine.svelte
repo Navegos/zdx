@@ -12,6 +12,8 @@
   let open = $state(false);
 
   let s = $derived(node.summary);
+  /** Finished, but its round is not in the thread file yet. */
+  let settling = $derived(!!node.running?.completed_at);
 
   function toggle() {
     open = !open;
@@ -35,7 +37,7 @@
 
 <div class:nested>
   <button type="button" onclick={toggle} aria-expanded={open} class="line">
-    {#if node.running}
+    {#if node.running && !settling}
       <span class="dot" aria-hidden="true"></span>
     {/if}
 
@@ -49,6 +51,7 @@
     {#if s.deletions}<span class="del">-{s.deletions}</span>{/if}
 
     {#if node.running}
+      {#if node.running.ok === false}<span class="del">failed</span>{/if}
       <span class="meta">{node.running.running_for}</span>
     {:else if s.failed}
       <span class="del">failed</span>

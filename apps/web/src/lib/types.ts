@@ -34,7 +34,33 @@ export interface ThreadResponse {
   /** Workers owned by this thread (live plus recovered from lineage). Gates the
    *  Workers tab without fetching the list first. */
   worker_count: number;
+  /** Shared live status of a turn running on this thread in any process, or
+   *  null when none runs. Keep polling while it is set. */
+  run: RunStatus | null;
   activity: ThreadActivity[];
+}
+
+/**
+ * Shared live status of one running turn (`zdx_engine::agent_activity::RunStatus`).
+ * The ages are observations: a quiet tool or a long model stream can leave
+ * `seconds_since_activity` high while the run is healthy. Never label a run
+ * stuck from them.
+ */
+export interface RunStatus {
+  /** `tool` while a call runs, else `waiting` | `thinking` | `answering` |
+   *  `retrying` | `working`. */
+  state: string;
+  /** One display line, e.g. `bash: cargo test (+1 more)` or `waiting for model`. */
+  label: string;
+  started_at: string;
+  turn_elapsed_secs: number | null;
+  /** Seconds since the run emitted any agent event. Null for older markers. */
+  seconds_since_activity: number | null;
+  /** Seconds since the run's process last wrote its heartbeat. Shows the
+   *  process is alive, not that the run makes progress. */
+  seconds_since_heartbeat: number | null;
+  running_tools: number;
+  finished_tools: number;
 }
 
 export type WorkerStatus =
@@ -61,10 +87,8 @@ export interface WorkerItem {
   root_path: string | null;
   /** Trailing component of `root_path`, for a compact project label. */
   project: string | null;
-  current_tool: string | null;
-  current_tool_input: string | null;
-  turn_elapsed_seconds: number | null;
-  seconds_since_last_activity: number | null;
+  /** Live status of the worker's running turn, from its run marker. */
+  run: RunStatus | null;
   last_error: string | null;
   /** Time since the worker thread's last write ("12m", "3h"), when known. */
   age: string | null;
@@ -91,6 +115,8 @@ export interface ThreadListItem {
   workers: WorkerRollup | null;
   /** Whether this thread is an orchestrator worker. Drives the `worker` badge. */
   is_worker: boolean;
+  /** Live status when a turn is running on this thread. */
+  run: RunStatus | null;
 }
 
 /** `/api/threads?kind=` filter: every top-level thread, or workers only. */
@@ -212,7 +238,12 @@ export interface ToolRunningActivity extends ActivityBase {
   summary: string;
   input: Json;
   output_tail: string;
+  /** Elapsed time while running; the duration once finished. */
   running_for: string;
+  /** Set when the call finished but its round is not in the thread file yet. */
+  completed_at?: string;
+  ok?: boolean;
+  duration_ms?: number;
 }
 
 export interface ToolResultActivity extends ActivityBase {
@@ -435,8 +466,7 @@ export interface MonitorAgent {
   account: string | null;
   thinking: string | null;
   uptime: string;
-  current_tool: string | null;
-  phase: string | null;
+  run: RunStatus;
 }
 
 export interface MonitorBackgroundProcess {

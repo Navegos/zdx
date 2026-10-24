@@ -80,12 +80,9 @@ pub struct AgentOverlayState {
     /// overlay rebuilds when a tool starts/finishes even though the JSONL
     /// hasn't changed yet.
     pub running_sig: Vec<String>,
-    /// Coarse phase of the run from its activity marker, shown in the title.
-    /// Refreshed every tick; `None` once the run ends.
-    pub run_phase: Option<String>,
-    /// Name of the first in-flight tool, shown in the title with precedence
-    /// over `run_phase` (a stale `thinking` would mislead during tool rounds).
-    pub running_tool: Option<String>,
+    /// Shared live status of the run from its activity marker, shown in the
+    /// title. Refreshed every tick; `None` once the run ends.
+    pub run: Option<agent_activity::RunStatus>,
     /// Width the transcript was last rendered at (re-render on resize).
     pub width: usize,
 }
@@ -162,7 +159,7 @@ pub(crate) fn load_active_agents() -> Vec<ActiveAgentInfo> {
                 .as_deref()
                 .map_or("-", |id| if id.len() > 8 { &id[..8] } else { id })
                 .to_string();
-            let current_tool = r.current_tools.first().map(|tool| tool.name.clone());
+            let current_tool = r.running_tools().last().map(|tool| tool.name.clone());
             ActiveAgentInfo {
                 pid: r.pid,
                 surface: r.surface.unwrap_or_else(|| "-".to_string()),
@@ -332,12 +329,13 @@ fn read_thread_transcript(
     (cells, lines, tools, thinking)
 }
 
-/// Appends a synthetic running-tool cell for each in-flight tool from the
-/// run's activity marker. Uses the marker's full input when it was stored;
+/// Appends a synthetic tool cell for each call of the run's current tool
+/// round from its activity marker: running, or finished (done/failed) but not
+/// yet in the thread file. Uses the marker's full input when it was stored;
 /// otherwise rebuilds a display input as `{primary_key: summary}`. The cell's
 /// start time comes from the marker so elapsed time survives rebuilds. Skips
-/// ids already persisted (a completed round lands in the JSONL just before
-/// the marker entry clears).
+/// ids already persisted (a completed round lands in the JSONL while its
+/// calls are still in the marker).
 fn append_running_tool_cells(
     cells: &mut Vec<zdx_transcript::HistoryCell>,
     running: &[agent_activity::ActiveToolCall],
@@ -364,11 +362,23 @@ fn append_running_tool_cells(
         if let zdx_transcript::HistoryCell::Tool {
             started_at,
             output_delta,
+            state,
+            completed_at,
             ..
         } = &mut cell
         {
             if let Ok(marker_start) = chrono::DateTime::parse_from_rfc3339(&tool.started_at) {
                 *started_at = marker_start.with_timezone(&chrono::Utc);
+            }
+            if let Some(done_at) = tool.completed_at.as_deref() {
+                *state = if tool.ok == Some(false) {
+                    zdx_transcript::ToolState::Error
+                } else {
+                    zdx_transcript::ToolState::Done
+                };
+                *completed_at = chrono::DateTime::parse_from_rfc3339(done_at)
+                    .ok()
+                    .map(|at| at.with_timezone(&chrono::Utc));
             }
             if !tool.output_tail.is_empty() {
                 *output_delta = Some(tool.output_tail.clone());
@@ -378,14 +388,13 @@ fn append_running_tool_cells(
     }
 }
 
-/// Marker record for the active run bound to `thread_id`, if any.
-fn active_run_for(thread_id: &str) -> Option<agent_activity::RunRecord> {
-    if thread_id.is_empty() {
-        return None;
-    }
-    agent_activity::list_active()
-        .into_iter()
-        .find(|r| r.thread_id.as_deref() == Some(thread_id))
+/// Changes when a call of the round starts, finishes, or gains output, so the
+/// overlay rebuilds even though the JSONL has not changed yet.
+fn running_signature(tools: &[agent_activity::ActiveToolCall]) -> Vec<String> {
+    tools
+        .iter()
+        .map(|t| format!("{}:{}:{}", t.id, t.output_tail.len(), t.is_running()))
+        .collect()
 }
 
 /// Applies the tracked expansions to freshly built cells, which always arrive
@@ -471,8 +480,7 @@ pub(crate) fn open_agent_overlay(app: &mut MonitorApp) {
                 file_len: 0,
                 file_mtime: None,
                 running_sig: Vec::new(),
-                run_phase: None,
-                running_tool: None,
+                run: None,
                 width,
             };
             load_transcript_into(&mut state);
@@ -495,8 +503,7 @@ pub(crate) fn open_agent_overlay(app: &mut MonitorApp) {
                 file_len: 0,
                 file_mtime: None,
                 running_sig: Vec::new(),
-                run_phase: None,
-                running_tool: None,
+                run: None,
                 width,
             });
         }
@@ -515,17 +522,10 @@ pub(crate) fn load_transcript_into(state: &mut AgentOverlayState) {
     let (len, mtime) = transcript_file_fingerprint(&path);
     state.file_len = len;
     state.file_mtime = mtime;
-    let run = active_run_for(&state.thread_id);
-    state.run_phase = run.as_ref().and_then(|r| r.phase.clone());
-    state.running_tool = run
-        .as_ref()
-        .and_then(|r| r.current_tools.first())
-        .map(|t| t.name.to_ascii_lowercase());
+    let run = agent_activity::active_run_for_thread(&state.thread_id);
+    state.run = run.as_ref().map(|r| r.status(chrono::Utc::now()));
     let running = run.map(|r| r.current_tools).unwrap_or_default();
-    state.running_sig = running
-        .iter()
-        .map(|t| format!("{}:{}", t.id, t.output_tail.len()))
-        .collect();
+    state.running_sig = running_signature(&running);
     let (cells, lines, tools, thinking) = read_thread_transcript(
         &state.thread_id,
         state.width,
@@ -566,19 +566,10 @@ pub(crate) fn refresh_agent_overlay(app: &mut MonitorApp) {
 
     let path = transcript_path(&state.thread_id);
     let (len, mtime) = transcript_file_fingerprint(&path);
-    let run = active_run_for(&state.thread_id);
-    state.run_phase = run.as_ref().and_then(|r| r.phase.clone());
-    state.running_tool = run
-        .as_ref()
-        .and_then(|r| r.current_tools.first())
-        .map(|t| t.name.to_ascii_lowercase());
-    let running_sig: Vec<String> = run
-        .map(|r| {
-            r.current_tools
-                .iter()
-                .map(|t| format!("{}:{}", t.id, t.output_tail.len()))
-                .collect()
-        })
+    let run = agent_activity::active_run_for_thread(&state.thread_id);
+    state.run = run.as_ref().map(|r| r.status(chrono::Utc::now()));
+    let running_sig = run
+        .map(|r| running_signature(&r.current_tools))
         .unwrap_or_default();
     if len == state.file_len
         && mtime == state.file_mtime
@@ -878,6 +869,33 @@ pub(crate) fn render_active_agents(f: &mut Frame, app: &MonitorApp, area: Rect) 
     f.render_widget(list, area);
 }
 
+/// Title status for a running turn: what it does now, then how long ago it
+/// emitted an event and how long ago its process last wrote a heartbeat. The
+/// ages are shown as observed; a quiet tool is not called stuck.
+fn run_title_status(run: &agent_activity::RunStatus) -> String {
+    use std::fmt::Write as _;
+    let mut status = if run.state == "tool" {
+        let glyph = zdx_transcript::tool_state_glyph(
+            &zdx_transcript::ToolState::Running,
+            spinner_frame_now(),
+        );
+        format!(" · {glyph} {}", run.label)
+    } else {
+        format!(" · {}…", run.label.to_ascii_uppercase())
+    };
+    if let Some(secs) = run.seconds_since_activity {
+        let _ = write!(status, " · event {} ago", agent_activity::format_secs(secs));
+    }
+    if let Some(secs) = run.seconds_since_heartbeat {
+        let _ = write!(
+            status,
+            " · heartbeat {} ago",
+            agent_activity::format_secs(secs)
+        );
+    }
+    status
+}
+
 pub(crate) fn render_agent_overlay(f: &mut Frame, state: &AgentOverlayState, area: Rect) {
     f.render_widget(Clear, area);
 
@@ -885,14 +903,8 @@ pub(crate) fn render_agent_overlay(f: &mut Frame, state: &AgentOverlayState, are
         String::new()
     } else if state.ended {
         " · ENDED".to_string()
-    } else if let Some(tool) = state.running_tool.as_deref() {
-        let glyph = zdx_transcript::tool_state_glyph(
-            &zdx_transcript::ToolState::Running,
-            spinner_frame_now(),
-        );
-        format!(" · {glyph} {}…", tool.to_ascii_uppercase())
-    } else if let Some(phase) = state.run_phase.as_deref() {
-        format!(" · {}…", phase.to_ascii_uppercase())
+    } else if let Some(run) = state.run.as_ref() {
+        run_title_status(run)
     } else if state.scroll.is_none() {
         " · FOLLOW".to_string()
     } else {
@@ -1148,8 +1160,7 @@ mod transcript_tests {
             file_len: 0,
             file_mtime: None,
             running_sig: Vec::new(),
-            run_phase: None,
-            running_tool: None,
+            run: None,
             width: 80,
         };
         let page = 40;
@@ -1232,8 +1243,7 @@ mod transcript_tests {
             file_len: 0,
             file_mtime: None,
             running_sig: Vec::new(),
-            run_phase: None,
-            running_tool: None,
+            run: None,
             width: 80,
         };
         let page = 40;
@@ -1296,8 +1306,7 @@ mod transcript_tests {
             file_len: 0,
             file_mtime: None,
             running_sig: Vec::new(),
-            run_phase: None,
-            running_tool: None,
+            run: None,
             width: 80,
         };
 
@@ -1319,6 +1328,47 @@ mod transcript_tests {
         let wide = lines_for(&cells, 100).len();
         let narrow = lines_for(&cells, 20).len();
         assert!(narrow > wide, "narrow={narrow} wide={wide}");
+    }
+
+    #[test]
+    fn finished_round_calls_show_their_outcome_until_persisted() {
+        let mut finished = agent_activity::ActiveToolCall::new(
+            "read-1",
+            "read",
+            &serde_json::json!({ "path": "src/lib.rs" }),
+        );
+        finished.completed_at = Some(chrono::Utc::now().to_rfc3339());
+        finished.ok = Some(false);
+        let running = agent_activity::ActiveToolCall::new(
+            "bash-1",
+            "bash",
+            &serde_json::json!({ "command": "cargo test" }),
+        );
+
+        let mut cells = Vec::new();
+        append_running_tool_cells(&mut cells, &[finished, running.clone()]);
+        let states: Vec<_> = cells
+            .iter()
+            .map(|cell| match cell {
+                zdx_transcript::HistoryCell::Tool { state, .. } => state.clone(),
+                _ => panic!("tool cell expected"),
+            })
+            .collect();
+        assert_eq!(
+            states,
+            vec![
+                zdx_transcript::ToolState::Error,
+                zdx_transcript::ToolState::Running
+            ]
+        );
+
+        let mut done = running.clone();
+        done.completed_at = Some(chrono::Utc::now().to_rfc3339());
+        assert_ne!(
+            running_signature(&[running]),
+            running_signature(&[done]),
+            "finishing a call changes the signature, so the overlay rebuilds"
+        );
     }
 
     #[test]

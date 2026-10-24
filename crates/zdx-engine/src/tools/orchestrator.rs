@@ -173,7 +173,7 @@ fn definition_for(op: Op) -> ToolDefinition {
         },
         Op::Status => ToolDefinition {
             name: "Get_Thread_Status".to_string(),
-            description: "Report a worker thread's status (queued/running/completed/failed/cancelled), queue depth, and the waiting prompts (`queue`: `prompt_id` + a bounded excerpt, in run order; the running prompt is not listed). The worker's last answer is left out by default because its `[worker update]` already delivered it; pass `include_last_answer: true` to get it as `latest_final_text` (bounded, held in memory by this process, so null after a restart or for an unmanaged thread). Use Read_Thread for anything older. Managed workers also report `current_tool`, `current_tool_input` (a one-line command/path/pattern preview, at most 200 characters), `seconds_since_last_activity`, and `turn_elapsed_seconds`. The name and input belong to the same tool-use id; with concurrent tools, they describe the most recently started unfinished call. Inspect the preview before judging a long wait: a build can be quiet, and activity age alone does not prove a hang. Input is null until available or when the tool has no primary argument. For a thread this process does not manage, live tool information is unavailable; it reports `seconds_since_last_write` from the file mtime. Both paths include `context`: the latest recorded request's input tokens INCLUDING cache reads/writes, its recorded model/provider, context_limit, percent_used, and recorded_at. This estimates context occupancy, not cumulative spend; output tokens are excluded, and it is not an exact count of the next resumed request. Context is null when no input-bearing usage is found in the last 256 KiB or the file cannot be read. Unknown model/provider/limit leaves tokens visible but limit and percentage null. Use percent_used to decide whether to move work to a fresh thread. Omit thread_id to list every worker owned by this orchestrator in the current process.".to_string(),
+            description: "Report a worker thread's status (queued/running/completed/failed/cancelled), queue depth, and the waiting prompts (`queue`: `prompt_id` + a bounded excerpt, in run order; the running prompt is not listed). The worker's last answer is left out by default because its `[worker update]` already delivered it; pass `include_last_answer: true` to get it as `latest_final_text` (bounded, held in memory by this process, so null after a restart or for an unmanaged thread). Use Read_Thread for anything older. Every result includes `run`, read from the shared live run file of a turn running in any process (null when no turn runs): `state` (`tool`, `waiting`, `thinking`, `answering`, `retrying`), `label` (e.g. `bash: cargo test (+1 more)`), `turn_elapsed_secs`, `seconds_since_activity` (any agent event, including model streaming), `seconds_since_heartbeat` (the run's process is alive; this does not prove progress), and running/finished tool counts. Managed workers also report `current_tool`, `current_tool_input` (a one-line command/path/pattern preview, at most 200 characters), `seconds_since_last_activity` (tool events only), and `turn_elapsed_seconds`. The name and input belong to the same tool-use id; with concurrent tools, they describe the most recently started unfinished call. Inspect the preview before judging a long wait: a build can be quiet, and activity age alone does not prove a hang. Input is null until available or when the tool has no primary argument. A thread this process does not manage also reports `seconds_since_last_write` from the file mtime. Both paths include `context`: the latest recorded request's input tokens INCLUDING cache reads/writes, its recorded model/provider, context_limit, percent_used, and recorded_at. This estimates context occupancy, not cumulative spend; output tokens are excluded, and it is not an exact count of the next resumed request. Context is null when no input-bearing usage is found in the last 256 KiB or the file cannot be read. Unknown model/provider/limit leaves tokens visible but limit and percentage null. Use percent_used to decide whether to move work to a fresh thread. Omit thread_id to list every worker owned by this orchestrator in the current process.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -303,13 +303,9 @@ fn thread_file_path(thread_id: &str) -> std::path::PathBuf {
     crate::config::paths::threads_dir().join(format!("{thread_id}.jsonl"))
 }
 
-/// Status for a thread this process does not manage.
-///
-/// Live tool activity only exists in the owning process, so the current tool is
-/// genuinely unavailable here rather than unknown-and-guessable: the thread
-/// JSONL has no `tool_started` event, and a running tool's `tool_use` is not
-/// flushed until its turn checkpoints. The file mtime does advance during a
-/// turn, so it is a real staleness signal and is all this path reports.
+/// Status for a thread this process does not manage. Worker state (queue,
+/// last answer) is unavailable here; live activity comes from the shared run
+/// marker, which the caller attaches as `run`.
 fn unmanaged_thread_json(thread_id: &str) -> Value {
     let title = thread_persistence::read_thread_title(thread_id)
         .ok()
@@ -326,8 +322,7 @@ fn unmanaged_thread_json(thread_id: &str) -> Value {
         "title": title,
         "managed": false,
         "seconds_since_last_write": seconds_since_last_write,
-        "current_tool": Value::Null,
-        "note": "Not a managed worker in this process: live tool activity is unavailable. `seconds_since_last_write` is the thread file's mtime and is the only progress signal here; a turn writes to it as it goes, so a large value means the thread is idle or stuck.",
+        "note": "Not a managed worker in this process: queue and last answer are unavailable. `run` shows a turn running in any process (null when none); `seconds_since_last_write` is the thread file's mtime, which lags a running tool round.",
     })
 }
 
@@ -567,8 +562,15 @@ fn get_thread_status(
         .get("include_last_answer")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    // One marker-directory read serves every worker in a listing.
+    let runs = crate::agent_activity::list_active();
+    let run_json = |thread_id: &str| {
+        crate::agent_activity::run_for_thread(&runs, thread_id)
+            .map_or(Value::Null, |run| json!(run.status(chrono::Utc::now())))
+    };
     let status_json = |snapshot: &WorkerSnapshot| {
         let mut worker = snapshot_json(snapshot);
+        worker["run"] = run_json(&snapshot.thread_id);
         if include_last_answer {
             worker["latest_final_text"] = json!(
                 snapshot
@@ -586,6 +588,7 @@ fn get_thread_status(
             Some(snapshot) => status_json(&snapshot),
             None if thread_file_path(thread_id).is_file() => {
                 let mut worker = unmanaged_thread_json(thread_id);
+                worker["run"] = run_json(thread_id);
                 if include_last_answer {
                     worker["latest_final_text"] = Value::Null;
                 }
