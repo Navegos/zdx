@@ -136,6 +136,10 @@ export interface DraftAnnotation {
   target: DraftTarget;
   voice: VoiceClip[];
   images: ImageClip[];
+  /** SHA-256 of the earlier version the note was written on, when Update
+   *  carried it over to a newer one (`lib/versionMatch.ts`). The first
+   *  version is kept through later updates. */
+  carriedFrom?: string;
 }
 
 export const INTENTS: { value: FeedbackIntent; label: string }[] = [
@@ -550,6 +554,66 @@ const HELPER_SOURCE = String.raw`(() => {
       if (!running) { running = true; raf(frame); }
     } else if (d.type === "text-selection") {
       post({ type: "text-selected", id: d.id, viewport: viewport(), selection: textSelection() });
+    } else if (d.type === "settle") {
+      // Update checks, sent after the frame's load event: answers once the
+      // page's web fonts are ready and two frames have been laid out, so the
+      // measurements see the page as loaded. No answer until then; the app's
+      // timeout bounds the wait.
+      const id = d.id;
+      const fonts = doc.fonts && doc.fonts.ready;
+      const settled = () => raf(() => raf(() => post({ type: "settled", id, viewport: viewport() })));
+      if (fonts && typeof fonts.then === "function") fonts.then(settled, () => {});
+      else settled();
+    } else if (d.type === "inspect" && Array.isArray(d.items)) {
+      // Update checks: for each selector, how many elements match now, the
+      // first one, and (for text notes) its full text. Answers only.
+      const items = d.items.slice(0, 300).map((it) => {
+        let list = [];
+        try { list = qsa.call(doc, String(it && it.selector)); } catch (_) {}
+        const el = list[0];
+        const out = { count: list.length, element: el && !own(el) ? describe(el) : null };
+        if (it && it.raw === true && out.element) {
+          try {
+            const r = createRange.call(doc);
+            r.selectNodeContents(el);
+            const t = rangeText.call(r);
+            if (t.length > 200000) out.truncated = true;
+            else out.raw = t;
+          } catch (_) { out.truncated = true; }
+        }
+        return out;
+      });
+      post({ type: "inspected", id: d.id, viewport: viewport(), items });
+    } else if (d.type === "range-rects" && Array.isArray(d.items)) {
+      // Update checks: where characters [start, end) of an element's text
+      // (the same text inspect returned) are on the page now, so a moved
+      // text note gets its real box. null when they cannot be placed.
+      const rects = d.items.slice(0, 300).map((it) => {
+        try {
+          const el = it && qs.call(doc, String(it.selector));
+          const start = it.start, end = it.end;
+          if (!el || own(el) || !Number.isInteger(start) || !Number.isInteger(end) || start < 0 || end <= start) return null;
+          const walker = doc.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+          const r = createRange.call(doc);
+          let at = 0, began = false;
+          for (let t = walker.nextNode(); t; t = walker.nextNode()) {
+            const len = (t.nodeValue || "").length;
+            if (!began && start < at + len) { r.setStart(t, start - at); began = true; }
+            if (began && end <= at + len) {
+              r.setEnd(t, end - at);
+              const b = rangeRect.call(r);
+              if (b.width === 0 && b.height === 0) return null;
+              // The words actually measured, so the app can refuse a box when
+              // the page changed its text since its inspect answer.
+              return { x: b.left + win.scrollX, y: b.top + win.scrollY, width: b.width, height: b.height,
+                text: rangeText.call(r) };
+            }
+            at += len;
+          }
+        } catch (_) {}
+        return null;
+      });
+      post({ type: "range-rects", id: d.id, viewport: viewport(), rects });
     } else if (d.type === "clear-text") {
       try { const sel = getSelection.call(doc); if (sel) sel.removeAllRanges(); } catch (_) {}
       lastText = null; lastTextKey = null;
@@ -794,6 +858,11 @@ export type HelperEvent =
       viewport: PageViewport | null;
     }
   | { type: "marks-status"; unresolved: number[] }
+  | { type: "inspected"; id: number; items: InspectedItem[]; viewport: PageViewport | null }
+  /** Boxes of text ranges asked for in a `range-rects` request, in order. */
+  | { type: "range-rects"; id: number; rects: (MeasuredRange | null)[]; viewport: PageViewport | null }
+  /** The checked page is loaded and its fonts are ready (answer to `settle`). */
+  | { type: "settled"; id: number; viewport: PageViewport | null }
   /** The page's text selection now, or null when nothing is selected. */
   | { type: "text-selected"; id: number; selection: TextSelection | null; viewport: PageViewport | null };
 
@@ -827,6 +896,19 @@ export function parseHelperEvent(data: unknown, nonce: string): HelperEvent | nu
         : [];
       return { type: "probed", id: d.id, anchor: parseElement(d.anchor), elements, viewport };
     }
+    case "inspected": {
+      if (typeof d.id !== "number" || !Array.isArray(d.items)) return null;
+      const items = d.items.slice(0, INSPECT_LIMITS.items).map(parseInspectedItem);
+      return { type: "inspected", id: d.id, items, viewport };
+    }
+    case "range-rects": {
+      if (typeof d.id !== "number" || !Array.isArray(d.rects)) return null;
+      return { type: "range-rects", id: d.id, rects: d.rects.slice(0, INSPECT_LIMITS.items).map(parseMeasuredRange), viewport };
+    }
+    case "settled": {
+      if (typeof d.id !== "number") return null;
+      return { type: "settled", id: d.id, viewport };
+    }
     case "text-selected": {
       if (typeof d.id !== "number") return null;
       return { type: "text-selected", id: d.id, selection: parseTextSelection(d.selection), viewport };
@@ -840,6 +922,44 @@ export function parseHelperEvent(data: unknown, nonce: string): HelperEvent | nu
     default:
       return null;
   }
+}
+
+/** One answer of an `inspect` request. Untrusted page data like any report. */
+export interface InspectedItem {
+  /** Elements the selector matches now. */
+  count: number;
+  /** The first of them, described like a Tap pick. */
+  element: PageElement | null;
+  /** Its full text (`Range.toString`), when asked for and not too long. */
+  raw?: string;
+  /** The text was asked for but is longer than `INSPECT_LIMITS.rawChars`. */
+  truncated?: boolean;
+}
+
+export const INSPECT_LIMITS = { items: 300, rawChars: 200_000 };
+
+/** One answer of a `range-rects` request: where the range is now, and the
+ *  words it holds (to compare with the quote). Untrusted page data. */
+export interface MeasuredRange {
+  rect: Rect;
+  text: string;
+}
+
+function parseMeasuredRange(value: unknown): MeasuredRange | null {
+  const rect = parseRect(value);
+  const text = value && typeof value === "object" ? (value as Record<string, unknown>).text : undefined;
+  if (!rect || typeof text !== "string" || text.length > LIMITS.quoteChars) return null;
+  return { rect, text: wellFormed(text) };
+}
+
+function parseInspectedItem(value: unknown): InspectedItem {
+  if (!value || typeof value !== "object") return { count: 0, element: null };
+  const v = value as Record<string, unknown>;
+  const count = Number.isInteger(v.count) && (v.count as number) >= 0 ? Math.min(v.count as number, 1_000_000) : 0;
+  const item: InspectedItem = { count, element: parseElement(v.element) };
+  if (typeof v.raw === "string" && v.raw.length <= INSPECT_LIMITS.rawChars) item.raw = wellFormed(v.raw);
+  else if (v.raw !== undefined || v.truncated === true) item.truncated = true;
+  return item;
 }
 
 /** A selection report, bounded. Untrusted: the quote and its context are page
@@ -1052,6 +1172,8 @@ export interface FeedbackSubmissionPayload {
       | ImageAreaTarget
       | { kind: "page" };
     media: FeedbackMediaPayload[];
+    /** Set when the note was carried over from an earlier version. */
+    carried_from?: string;
   }[];
 }
 
@@ -1090,6 +1212,7 @@ export async function buildPayload(input: {
       comment: wellFormed(draft.comment.trim()),
       target: wellFormedDeep(target),
       media: items,
+      ...(draft.carriedFrom ? { carried_from: draft.carriedFrom } : {}),
     });
   }
   const payload: FeedbackSubmissionPayload = {

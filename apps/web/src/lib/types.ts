@@ -180,6 +180,14 @@ export interface ArtifactItem extends ArtifactAttachment {
   modified_at?: string;
 }
 
+/** `GET /api/threads/{id}/artifacts/version`: the file as it is now.
+ *  `sha256` is the hash of its bytes, the version feedback names. */
+export interface ArtifactVersion {
+  sha256: string;
+  size_bytes: number;
+  modified_at: string | null;
+}
+
 export interface ArtifactsResponse {
   artifacts: ArtifactItem[];
 }

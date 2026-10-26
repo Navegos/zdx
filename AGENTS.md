@@ -67,6 +67,7 @@ All common tasks are available via `just` (see `justfile`). Run `just` to list a
 - `bun test apps/web/image-marks.test.mjs` (image annotation geometry, reveal/badge placement, and payload tests)
 - `bun test apps/web/artifact-link.test.mjs` (`Open artifact` start-parameter parsing and key lookup)
 - `bun test apps/web/artifact-list.test.mjs` (Artifacts tab order and day groups)
+- `bun test apps/web/version-match.test.mjs` (artifact Update: which notes move to a newer version)
 
 ## Verification
 

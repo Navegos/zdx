@@ -27,16 +27,30 @@
     type DraftTarget,
     type ImageFrame,
     type PageElement,
+    type InspectedItem,
+    type MeasuredRange,
     type PageViewport,
+    type Rect,
     type Point,
     type SelectionTree,
     type TextSelection,
     type TreeNode,
   } from "$lib/annotate";
   import { draftKey, loadDraftRecord, saveDraftRecord } from "$lib/draftStore";
+  import {
+    allMatched,
+    carryOver,
+    checkHtmlNotes,
+    acceptMeasured,
+    checkImageNotes,
+    inspectPlan,
+    rangeRequests,
+    type InspectPlan,
+    type NoteCheck,
+  } from "$lib/versionMatch";
   import { limitArea, type ImagePoint, type Size, type StageMark } from "$lib/imageMarks";
   import { confirmAction, haptic, notify, setClosingConfirmation, telegramUserId } from "$lib/telegram";
-  import type { ArtifactAttachment, ArtifactImageCopy } from "$lib/types";
+  import type { ArtifactAttachment, ArtifactImageCopy, ArtifactVersion } from "$lib/types";
   import Icon from "./Icon.svelte";
   import ImageStage from "./ImageStage.svelte";
 
@@ -56,7 +70,7 @@
   let { threadId, artifact, blob, image, unsaved = $bindable(false) }: Props = $props();
 
   type Mode = "browse" | "select" | "draw";
-  type Panel = "none" | "editor" | "list";
+  type Panel = "none" | "editor" | "list" | "update";
   /** `reopened`: the notes were made on an earlier version than the one shown.
    *  `server`: the file on the bot host changed after this version was opened. */
   type Stale = null | "reopened" | "server";
@@ -72,15 +86,19 @@
   let prepareError = $state("");
   let loaded = $state(false);
 
+  /** The image copy shown now: the prop at first, a newer copy after Update. */
+  let imageCopy = $state<ArtifactImageCopy | undefined>(untrack(() => image));
   /** Image artifacts: pins and drawn areas on the canonical copy, no page bridge. */
-  const isImage = $derived(image !== undefined);
+  const isImage = $derived(imageCopy !== undefined);
   const surface = $derived(isImage ? "image" : "page");
   let imageUrl = $state<string | null>(null);
   /** The copy's size, as the server named it (checked against the decode). */
   let imageSize = $state<Size | null>(null);
   /** The copy shown now, as the payload names it. */
   const currentFrame = $derived<ImageFrame | null>(
-    image ? { canonical_sha256: image.canonicalSha256, width: image.width, height: image.height } : null,
+    imageCopy
+      ? { canonical_sha256: imageCopy.canonicalSha256, width: imageCopy.width, height: imageCopy.height }
+      : null,
   );
   /** Strokes drawn on the image that are not a note yet. */
   let imageStrokes = $state<ImagePoint[][]>([]);
@@ -209,11 +227,16 @@
     return url;
   }
 
+  /** Update to a newer version: loading it, checking notes against it. */
+  let updateState = $state<"idle" | "loading" | "checking">("idle");
+  /** Notes are frozen while an update loads, checks, or waits for a choice. */
+  const updating = $derived(updateState !== "idle" || panel === "update");
   const canAnnotate = $derived(
     loaded &&
       (isImage ? imageSize !== null : helperReady && !bridgeLost) &&
       stale !== "reopened" &&
-      !sending,
+      !sending &&
+      !updating,
   );
   /** Strokes drawn but not turned into a note yet. */
   const pendingStrokes = $derived(isImage ? imageStrokes.length : strokeCount);
@@ -249,6 +272,12 @@
   async function decodeArtifactImage(source: Blob, expected: Size): Promise<void> {
     if (imageUrl) URL.revokeObjectURL(imageUrl);
     imageUrl = null;
+    imageUrl = await decodeImageUrl(source, expected);
+    imageSize = { width: expected.width, height: expected.height };
+  }
+
+  /** An object URL for `source` once it decodes at exactly `expected`. */
+  async function decodeImageUrl(source: Blob, expected: Size): Promise<string> {
     const url = URL.createObjectURL(source);
     const probe = new Image();
     probe.src = url;
@@ -262,8 +291,7 @@
       URL.revokeObjectURL(url);
       throw new Error("The image preview did not show at its expected size, so it cannot be annotated here.");
     }
-    imageUrl = url;
-    imageSize = { width: expected.width, height: expected.height };
+    return url;
   }
 
   function buildFrame() {
@@ -285,6 +313,7 @@
         try {
           // An image's version is the server's hash of the original; the
           // bytes here are its canonical copy.
+          imageCopy = image;
           const copy = image;
           const digest = copy ? copy.sourceSha256 : await sha256Hex(source);
           const html = copy ? "" : await source.text();
@@ -331,6 +360,10 @@
   }
 
   function onMessage(event: MessageEvent) {
+    if (checker && event.source === checker.contentWindow) {
+      onCheckerMessage(event);
+      return;
+    }
     if (!frame || event.source !== frame.contentWindow) return;
     const parsed = parseHelperEvent(event.data, nonce);
     if (!parsed) return;
@@ -541,7 +574,7 @@
   /** Any change to the drafts makes the next send a new submission. Refused
    *  while a send is in flight. */
   function commit(next: DraftAnnotation[]): boolean {
-    if (sending) return false;
+    if (sending || updating) return false;
     drafts = next;
     submissionId = newId();
     if (next.length === 0) {
@@ -556,7 +589,7 @@
   }
 
   function openEditor(draft: DraftAnnotation, isNew: boolean) {
-    if (sending) return;
+    if (sending || updating) return;
     editing = { ...draft, voice: [...draft.voice], images: [...draft.images] };
     editingIsNew = isNew;
     editorError = "";
@@ -889,12 +922,292 @@
     if (editing) editing.images = editing.images.filter((_, i) => i !== index);
   }
 
+  // --- a newer version of the file ---
+
+  /** How often an open, visible viewer asks the bot host for the file's
+   *  version. A local read of the bot's file, never a Telegram call. */
+  const VERSION_POLL_MS = 30_000;
+  /** Focus and visibility events closer than this share one check. */
+  const VERSION_MIN_GAP_MS = 10_000;
+  /** How long the new page may take to load (its load event and web fonts),
+   *  and then to answer each request. Past it, notes do not move. */
+  const CHECK_LOAD_TIMEOUT_MS = 8_000;
+  const CHECK_TIMEOUT_MS = 5_000;
+
+  /** A newer version, loaded but not shown. `sha` names exactly these bytes
+   *  (hashed here for HTML; the server's source hash for an image), never the
+   *  hash the version check advertised. */
+  type Candidate = { sha: string; html: string | null; copy: ArtifactImageCopy | null; imageUrl: string | null };
+
+  /** The file's version on the bot host at the last check. */
+  let advertised = $state<ArtifactVersion | null>(null);
+  const newVersion = $derived(loaded && sha !== null && advertised !== null && advertised.sha256 !== sha);
+  let updateError = $state("");
+  let updateInfo = $state("");
+  /** Some notes could not be matched: the choice is open in the `update` panel. */
+  let updateResult = $state<{ candidate: Candidate; checks: NoteCheck[] } | null>(null);
+  /** Work an update must not interrupt. It waits; nothing is discarded. */
+  const updateBlock = $derived(
+    sending
+      ? "Wait for the send to finish."
+      : panel === "editor" || recording
+        ? "Save or cancel the note you are editing first."
+        : pendingStrokes > 0
+          ? "Turn your drawing into a note or clear it first."
+          : "",
+  );
+  let versionInFlight = false;
+  let lastVersionCheck = 0;
+  /** The preview closed while an update was loading: show nothing. */
+  let destroyed = false;
+
+  async function checkVersion() {
+    const now = Date.now();
+    if (versionInFlight || now - lastVersionCheck < VERSION_MIN_GAP_MS) return;
+    versionInFlight = true;
+    lastVersionCheck = now;
+    try {
+      advertised = await api.artifactVersion(threadId, artifact.path);
+    } catch {
+      // Gone, offline, or expired: keep what is shown; the next check retries.
+    } finally {
+      versionInFlight = false;
+    }
+  }
+
+  // Only while the viewer is open and on screen; never a reload by itself.
+  $effect(() => {
+    if (!loaded || prepareError) return;
+    const visible = () => {
+      if (document.visibilityState === "visible") void checkVersion();
+    };
+    const timer = setInterval(visible, VERSION_POLL_MS);
+    document.addEventListener("visibilitychange", visible);
+    window.addEventListener("focus", visible);
+    return () => {
+      clearInterval(timer);
+      document.removeEventListener("visibilitychange", visible);
+      window.removeEventListener("focus", visible);
+    };
+  });
+
+  // The new page is checked in a hidden frame of the same size, with its own
+  // bridge, while the page on screen stays as it is.
+  let checker = $state<HTMLIFrameElement | null>(null);
+  let checkerUrl = $state<string | null>(null);
+  let checkerNonce = "";
+  /** The id of the `settle` request sent after the frame's load event. */
+  let checkerSettleId: number | null = null;
+  let checkerReady: (() => void) | null = null;
+  const checkerAnswers = new Map<number, (answer: { items: InspectedItem[]; viewport: PageViewport | null }) => void>();
+  const checkerRects = new Map<number, (rects: (MeasuredRange | null)[]) => void>();
+
+  /** The bridge posts `ready` as soon as it runs, before the body, styles,
+   *  scripts, or fonts are there. The checker ignores it: it is ready only on
+   *  the answer to the `settle` it sends after the frame's load event. */
+  function onCheckerMessage(event: MessageEvent) {
+    const parsed = parseHelperEvent(event.data, checkerNonce);
+    if (parsed?.type === "settled" && parsed.id === checkerSettleId) checkerReady?.();
+    else if (parsed?.type === "inspected") checkerAnswers.get(parsed.id)?.(parsed);
+    else if (parsed?.type === "range-rects") checkerRects.get(parsed.id)?.(parsed.rects);
+  }
+
+  function onCheckerLoad() {
+    checkerSettleId = ++requestSeq;
+    try {
+      checker?.contentWindow?.postMessage(helperMessage({ type: "settle", id: checkerSettleId }), "*");
+    } catch {
+      // The timeout reports a page that does not answer.
+    }
+  }
+
+  function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T | null> {
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => resolve(null), ms);
+      promise.then(
+        (value) => {
+          clearTimeout(timer);
+          resolve(value);
+        },
+        () => {
+          clearTimeout(timer);
+          resolve(null);
+        },
+      );
+    });
+  }
+
+  /** Asks the new page about the notes' targets, then where each text
+   *  note's matched words are. `null` when it does not load its bridge or
+   *  answer in time; a range it does not measure stays out of `measured`.
+   *  Only selectors and character offsets go in; nothing the user wrote. */
+  async function inspectNewPage(html: string, plan: InspectPlan, notes: DraftAnnotation[]) {
+    checkerNonce = newNonce();
+    checkerSettleId = null;
+    const ready = new Promise<boolean>((resolve) => (checkerReady = () => resolve(true)));
+    checkerUrl = URL.createObjectURL(new Blob([injectHelper(html, checkerNonce)], { type: "text/html;charset=utf-8" }));
+    try {
+      if ((await withTimeout(ready, CHECK_LOAD_TIMEOUT_MS)) === null) return null;
+      const id = ++requestSeq;
+      const answer = new Promise<{ items: InspectedItem[]; viewport: PageViewport | null }>((resolve) =>
+        checkerAnswers.set(id, resolve),
+      );
+      checker?.contentWindow?.postMessage(helperMessage({ type: "inspect", id, items: plan.items }), "*");
+      const inspected = await withTimeout(answer, CHECK_TIMEOUT_MS);
+      if (!inspected) return null;
+      const measured = new Map<number, Rect | null>();
+      const ranges = rangeRequests(notes, plan, inspected.items);
+      if (ranges.length > 0) {
+        const rectsId = ++requestSeq;
+        const rects = new Promise<(MeasuredRange | null)[]>((resolve) => checkerRects.set(rectsId, resolve));
+        const items = ranges.map(({ selector, start, end }) => ({ selector, start, end }));
+        checker?.contentWindow?.postMessage(helperMessage({ type: "range-rects", id: rectsId, items }), "*");
+        const boxes = await withTimeout(rects, CHECK_TIMEOUT_MS);
+        for (const [note, box] of acceptMeasured(notes, ranges, boxes)) measured.set(note, box);
+      }
+      return { ...inspected, measured };
+    } finally {
+      checkerReady = null;
+      checkerSettleId = null;
+      checkerAnswers.clear();
+      checkerRects.clear();
+      if (checkerUrl) URL.revokeObjectURL(checkerUrl);
+      checkerUrl = null;
+    }
+  }
+
+  async function fetchCandidate(): Promise<Candidate> {
+    if (isImage) {
+      let copy: ArtifactImageCopy;
+      try {
+        copy = await api.artifactImage(threadId, artifact.path);
+      } catch (e) {
+        if (e instanceof ApiError && e.status === 422) throw new Error(`the new version cannot be annotated: ${e.message}`);
+        throw e;
+      }
+      return { sha: copy.sourceSha256, html: null, copy, imageUrl: await decodeImageUrl(copy.blob, copy) };
+    }
+    const blob = await api.artifactBlob(threadId, artifact.path);
+    return { sha: await sha256Hex(blob), html: await blob.text(), copy: null, imageUrl: null };
+  }
+
+  function dropCandidate(candidate: Candidate) {
+    if (candidate.imageUrl) URL.revokeObjectURL(candidate.imageUrl);
+  }
+
+  /** Shows `candidate`. With `moved`, the notes go with it; without, notes
+   *  keep the version they were made on (marked earlier, never moved). */
+  function applyCandidate(candidate: Candidate, moved: DraftAnnotation[] | null) {
+    sha = candidate.sha;
+    if (candidate.copy) {
+      if (imageUrl) URL.revokeObjectURL(imageUrl);
+      imageUrl = candidate.imageUrl;
+      imageSize = { width: candidate.copy.width, height: candidate.copy.height };
+      imageCopy = candidate.copy;
+      imageStrokes = [];
+    } else {
+      pageHtml = candidate.html ?? "";
+      buildFrame();
+    }
+    if (moved) {
+      draftSha = candidate.sha;
+      draftFrame = currentFrame;
+      drafts = moved;
+      submissionId = newId();
+      stale = null;
+      sendState = "idle";
+      sendMessage = "";
+      persist();
+      updateInfo = `Updated. ${moved.length === 1 ? "Your note was" : `All ${moved.length} notes were`} found unchanged in the new version and moved to it. The check compares selectors, text, markup, and sizes, so look ${moved.length === 1 ? "it" : "them"} over before sending.`;
+    } else if (drafts.length === 0) {
+      draftSha = candidate.sha;
+      draftFrame = currentFrame;
+      stale = null;
+      updateInfo = "Updated to the new version.";
+    } else {
+      const sameFrame = !isImage || draftFrame?.canonical_sha256 === currentFrame?.canonical_sha256;
+      stale = draftSha === candidate.sha && sameFrame ? null : "reopened";
+      updateInfo = stale
+        ? "Updated. Your notes stay as notes on the earlier version."
+        : "Updated. This is the version your notes were made on, so they apply again.";
+    }
+    updateResult = null;
+    if (panel === "update" || panel === "none") panel = drafts.length > 0 ? "list" : "none";
+  }
+
+  async function startUpdate() {
+    if (!newVersion || updateBlock || updateState !== "idle") return;
+    updateError = "";
+    updateInfo = "";
+    clearSelection();
+    if (mode !== "browse") setMode("browse");
+    updateState = "loading";
+    let candidate: Candidate | null = null;
+    try {
+      candidate = await fetchCandidate();
+      if (destroyed) return;
+      if (candidate.sha === sha) {
+        // Changed back to what is shown.
+        dropCandidate(candidate);
+        candidate = null;
+        advertised = null;
+        updateInfo = "The file is the same as the version you have open.";
+        return;
+      }
+      const notes = $state.snapshot(drafts) as DraftAnnotation[];
+      // Notes already on an earlier version keep it: checking them against
+      // what is shown would match them to the wrong version.
+      if (notes.length === 0 || stale === "reopened") {
+        applyCandidate(candidate, null);
+        candidate = null;
+        return;
+      }
+      updateState = "checking";
+      let checks: NoteCheck[];
+      if (candidate.copy) {
+        checks = checkImageNotes(notes, candidate.copy.canonicalSha256 === draftFrame?.canonical_sha256);
+      } else {
+        const plan = inspectPlan(notes);
+        const answer =
+          plan.items.length > 0
+            ? await inspectNewPage(candidate.html ?? "", plan, notes)
+            : { items: [], viewport: null, measured: new Map<number, Rect | null>() };
+        checks = checkHtmlNotes(notes, plan, answer?.items ?? null, answer?.viewport ?? null, answer?.measured);
+      }
+      if (destroyed) return;
+      if (allMatched(checks)) {
+        applyCandidate(candidate, carryOver(notes, checks, sha!));
+      } else {
+        updateResult = { candidate, checks };
+        panel = "update";
+      }
+      candidate = null;
+    } catch (e) {
+      const text = e instanceof Error ? e.message : String(e);
+      updateError = `Could not load the new version (${text}). You are still on the version you opened.`;
+    } finally {
+      if (candidate) dropCandidate(candidate);
+      updateState = "idle";
+    }
+  }
+
+  function stayOnVersion() {
+    if (updateResult) dropCandidate(updateResult.candidate);
+    updateResult = null;
+    panel = drafts.length > 0 ? "list" : "none";
+  }
+
+  function updateAnyway() {
+    if (updateResult) applyCandidate(updateResult.candidate, null);
+  }
+
   // --- send ---
 
   async function send(allowStale = false) {
     // Unfinished strokes would be cleared by leaving Draw: they are not sent
     // and must not vanish silently.
     if (!draftSha || drafts.length === 0 || sendState === "sending" || panel === "editor" || pendingStrokes > 0) return;
+    if (updating) return;
     sendState = "sending";
     sendMessage = "";
     if (mode !== "browse") setMode("browse");
@@ -961,11 +1274,14 @@
   });
 
   onDestroy(() => {
+    destroyed = true;
     window.removeEventListener("message", onMessage);
     window.removeEventListener("resize", resizeCanvas);
     if (readyTimer) clearTimeout(readyTimer);
     if (hintTimer) clearTimeout(hintTimer);
     if (textHoldTimer) clearTimeout(textHoldTimer);
+    if (checkerUrl) URL.revokeObjectURL(checkerUrl);
+    if (updateResult) dropCandidate(updateResult.candidate);
     stopRecording();
     setClosingConfirmation(false);
     if (frameUrl) URL.revokeObjectURL(frameUrl);
@@ -1002,7 +1318,7 @@
       class="notes-btn"
       aria-pressed={panel === "list" && !selection}
       onclick={toggleNotes}
-      disabled={panel === "editor"}
+      disabled={panel === "editor" || updating}
     >
       <Icon name="list" />
       <span>Notes</span>
@@ -1010,11 +1326,49 @@
     </button>
   </div>
 
-  {#if image && (image.sourceWidth > image.width || image.sourceHeight > image.height)}
+  {#if imageCopy && (imageCopy.sourceWidth > imageCopy.width || imageCopy.sourceHeight > imageCopy.height)}
     <p class="copy-note">
-      Optimized copy for annotation: {image.width}×{image.height} of {image.sourceWidth}×{image.sourceHeight} px.
+      Optimized copy for annotation: {imageCopy.width}×{imageCopy.height} of {imageCopy.sourceWidth}×{imageCopy.sourceHeight}
+      px.
       The original is unchanged; the agent gets this copy with your marks.
     </p>
+  {/if}
+
+  {#if (newVersion || updateState !== "idle") && panel !== "update"}
+    <div class="banner info" role="status" data-new-version>
+      <p class="m-0 min-w-0 flex-1">
+        <b class="text-foreground">New version available.</b>
+        {#if updateState === "loading"}
+          Loading it…
+        {:else if updateState === "checking"}
+          Checking your notes against it…
+        {:else if updateError}
+          {updateError}
+        {:else if updateBlock}
+          {updateBlock}
+        {:else if drafts.length > 0 && stale !== "reopened"}
+          Your notes are checked against it before anything changes.
+        {:else}
+          Nothing reloads until you tap Update.
+        {/if}
+      </p>
+      <button
+        type="button"
+        class="act-btn primary"
+        onclick={startUpdate}
+        disabled={!!updateBlock || updateState !== "idle"}
+        data-update
+      >
+        Update
+      </button>
+    </div>
+  {:else if updateInfo}
+    <div class="banner info" role="status" data-update-info>
+      <p class="m-0 min-w-0 flex-1">{updateInfo}</p>
+      <button type="button" class="icon-btn" aria-label="Dismiss" onclick={() => (updateInfo = "")}>
+        <Icon name="x" />
+      </button>
+    </div>
   {/if}
 
   {#if bridgeLost}
@@ -1083,6 +1437,19 @@
         class="annot-frame"
         onload={onFrameLoad}
       ></iframe>
+      {#if checkerUrl}
+        <!-- The new version, checked out of sight; the page above stays. -->
+        <iframe
+          bind:this={checker}
+          title="New version check"
+          src={checkerUrl}
+          sandbox="allow-scripts"
+          class="annot-frame checker-frame"
+          aria-hidden="true"
+          tabindex="-1"
+          onload={onCheckerLoad}
+        ></iframe>
+      {/if}
     {/if}
     {#if !isImage && mode === "browse" && textSel}
       <div
@@ -1248,6 +1615,42 @@
         </button>
       </div>
     </section>
+  {:else if panel === "update" && updateResult}
+    {@const checks = updateResult.checks}
+    {@const matched = checks.filter((check) => check.ok).length}
+    <section class="panel" aria-label="New version" data-update-sheet>
+      <p class="m-0 text-xs font-semibold">
+        {matched} of {checks.length} notes still match the new version.
+      </p>
+      <ol class="note-list">
+        {#each drafts as draft, index (draft.id)}
+          {@const check = checks[index]}
+          {#if check && !check.ok}
+            <li class="note-row">
+              <span class="note-main">
+                <span class="note-n">{index + 1}</span>
+                <span class="min-w-0 flex-1">
+                  <span class="block truncate text-xs">
+                    <span class="intent intent-{draft.intent}">{intentLabel(draft.intent)}</span>
+                    {targetSummary(draft.target, surface)}
+                  </span>
+                  <span class="block text-xxs text-warning">Not matched: {check.reason}</span>
+                </span>
+              </span>
+            </li>
+          {/if}
+        {/each}
+      </ol>
+      <p class="m-0 text-xxs text-muted-foreground">
+        Stay on this version keeps the {surface} you have open and your notes as they are. Update anyway opens the new
+        version and keeps every note as a note on the earlier version: its mark is hidden, and you can still send it.
+      </p>
+      <div class="panel-actions">
+        <button type="button" class="act-btn primary" onclick={stayOnVersion} data-stay>Stay on this version</button>
+        <span class="flex-1"></span>
+        <button type="button" class="act-btn" onclick={updateAnyway} data-update-anyway>Update anyway</button>
+      </div>
+    </section>
   {:else if selection}
     {@const el = selection.element}
     {@const tree = selection.tree}
@@ -1401,7 +1804,7 @@
           type="button"
           class="act-btn primary"
           onclick={() => send()}
-          disabled={sending || panel === "editor" || pendingStrokes > 0 || !draftSha}
+          disabled={sending || panel === "editor" || pendingStrokes > 0 || !draftSha || updating}
         >
           <Icon name="send" />
           <span>{sendState === "error" ? "Retry" : "Send"}</span>
@@ -1509,6 +1912,17 @@
     padding: 0.5rem 0.75rem;
     font-size: 0.75rem;
     color: var(--color-muted-foreground);
+  }
+
+  .banner.info {
+    border-bottom-color: color-mix(in srgb, var(--color-link) 45%, transparent);
+  }
+
+  .checker-frame {
+    position: absolute;
+    inset: 0;
+    opacity: 0;
+    pointer-events: none;
   }
 
   .banner.warn {

@@ -542,6 +542,7 @@ mod tests {
             comment: "x".to_string(),
             target,
             media: Vec::new(),
+            carried_from: None,
         };
         let rendered = render(
             &image,

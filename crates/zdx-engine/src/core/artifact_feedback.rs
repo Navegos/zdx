@@ -252,6 +252,12 @@ pub struct FeedbackAnnotation {
     pub target: FeedbackTarget,
     #[serde(default)]
     pub media: Vec<FeedbackMedia>,
+    /// SHA-256 of the earlier version the note was written on, when the
+    /// surface carried it over to a newer version because its target was
+    /// still found there by mechanical checks. Those checks do not prove the
+    /// target means the same thing, so the prompt says so.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub carried_from: Option<String>,
 }
 
 /// One explicit send from a surface.
@@ -767,6 +773,7 @@ fn bundle_record(input: &BundleInput<'_>) -> serde_json::Value {
             serde_json::json!({
                 "intent": annotation.intent,
                 "comment": clean_text(&annotation.comment, MAX_COMMENT_CHARS),
+                "carried_from": annotation.carried_from,
                 "target": target,
                 "media": media,
                 "closeup": closeup,
@@ -859,6 +866,13 @@ fn validate_annotation(annotation: &FeedbackAnnotation, n: usize) -> Result<(), 
     if annotation.comment.chars().count() > MAX_COMMENT_CHARS {
         return Err(invalid(format!(
             "Comment {n} is longer than {MAX_COMMENT_CHARS} characters"
+        )));
+    }
+    if let Some(sha) = &annotation.carried_from
+        && (sha.len() != 64 || !sha.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
+        return Err(invalid(format!(
+            "Note {n} names an invalid earlier version"
         )));
     }
     if annotation.media.len() > MAX_MEDIA_PER_ANNOTATION {
@@ -1346,6 +1360,13 @@ fn render_annotation<'a>(
     let intent = annotation.intent.label();
     if !render_image_target(out, input, n, intent, &annotation.target) {
         render_html_target(out, n, intent, &annotation.target, files);
+    }
+    if let Some(sha) = &annotation.carried_from {
+        let _ = writeln!(
+            out,
+            "   Written on an earlier version (sha256 {}) and carried over to this one: its target was found again by mechanical checks (selector, text, markup, the quote with its surrounding words, sizes), which do not prove it means the same thing. A note on the whole page may describe the earlier version.",
+            sha.get(..12).unwrap_or(sha)
+        );
     }
     let comment = clean_text(&annotation.comment, MAX_COMMENT_CHARS);
     if comment.trim().is_empty() {
@@ -3117,6 +3138,44 @@ mod tests {
                 Err(FeedbackError::Invalid(message)) if message.contains(expected)
             ));
         }
+    }
+
+    /// A note carried over from an earlier version says so in the prompt and
+    /// the bundle, with that version's hash; a malformed hash is refused.
+    #[test]
+    fn carried_notes_name_the_version_they_were_written_on() {
+        let _home = crate::test_support::temp_zdx_home();
+        let (thread_id, _file) = setup_thread();
+        let earlier = "ab".repeat(32);
+        let sub = submission(serde_json::json!([
+            { "intent": "note", "comment": "hi", "target": { "kind": "page" }, "carried_from": earlier },
+            { "intent": "change", "comment": "x", "target": { "kind": "element", "element": element("body > h1") } },
+        ]));
+        let saved = saved(save_feedback(&thread_id, BINDING, &sub).unwrap());
+        assert!(
+            saved
+                .prompt
+                .contains("Written on an earlier version (sha256 abababababab) and carried over"),
+            "{}",
+            saved.prompt
+        );
+        assert_eq!(
+            saved.prompt.matches("carried over").count(),
+            1,
+            "only the carried note"
+        );
+        let record: serde_json::Value =
+            serde_json::from_slice(&fs::read(saved.dir.join("feedback.json")).unwrap()).unwrap();
+        assert_eq!(record["annotations"][0]["carried_from"], earlier);
+        assert!(record["annotations"][1]["carried_from"].is_null());
+
+        let bad = submission(serde_json::json!([
+            { "intent": "note", "comment": "hi", "target": { "kind": "page" }, "carried_from": "nope" },
+        ]));
+        assert!(matches!(
+            save_feedback(&thread_id, BINDING, &bad),
+            Err(FeedbackError::Invalid(message)) if message.contains("earlier version")
+        ));
     }
 
     /// Image targets on an HTML artifact are refused.

@@ -120,6 +120,24 @@ pub struct ArtifactsResponse {
     pub artifacts: Vec<Artifact>,
 }
 
+/// `GET /api/threads/{id}/artifacts/version`: the version of one artifact file
+/// as it is now. `sha256` is the hash of the file bytes, the same value the
+/// Mini App names when it sends feedback, so a viewer can tell the file changed
+/// under it without downloading it.
+#[derive(Serialize)]
+struct ArtifactVersionResponse {
+    sha256: String,
+    size_bytes: u64,
+    modified_at: Option<String>,
+}
+
+/// File hashes by path, valid while the file keeps the same length and
+/// modified time, so a viewer checking an open artifact every 30 s does not
+/// re-read it each time. Bounded: cleared when it grows past
+/// `MAX_VERSION_CACHE` paths.
+type VersionCache = std::sync::Mutex<HashMap<PathBuf, (u64, SystemTime, String)>>;
+const MAX_VERSION_CACHE: usize = 256;
+
 /// Query for the artifact download endpoint: the artifact's `path` as listed.
 #[derive(Deserialize)]
 struct ArtifactFileQuery {
@@ -624,6 +642,7 @@ pub(crate) struct ServerState {
     /// (`canonical::MAX_NORMALIZATIONS`, shared with feedback saves).
     /// Requests wait for a permit instead of failing: a preview is a read.
     image_permits: Arc<tokio::sync::Semaphore>,
+    artifact_versions: Arc<VersionCache>,
 }
 
 impl ServerState {
@@ -647,6 +666,7 @@ impl ServerState {
             feedback_in_flight: FeedbackInFlight::default(),
             feedback_permits: Arc::new(tokio::sync::Semaphore::new(FEEDBACK_CONCURRENCY)),
             image_permits: Arc::new(tokio::sync::Semaphore::new(IMAGE_READS)),
+            artifact_versions: Arc::new(VersionCache::default()),
         }
     }
 
@@ -675,6 +695,10 @@ pub(crate) fn create_router(state: Arc<ServerState>) -> Router {
         .route(
             "/threads/{id}/artifacts/file",
             get(get_thread_artifact_file),
+        )
+        .route(
+            "/threads/{id}/artifacts/version",
+            get(get_thread_artifact_version),
         )
         .route(
             "/threads/{id}/artifacts/image",
@@ -1352,6 +1376,69 @@ async fn get_thread_artifact_file(
         .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
         .body(body)
         .map_err(|_build| (StatusCode::INTERNAL_SERVER_ERROR, "Artifact read failed"))
+}
+
+async fn get_thread_artifact_version(
+    State(state): State<Arc<ServerState>>,
+    Path(id): Path<String>,
+    Query(query): Query<ArtifactFileQuery>,
+) -> Result<Json<ArtifactVersionResponse>, ApiError> {
+    let target_id = resolve_thread_param(id);
+    if !valid_thread_id(&target_id) {
+        return Err((StatusCode::BAD_REQUEST, "Invalid thread ID"));
+    }
+    if query.path.trim().is_empty() || query.path.contains('\0') {
+        return Err((StatusCode::BAD_REQUEST, "Invalid artifact path"));
+    }
+    let effective = resolve_alias_id(&target_id);
+    let cache = Arc::clone(&state.artifact_versions);
+    tokio::task::spawn_blocking(move || {
+        let (path, _mime) = artifacts::resolve_artifact_for_download(&effective, &query.path)
+            .map_err(|error| {
+                tracing::warn!(thread_id = effective, error = %format!("{error:#}"), "Failed to resolve Mini App artifact version");
+                (StatusCode::NOT_FOUND, "Artifact not found")
+            })?;
+        let not_found = |error: std::io::Error| {
+            tracing::warn!(path = %path.display(), %error, "Failed to read Mini App artifact version");
+            (StatusCode::NOT_FOUND, "Artifact not found")
+        };
+        let stamp = |meta: &std::fs::Metadata| (meta.len(), meta.modified().unwrap_or(UNIX_EPOCH));
+        let before = stamp(&std::fs::metadata(&path).map_err(not_found)?);
+        let cached = cache
+            .lock()
+            .expect("version cache lock poisoned")
+            .get(&path)
+            .filter(|(len, modified, _)| (*len, *modified) == before)
+            .map(|(_, _, sha)| sha.clone());
+        let sha256 = if let Some(sha) = cached {
+            sha
+        } else {
+            let sha = artifacts::file_sha256(&path).map_err(not_found)?;
+            // Cached only when the file did not change while it was read;
+            // a mixed read can only cause one extra "new version" notice,
+            // because the viewer hashes the bytes it loads on Update.
+            if std::fs::metadata(&path).is_ok_and(|meta| stamp(&meta) == before) {
+                let mut cache = cache.lock().expect("version cache lock poisoned");
+                if cache.len() >= MAX_VERSION_CACHE {
+                    cache.clear();
+                }
+                cache.insert(path.clone(), (before.0, before.1, sha.clone()));
+            }
+            sha
+        };
+        let modified_at = (before.1 != UNIX_EPOCH)
+            .then(|| chrono::DateTime::<chrono::Utc>::from(before.1).to_rfc3339());
+        Ok(Json(ArtifactVersionResponse {
+            sha256,
+            size_bytes: before.0,
+            modified_at,
+        }))
+    })
+    .await
+    .map_err(|error| {
+        tracing::warn!(%error, "Mini App artifact version task failed");
+        (StatusCode::INTERNAL_SERVER_ERROR, "Artifact version failed")
+    })?
 }
 
 /// Image previews read at once (see `ServerState::image_permits`).
@@ -3548,6 +3635,91 @@ mod tests {
             .await
             .expect("request foreign path");
         assert_eq!(foreign.status(), StatusCode::NOT_FOUND);
+
+        server.abort();
+        drop(home);
+    }
+
+    /// The version route answers the SHA-256 of the file bytes (the value
+    /// feedback names), follows a change even when the size stays the same,
+    /// and keeps the file route's login and path rules.
+    #[tokio::test]
+    async fn artifact_version_follows_the_file_bytes() {
+        use sha2::Digest as _;
+
+        let home = zdx_engine::test_support::temp_zdx_home();
+        let thread_id = format!("telegram-version-{}", uuid::Uuid::new_v4());
+        let dir = paths::artifact_dir_for_thread(Some(&thread_id));
+        std::fs::create_dir_all(&dir).expect("create artifact dir");
+        let file = dir.join("report.html");
+        std::fs::write(&file, "<h1>one</h1>").expect("write artifact");
+
+        let app = create_router(Arc::new(ServerState::new(
+            SAMPLE_BOT_TOKEN.to_string(),
+            sample_allowlist(),
+            PathBuf::from("."),
+            WorkerManager::new().0,
+        )));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("read test server address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve test app");
+        });
+        let client = reqwest::Client::new();
+        let auth = format!("tma {}", fresh_init_data(279_058_397));
+        let version = |path: &str| {
+            client
+                .get(format!(
+                    "http://{addr}/api/threads/{thread_id}/artifacts/version?path={path}"
+                ))
+                .header(AUTHORIZATION, &auth)
+                .send()
+        };
+        let sha_of = |bytes: &[u8]| {
+            sha2::Sha256::digest(bytes)
+                .iter()
+                .fold(String::new(), |mut out, byte| {
+                    use std::fmt::Write as _;
+                    let _ = write!(out, "{byte:02x}");
+                    out
+                })
+        };
+        let read = |response: reqwest::Response| async move {
+            assert_eq!(response.status(), StatusCode::OK);
+            response.json::<Value>().await.expect("version json")
+        };
+
+        let first = read(version("report.html").await.expect("version")).await;
+        assert_eq!(first["sha256"], sha_of(b"<h1>one</h1>"));
+        assert_eq!(first["size_bytes"], 12);
+        assert!(first["modified_at"].is_string());
+        // Cached answer, unchanged file.
+        let again = read(version("report.html").await.expect("version")).await;
+        assert_eq!(again["sha256"], first["sha256"]);
+
+        // Same length, new bytes, a later modified time.
+        std::fs::write(&file, "<h1>two</h1>").expect("rewrite artifact");
+        let later = SystemTime::now() + Duration::from_secs(5);
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .and_then(|handle| handle.set_modified(later))
+            .expect("set mtime");
+        let changed = read(version("report.html").await.expect("version")).await;
+        assert_eq!(changed["sha256"], sha_of(b"<h1>two</h1>"));
+
+        let foreign = version("/etc/hosts").await.expect("foreign");
+        assert_eq!(foreign.status(), StatusCode::NOT_FOUND);
+        let anonymous = reqwest::Client::new()
+            .get(format!(
+                "http://{addr}/api/threads/{thread_id}/artifacts/version?path=report.html"
+            ))
+            .send()
+            .await
+            .expect("anonymous");
+        assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
 
         server.abort();
         drop(home);

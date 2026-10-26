@@ -113,6 +113,24 @@ pub struct Artifact {
     pub modified_at: Option<String>,
 }
 
+/// SHA-256 (lowercase hex) of the file at `path`, read in chunks so a large
+/// file is never held in memory. It is the artifact version a feedback
+/// submission names (`artifact_feedback`), and what a viewer compares to tell
+/// that the file changed under it.
+///
+/// # Errors
+/// Returns an error when the file cannot be read.
+pub fn file_sha256(path: &Path) -> std::io::Result<String> {
+    let mut file = fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut file, &mut hasher)?;
+    let mut out = String::with_capacity(64);
+    for byte in hasher.finalize() {
+        let _ = write!(out, "{byte:02x}");
+    }
+    Ok(out)
+}
+
 /// Thread artifact directory (`$ZDX_HOME/artifacts/threads/<id>`, or
 /// `.../scratch` when `thread_id` is missing/blank).
 pub fn artifact_dir_for_thread(thread_id: Option<&str>) -> PathBuf {

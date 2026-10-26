@@ -12,6 +12,7 @@ import type { FeedbackSubmissionPayload } from "./annotate";
 import type {
   ArtifactFeedbackResponse,
   ArtifactImageCopy,
+  ArtifactVersion,
   ArtifactsResponse,
   GitDiffResponse,
   GitResponse,
@@ -894,6 +895,17 @@ export async function demoArtifactImage(path: string): Promise<ArtifactImageCopy
   const blob = await demoChartPng();
   const sha = await sha256Of(blob);
   return { blob, sourceSha256: sha, canonicalSha256: sha, width: 1200, height: 800, sourceWidth: 1200, sourceHeight: 800 };
+}
+
+/** Stands in for `GET /artifacts/version`: the hash of what the demo would
+ *  serve for `path` now (an image override names its source hash). */
+export async function demoArtifactVersion(path: string): Promise<ArtifactVersion> {
+  const override = demoOverride(path);
+  if (override && "sourceSha256" in override) {
+    return { sha256: override.sourceSha256, size_bytes: override.blob.size, modified_at: null };
+  }
+  const blob = await demoArtifactBlob(path);
+  return { sha256: await sha256Of(blob), size_bytes: blob.size, modified_at: null };
 }
 
 /**

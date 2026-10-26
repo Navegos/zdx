@@ -3,6 +3,7 @@ import { tg } from "./telegram";
 import type {
   ArtifactFeedbackResponse,
   ArtifactImageCopy,
+  ArtifactVersion,
   ArtifactsResponse,
   GitDiffResponse,
   GitFileKind,
@@ -267,6 +268,16 @@ export const api = {
       if (demo.demoEnabled()) return demo.demoArtifactBlob(path);
     }
     return getBlob(`/api/threads/${encodeURIComponent(id)}/artifacts/file`, { path });
+  },
+
+  /** The file's version now, without its bytes: an open viewer compares it
+   *  with what it shows. A read of the bot host only, no Telegram call. */
+  artifactVersion: async (id: string, path: string) => {
+    if (import.meta.env.DEV) {
+      const demo = await import("./demo");
+      if (demo.demoEnabled()) return demo.demoArtifactVersion(path);
+    }
+    return get<ArtifactVersion>(`/api/threads/${encodeURIComponent(id)}/artifacts/version`, { path });
   },
 
   /**
